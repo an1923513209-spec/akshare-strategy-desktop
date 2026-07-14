@@ -971,7 +971,34 @@ def _fit_fast_stacking_model(train_x: pd.DataFrame, train_y: pd.Series):
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
-    base_specs = [
+    base_specs = []
+    has_gpu_xgb = False
+    try:
+        from xgboost import XGBClassifier
+
+        base_specs.append(
+            (
+                "xgb_gpu",
+                XGBClassifier(
+                    n_estimators=130,
+                    max_depth=3,
+                    learning_rate=0.045,
+                    subsample=0.85,
+                    colsample_bytree=0.85,
+                    objective="binary:logistic",
+                    eval_metric="logloss",
+                    tree_method="hist",
+                    device="cuda",
+                    random_state=11,
+                    n_jobs=1,
+                ),
+            )
+        )
+        has_gpu_xgb = True
+    except Exception:
+        pass
+
+    base_specs.extend([
         (
             "logit",
             make_pipeline(
@@ -1010,7 +1037,9 @@ def _fit_fast_stacking_model(train_x: pd.DataFrame, train_y: pd.Series):
                 random_state=19,
             ),
         ),
-    ]
+    ])
+    if has_gpu_xgb:
+        base_specs = [spec for spec in base_specs if spec[0] in {"xgb_gpu", "logit"}]
 
     train_y = train_y.astype(int)
     if len(train_x) < 180 or train_y.nunique() < 2:
@@ -1026,9 +1055,16 @@ def _fit_fast_stacking_model(train_x: pd.DataFrame, train_y: pd.Series):
     meta_base_models = []
     meta_features: list[np.ndarray] = []
     for _name, model in base_specs:
-        fitted = model.fit(base_x, base_y)
+        try:
+            fitted = model.fit(base_x, base_y)
+        except Exception:
+            continue
         meta_base_models.append(fitted)
         meta_features.append(fitted.predict_proba(meta_x)[:, 1])
+    if not meta_base_models:
+        model = base_specs[-1][1]
+        model.fit(train_x, train_y)
+        return {"base": [model], "meta": None}
 
     meta_model = None
     if meta_y.nunique() >= 2:
@@ -1038,7 +1074,12 @@ def _fit_fast_stacking_model(train_x: pd.DataFrame, train_y: pd.Series):
 
     full_base_models = []
     for _name, model in base_specs:
-        full_base_models.append(model.fit(train_x, train_y))
+        try:
+            full_base_models.append(model.fit(train_x, train_y))
+        except Exception:
+            continue
+    if not full_base_models:
+        full_base_models = meta_base_models
     return {"base": full_base_models, "meta": meta_model}
 
 

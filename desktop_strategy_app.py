@@ -258,6 +258,10 @@ def _ml_prediction_row(result: dict[str, Any]) -> dict[str, Any]:
         "holding_risk": holding_risk.get("level", "-"),
         "risk_detail": holding_risk.get("detail", "-"),
         "target_weight": float(result.get("target_weight", np.nan)),
+        "current_weight": float(result.get("current_weight", np.nan)),
+        "target_shares": float(result.get("target_shares", np.nan)),
+        "trade_shares": float(result.get("trade_shares", np.nan)),
+        "rebalance_action": result.get("rebalance_action", "-"),
         "prob3": float(h3.get("up_prob", np.nan)) * 100,
         "prob5": float(h5.get("up_prob", np.nan)) * 100,
         "prob10": float(h10.get("up_prob", np.nan)) * 100,
@@ -859,7 +863,7 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_canvas.grid(row=0, column=0, sticky="nsew")
         self.ml_canvas.bind("<Configure>", self._schedule_ml_canvas_redraw)
 
-        columns = ("rank", "symbol", "name", "holding_risk", "target_weight", "risk", "anomaly", "news", "volatility", "prob10", "exp10", "factor", "detail")
+        columns = ("rank", "symbol", "name", "action", "current_weight", "target_weight", "trade_shares", "holding_risk", "risk", "prob10", "exp10", "factor", "detail")
         self.ml_tree = ttk.Treeview(ml_table_frame, columns=columns, show="headings", height=9)
         headings = {
             "rank": "排名",
@@ -876,7 +880,7 @@ class StrategyDesktopApp(tk.Tk):
             "factor": "因子分",
             "detail": "风控说明",
         }
-        widths = {"rank": 55, "symbol": 80, "name": 100, "holding_risk": 90, "target_weight": 90, "risk": 75, "anomaly": 70, "news": 80, "volatility": 75, "prob10": 80, "exp10": 95, "factor": 75, "detail": 280}
+        widths = {"rank": 55, "symbol": 80, "name": 100, "action": 90, "current_weight": 90, "target_weight": 90, "trade_shares": 90, "holding_risk": 90, "risk": 75, "prob10": 80, "exp10": 95, "factor": 75, "detail": 360}
         self._setup_tree(self.ml_tree, headings, widths)
         self.ml_tree.grid(row=0, column=0, sticky="nsew")
         self.ml_tree.bind("<<TreeviewSelect>>", self._on_ml_rank_select)
@@ -1012,8 +1016,8 @@ class StrategyDesktopApp(tk.Tk):
         columns = list(tree["columns"])
         stretch_col = columns[-1] if columns else ""
         for col in columns:
-            tree.heading(col, text=headings[col])
-            tree.column(col, width=widths[col], anchor="center", stretch=(col == stretch_col))
+            tree.heading(col, text=headings.get(col, col))
+            tree.column(col, width=widths.get(col, 90), anchor="center", stretch=(col == stretch_col))
 
     def _record_strategy_type(self, record: dict[str, Any]) -> str:
         result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
@@ -2451,14 +2455,22 @@ class StrategyDesktopApp(tk.Tk):
     def _apply_portfolio_weights(self, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not results:
             return []
+        try:
+            total_capital = max(float(self.ml_cash.get() or 100000), 1.0)
+        except Exception:
+            total_capital = 100000.0
         raw_scores: list[float] = []
         risk_scores: list[float] = []
         for result in results:
+            symbol = str(result.get("symbol", ""))
             prediction = result.get("prediction", {})
             factor = prediction.get("factor", {}) if isinstance(prediction.get("factor"), dict) else {}
             anomaly = prediction.get("anomaly", {}) if isinstance(prediction.get("anomaly"), dict) else {}
             news = prediction.get("news_sentiment", {}) if isinstance(prediction.get("news_sentiment"), dict) else {}
             holding = prediction.get("holding_risk", {}) if isinstance(prediction.get("holding_risk"), dict) else {}
+            saved_rows = self._saved_records_for_symbol(symbol, exclude_strategy_type="ml")
+            saved_result = saved_rows[0][1].get("result", {}) if saved_rows and isinstance(saved_rows[0][1].get("result"), dict) else {}
+            saved_signal = saved_result.get("daily_signal", {}) if isinstance(saved_result.get("daily_signal"), dict) else {}
             risk_score = float(prediction.get("risk_score", 50) or 50)
             risk_scores.append(risk_score)
             atr_pct = max(float(factor.get("atr_pct", 3.0) or 3.0), 0.4)
@@ -2478,6 +2490,12 @@ class StrategyDesktopApp(tk.Tk):
                 penalty *= 0.5
             elif holding_level == "观察":
                 penalty *= 0.8
+            if bool(saved_signal.get("exit_today")):
+                penalty *= 0.05
+            elif bool(saved_signal.get("entry_today")):
+                penalty *= 1.25
+            elif bool(saved_signal.get("in_trend")):
+                penalty *= 1.08
             edge = max(prob10 - 42.0, 1.0)
             raw_scores.append(max(risk_score, 1.0) * edge * penalty / atr_pct)
 
@@ -2498,7 +2516,36 @@ class StrategyDesktopApp(tk.Tk):
         weighted: list[dict[str, Any]] = []
         for result, raw in zip(results, raw_scores):
             item = result.copy()
-            item["target_weight"] = round(0.0 if total_raw <= 0 else raw / total_raw * invest_weight * 100, 1)
+            symbol = str(item.get("symbol", ""))
+            prediction = item.get("prediction", {}) if isinstance(item.get("prediction"), dict) else {}
+            latest_price = float(prediction.get("latest_close", 0) or 0)
+            position = self._stock_position(symbol)
+            try:
+                current_shares = int(float(position.get("shares", "") or 0))
+            except Exception:
+                current_shares = 0
+            current_value = current_shares * latest_price
+            current_weight = current_value / total_capital * 100 if total_capital > 0 else 0.0
+            target_weight = round(0.0 if total_raw <= 0 else raw / total_raw * invest_weight * 100, 1)
+            target_value = total_capital * target_weight / 100.0
+            target_shares = int(target_value // (latest_price * 100)) * 100 if latest_price > 0 else 0
+            trade_shares = target_shares - current_shares
+            if abs(trade_shares) < 100:
+                action = "持有/观察" if current_shares > 0 else "暂不买入"
+                trade_shares = 0
+            elif trade_shares > 0:
+                action = "买入/加仓"
+            elif target_shares <= 0:
+                action = "卖出/清仓"
+            else:
+                action = "卖出/减仓"
+            item["current_shares"] = current_shares
+            item["current_value"] = round(current_value, 2)
+            item["current_weight"] = round(current_weight, 1)
+            item["target_weight"] = target_weight
+            item["target_shares"] = target_shares
+            item["trade_shares"] = trade_shares
+            item["rebalance_action"] = action
             item["cash_reserve"] = round(cash_reserve * 100, 1)
             item["row"] = _ml_prediction_row(item)
             weighted.append(item)
@@ -2516,12 +2563,12 @@ class StrategyDesktopApp(tk.Tk):
                 rank,
                 symbol,
                 row.get("name", ""),
-                row.get("holding_risk", "-"),
+                row.get("rebalance_action", "-"),
+                self._fmt_number(row.get("current_weight")),
                 self._fmt_number(row.get("target_weight")),
+                int(row.get("trade_shares", 0) or 0),
+                row.get("holding_risk", "-"),
                 self._fmt_number(row.get("risk")),
-                row.get("anomaly", "-"),
-                row.get("news_risk", "-"),
-                self._fmt_number(row.get("volatility")),
                 self._fmt_number(row.get("prob10")),
                 self._fmt_number(row.get("exp10")),
                 self._fmt_number(row.get("factor")),
