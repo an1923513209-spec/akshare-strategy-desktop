@@ -1156,6 +1156,8 @@ class StrategyDesktopApp(tk.Tk):
                 continue
             tree = getattr(self, tree_name)
             selected = set(tree.selection())
+            if tree_name == "saved_stock_tree" and self.selected_monitor_symbol:
+                selected.add(str(self.selected_monitor_symbol))
             for iid in tree.get_children():
                 tree.delete(iid)
             for row in rows:
@@ -1175,9 +1177,13 @@ class StrategyDesktopApp(tk.Tk):
                 else:
                     values = (symbol, row.get("name", ""), row.get("count", 0), row.get("latest", ""))
                 tree.insert("", "end", iid=symbol, values=values)
-            for symbol in selected:
-                if tree.exists(symbol):
-                    tree.selection_add(symbol)
+            existing_selected = [symbol for symbol in selected if tree.exists(symbol)]
+            if existing_selected:
+                tree.selection_set(existing_selected)
+                focus_symbol = existing_selected[0]
+                if tree_name == "saved_stock_tree" and self.selected_monitor_symbol in existing_selected:
+                    focus_symbol = str(self.selected_monitor_symbol)
+                tree.focus(focus_symbol)
 
     def _selected_or_all_saved_symbols(self) -> list[str]:
         rows = self._saved_stock_rows(exclude_strategy_type="ml")
@@ -2226,6 +2232,9 @@ class StrategyDesktopApp(tk.Tk):
         self._save_monitor_snapshot()
         self._render_monitor_table()
         if self.selected_monitor_symbol in self.monitor_items:
+            if hasattr(self, "saved_stock_tree") and self.saved_stock_tree.exists(self.selected_monitor_symbol):
+                self.saved_stock_tree.selection_set(self.selected_monitor_symbol)
+                self.saved_stock_tree.focus(self.selected_monitor_symbol)
             self._render_monitor_strategy_list(self.selected_monitor_symbol)
             self._render_monitor_detail(self.monitor_items[self.selected_monitor_symbol])
             self._draw_intraday_chart(self.monitor_items[self.selected_monitor_symbol])

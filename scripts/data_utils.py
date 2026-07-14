@@ -72,7 +72,12 @@ def load_a_share_daily(
     cache_path = DATA_DIR / f"{code}_{start}_{end}_{adjust or 'raw'}.csv"
 
     if cache and cache_path.exists():
-        return pd.read_csv(cache_path, parse_dates=["Date"], index_col="Date")
+        cached = pd.read_csv(cache_path, parse_dates=["Date"], index_col="Date")
+        requested_end = pd.to_datetime(end).date()
+        today = datetime.now().date()
+        latest_cached = cached.index.max().date() if not cached.empty else None
+        if requested_end != today or (latest_cached is not None and latest_cached >= requested_end):
+            return cached
 
     try:
         raw = ak.stock_zh_a_hist(

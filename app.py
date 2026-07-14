@@ -1621,9 +1621,9 @@ def candidate_params(horizon: str, strategy_filter: str) -> list[tuple[str, int,
     grid = STRATEGY_GRIDS[horizon]
     if strategy_filter == "auto":
         if horizon == "short":
-            strategy_types = ["hybrid", "rsi_capital", "macd_kdj", "boll_wr", "breakout_capital", "breakout", "rsi", "macd", "ml", "sma"]
+            strategy_types = ["hybrid", "rsi_capital", "macd_kdj", "boll_wr", "breakout_capital", "breakout", "rsi", "macd", "sma"]
         else:
-            strategy_types = ["hybrid", "rsi_capital", "macd_kdj", "breakout_capital", "sma", "macd", "breakout", "ml"]
+            strategy_types = ["hybrid", "rsi_capital", "macd_kdj", "breakout_capital", "sma", "macd", "breakout"]
     elif strategy_filter == "auto_fast":
         if horizon == "short":
             strategy_types = ["hybrid", "rsi_capital", "macd_kdj", "boll_wr", "breakout_capital", "breakout", "rsi", "macd", "sma"]
