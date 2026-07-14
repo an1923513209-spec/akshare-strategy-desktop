@@ -1,0 +1,10 @@
+akshare
+backtesting
+flask
+matplotlib
+numpy
+optuna
+pandas
+plotly
+scikit-learn
+vectorbt
