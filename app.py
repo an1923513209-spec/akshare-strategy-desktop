@@ -704,7 +704,7 @@ def default_form() -> dict[str, str]:
 
 @lru_cache(maxsize=64)
 def cached_data(symbol: str, start: str, adjust: str) -> pd.DataFrame:
-    return load_a_share_daily(symbol, start=start, adjust=adjust).copy()
+    return load_a_share_daily(symbol, start=start, adjust=adjust, refresh_stale_today=True).copy()
 
 
 def make_signals(close: pd.Series, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
@@ -2091,12 +2091,39 @@ def save_daily_gate(cache_key: tuple[str, str, str, str, str, str], result: dict
     symbol = cache_key[0]
     key_text = strategy_cache_key_text(cache_key)
     display_name = str(result.get("name") or "")
-    if not display_name:
-        display_name = stock_display_name(symbol)
     existing_position: dict[str, object] = {}
     existing_record = cache.get(key_text)
+    if not display_name and isinstance(existing_record, dict):
+        display_name = str(existing_record.get("name") or "")
+        existing_result = existing_record.get("result")
+        if not display_name and isinstance(existing_result, dict):
+            display_name = str(existing_result.get("name") or "")
     if isinstance(existing_record, dict) and isinstance(existing_record.get("position"), dict):
         existing_position = dict(existing_record["position"])
+    if not display_name:
+        newest_name_saved_at = ""
+        for record in cache.values():
+            if not isinstance(record, dict):
+                continue
+            try:
+                same_symbol = normalize_symbol(str(record.get("symbol", ""))) == normalize_symbol(symbol)
+            except Exception:
+                same_symbol = str(record.get("symbol", "")) == symbol
+            if not same_symbol:
+                continue
+            record_name = str(record.get("name") or "")
+            if not record_name:
+                record_result = record.get("result")
+                if isinstance(record_result, dict):
+                    record_name = str(record_result.get("name") or "")
+            saved_at = str(record.get("saved_at", ""))
+            if record_name and saved_at >= newest_name_saved_at:
+                newest_name_saved_at = saved_at
+                display_name = record_name
+    if not display_name:
+        display_name = stock_display_name(symbol)
+    if display_name:
+        result["name"] = display_name
     if not existing_position:
         newest_saved_at = ""
         for record in cache.values():

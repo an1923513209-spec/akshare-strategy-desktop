@@ -2234,6 +2234,11 @@ class StrategyDesktopApp(tk.Tk):
                     payload = message.payload if isinstance(message.payload, dict) else {}
                     if payload.get("key_text") == self.cache_preview_key:
                         self.status_var.set(message.error or "保存策略预览失败")
+                elif message.kind == "strategy_saved":
+                    self._apply_saved_strategy_result(message.payload)
+                elif message.kind == "strategy_save_error":
+                    self.status_var.set("保存策略失败，详情已弹出")
+                    messagebox.showerror("保存策略失败", message.error or "")
                 elif message.kind == "status":
                     self.status_var.set(str(message.payload))
         except queue.Empty:
@@ -2761,20 +2766,58 @@ class StrategyDesktopApp(tk.Tk):
             self.status_var.set("请先完成回测并在右侧选择一条策略")
             return
         form = self._backtest_form()
-        data: pd.DataFrame = result["data"]
-        horizon = str(result.get("horizon") or form.get("horizon", "short"))
-        fast = int(row["fast"])
-        slow = int(row["slow"])
-        strategy_type = str(row.get("strategy_type", "sma"))
-        fast_line, slow_line, entries, exits = engine.strategy_signals(data, fast, slow, horizon, strategy_type)
-        gate = self._daily_gate_from_backtest(form, str(result["symbol"]), data, row, fast_line, slow_line, entries, exits, horizon, str(result.get("name") or ""))
-        result["daily_gate"] = gate
-        result["best"] = row
-        result["fast_line"] = fast_line
-        result["slow_line"] = slow_line
+        self.status_var.set("正在后台保存选中策略...")
+        worker = threading.Thread(target=self._save_selected_rank_strategy_worker, args=(result, row.copy(), form), daemon=True)
+        worker.start()
+
+    def _save_selected_rank_strategy_worker(self, result: dict[str, Any], row: pd.Series, form: dict[str, str]) -> None:
+        try:
+            data: pd.DataFrame = result["data"]
+            horizon = str(result.get("horizon") or form.get("horizon", "short"))
+            fast = int(row["fast"])
+            slow = int(row["slow"])
+            strategy_type = str(row.get("strategy_type", "sma"))
+            fast_line, slow_line, entries, exits = engine.strategy_signals(data, fast, slow, horizon, strategy_type)
+            gate = self._daily_gate_from_backtest(
+                form,
+                str(result["symbol"]),
+                data,
+                row,
+                fast_line,
+                slow_line,
+                entries,
+                exits,
+                horizon,
+                str(result.get("name") or ""),
+            )
+            self.queue.put(
+                WorkerMessage(
+                    "strategy_saved",
+                    payload={
+                        "result": result,
+                        "row": row,
+                        "gate": gate,
+                        "fast_line": fast_line,
+                        "slow_line": slow_line,
+                        "strategy_type": strategy_type,
+                        "fast": fast,
+                        "slow": slow,
+                    },
+                )
+            )
+        except Exception:
+            self.queue.put(WorkerMessage("strategy_save_error", error=traceback.format_exc()))
+
+    def _apply_saved_strategy_result(self, payload: dict[str, Any]) -> None:
+        result = payload["result"]
+        result["daily_gate"] = payload["gate"]
+        result["best"] = payload["row"]
+        result["fast_line"] = payload["fast_line"]
+        result["slow_line"] = payload["slow_line"]
         self._render_strategy_cache_list()
+        strategy_type = str(payload["strategy_type"])
         label = engine.STRATEGY_TYPES.get(strategy_type, strategy_type)
-        self.status_var.set(f"已保存选中策略：{result['symbol']} {label} {fast}/{slow}，盘中监控会优先使用它")
+        self.status_var.set(f"已保存选中策略：{result['symbol']} {label} {payload['fast']}/{payload['slow']}，盘中监控会优先使用它")
 
     def _zoom_backtest(self, factor: float) -> None:
         payload = self.backtest_chart_payload
