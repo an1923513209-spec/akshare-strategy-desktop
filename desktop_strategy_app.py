@@ -2342,7 +2342,8 @@ class StrategyDesktopApp(tk.Tk):
             selected_candidate = self._selected_scan_row()
             selected_row = selected_candidate if selected_candidate is not None else best
             self._set_backtest_summary(selected_row)
-        self._render_strategy_cache_list()
+        if not result.get("from_saved_strategy"):
+            self._render_strategy_cache_list()
         try:
             self._draw_backtest_chart(result, selected_row)
             self.status_var.set(f"回测完成：右键排名行可查看策略说明或保存策略 {time.strftime('%H:%M:%S')}")
@@ -2722,7 +2723,10 @@ class StrategyDesktopApp(tk.Tk):
 
     def _delete_selected_cache(self) -> None:
         selection = self.cache_tree.selection()
-        if not selection:
+        if not selection and self.cache_preview_key:
+            selection = (self.cache_preview_key,)
+        key_text = selection[0] if selection else ""
+        if not key_text or not self.cache_tree.exists(key_text):
             self.status_var.set("请先在左侧选择一条已保存策略")
             return
         key_text = selection[0]
