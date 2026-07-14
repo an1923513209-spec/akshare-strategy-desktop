@@ -1055,7 +1055,7 @@ class StrategyDesktopApp(tk.Tk):
                 code,
                 {
                     "symbol": code,
-                    "name": str(record.get("name") or engine.stock_display_name(code)),
+                    "name": str(record.get("name") or ""),
                     "count": 0,
                     "latest": "",
                 },
@@ -1066,6 +1066,24 @@ class StrategyDesktopApp(tk.Tk):
                 row["latest"] = saved_at
                 row["name"] = str(record.get("name") or row["name"])
         return sorted(stocks.values(), key=lambda item: str(item.get("latest", "")), reverse=True)
+
+    def _saved_stock_name(self, symbol: str) -> str:
+        try:
+            code = engine.normalize_symbol(symbol)
+        except Exception:
+            code = str(symbol)
+        if hasattr(self, "saved_stock_tree") and self.saved_stock_tree.exists(code):
+            values = self.saved_stock_tree.item(code, "values")
+            if len(values) > 1 and values[1]:
+                return str(values[1])
+        item = self.monitor_items.get(code)
+        if isinstance(item, dict) and item.get("name"):
+            return str(item["name"])
+        for _key_text, record in self._saved_records_for_symbol(code):
+            name = str(record.get("name") or "")
+            if name:
+                return name
+        return ""
 
     def _saved_records_for_symbol(
         self,
@@ -1212,7 +1230,7 @@ class StrategyDesktopApp(tk.Tk):
             return
         symbol = str(selection[0])
         self.selected_monitor_symbol = symbol
-        self.monitor_xueqiu_var.set(f"{symbol} {engine.stock_display_name(symbol)} | {engine.xueqiu_url(symbol)}")
+        self.monitor_xueqiu_var.set(f"{symbol} {self._saved_stock_name(symbol)} | {engine.xueqiu_url(symbol)}")
         if self.monitor_select_job is not None:
             try:
                 self.after_cancel(self.monitor_select_job)
@@ -1310,7 +1328,7 @@ class StrategyDesktopApp(tk.Tk):
         dialog.resizable(False, False)
         dialog.configure(background="#f8fafc")
 
-        name = engine.stock_display_name(symbol)
+        name = self._saved_stock_name(symbol)
         shares_var = tk.StringVar(value=str(position.get("shares", "")))
         cost_var = tk.StringVar(value=str(position.get("cost", "")))
 
@@ -1458,7 +1476,7 @@ class StrategyDesktopApp(tk.Tk):
             )
 
     def _show_monitor_loading(self, symbol: str) -> None:
-        name = engine.stock_display_name(symbol)
+        name = self._saved_stock_name(symbol)
         self._write_monitor_detail(f"{symbol} {name} 正在拉取实时行情和分时曲线...")
         if hasattr(self, "monitor_canvas"):
             self.monitor_canvas.delete("all")
@@ -1471,7 +1489,7 @@ class StrategyDesktopApp(tk.Tk):
             )
 
     def _show_monitor_waiting(self, symbol: str) -> None:
-        name = engine.stock_display_name(symbol)
+        name = self._saved_stock_name(symbol)
         self._write_monitor_detail(f"{symbol} {name} 已选中。暂无盘中缓存，点击“刷新一次”后再拉取监测曲线。")
         if hasattr(self, "monitor_canvas"):
             self.monitor_canvas.delete("all")
