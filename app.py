@@ -2090,6 +2090,9 @@ def save_daily_gate(cache_key: tuple[str, str, str, str, str, str], result: dict
     cache = load_persistent_strategy_cache()
     symbol = cache_key[0]
     key_text = strategy_cache_key_text(cache_key)
+    display_name = str(result.get("name") or "")
+    if not display_name:
+        display_name = stock_display_name(symbol)
     existing_position: dict[str, object] = {}
     existing_record = cache.get(key_text)
     if isinstance(existing_record, dict) and isinstance(existing_record.get("position"), dict):
@@ -2111,7 +2114,7 @@ def save_daily_gate(cache_key: tuple[str, str, str, str, str, str], result: dict
                 existing_position = dict(record["position"])
     cache[key_text] = {
         "symbol": symbol,
-        "name": stock_display_name(symbol),
+        "name": display_name,
         "saved_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         "params": {
             "symbol": cache_key[0],

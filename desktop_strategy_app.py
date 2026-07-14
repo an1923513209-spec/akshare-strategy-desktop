@@ -2107,6 +2107,7 @@ class StrategyDesktopApp(tk.Tk):
         entries: pd.Series,
         exits: pd.Series,
         horizon: str,
+        display_name: str = "",
     ) -> dict[str, Any]:
         risk = form.get("risk", "normal")
         strategy_filter = form.get("strategy_type", "auto")
@@ -2134,6 +2135,7 @@ class StrategyDesktopApp(tk.Tk):
         structure_stop = recent_low
         stop_line = min(trend_stop, latest_close * (0.992 if horizon == "short" else 0.985)) if in_trend else max(latest_slow, latest_close * 1.01)
         result = {
+            "name": display_name,
             "strategy_label": strategy_label,
             "best_params": f"{fast}/{slow}",
             "signal_lines": [f"Latest daily: {latest_date:%Y-%m-%d}, close {engine.money(latest_close)}."],
@@ -2756,16 +2758,12 @@ class StrategyDesktopApp(tk.Tk):
         slow = int(row["slow"])
         strategy_type = str(row.get("strategy_type", "sma"))
         fast_line, slow_line, entries, exits = engine.strategy_signals(data, fast, slow, horizon, strategy_type)
-        gate = self._daily_gate_from_backtest(form, str(result["symbol"]), data, row, fast_line, slow_line, entries, exits, horizon)
-        portfolio = engine.strategy_portfolio(data, entries, exits, float(result["cash"]), float(result["fee"]), horizon)
+        gate = self._daily_gate_from_backtest(form, str(result["symbol"]), data, row, fast_line, slow_line, entries, exits, horizon, str(result.get("name") or ""))
         result["daily_gate"] = gate
         result["best"] = row
         result["fast_line"] = fast_line
         result["slow_line"] = slow_line
-        result["trades"] = portfolio.trades.records_readable
-        result["equity"] = portfolio.value()
         self._render_strategy_cache_list()
-        self._draw_backtest_chart(result, row)
         label = engine.STRATEGY_TYPES.get(strategy_type, strategy_type)
         self.status_var.set(f"已保存选中策略：{result['symbol']} {label} {fast}/{slow}，盘中监控会优先使用它")
 
