@@ -314,6 +314,8 @@ class StrategyDesktopApp(tk.Tk):
         self.backtest_worker: threading.Thread | None = None
         self.cache_preview_worker: threading.Thread | None = None
         self.cache_preview_key: str | None = None
+        self.selected_cache_key: str | None = None
+        self.rendering_cache_list = False
         self.backtest_process: mp.Process | None = None
         self.backtest_stop_event = threading.Event()
         self.backtest_target = "traditional"
@@ -1542,28 +1544,41 @@ class StrategyDesktopApp(tk.Tk):
     def _render_strategy_cache_list(self) -> None:
         if not hasattr(self, "cache_tree"):
             return
-        for iid in self.cache_tree.get_children():
-            self.cache_tree.delete(iid)
-        cache = engine.load_persistent_strategy_cache()
-        rows: list[tuple[str, dict[str, Any]]] = []
-        for key_text, record in cache.items():
-            if isinstance(record, dict):
-                if not self._record_matches_strategy_filter(record, exclude_strategy_type="ml"):
-                    continue
-                rows.append((key_text, record))
-        rows.sort(key=lambda item: str(item[1].get("saved_at", "")), reverse=True)
-        for key_text, record in rows:
-            result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
-            signal = result.get("daily_signal", {}) if isinstance(result.get("daily_signal"), dict) else {}
-            params = record.get("params", {}) if isinstance(record.get("params"), dict) else {}
-            values = (
-                record.get("symbol", ""),
-                record.get("name", ""),
-                params.get("mode", ""),
-                f"{signal.get('strategy_label', result.get('strategy_label', ''))} {signal.get('fast', '')}/{signal.get('slow', '')}",
-                signal.get("date", ""),
-            )
-            self.cache_tree.insert("", "end", iid=key_text, values=values)
+        selected = set(self.cache_tree.selection())
+        if self.selected_cache_key:
+            selected.add(self.selected_cache_key)
+        self.rendering_cache_list = True
+        try:
+            for iid in self.cache_tree.get_children():
+                self.cache_tree.delete(iid)
+            cache = engine.load_persistent_strategy_cache()
+            rows: list[tuple[str, dict[str, Any]]] = []
+            for key_text, record in cache.items():
+                if isinstance(record, dict):
+                    if not self._record_matches_strategy_filter(record, exclude_strategy_type="ml"):
+                        continue
+                    rows.append((key_text, record))
+            rows.sort(key=lambda item: str(item[1].get("saved_at", "")), reverse=True)
+            for key_text, record in rows:
+                result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
+                signal = result.get("daily_signal", {}) if isinstance(result.get("daily_signal"), dict) else {}
+                params = record.get("params", {}) if isinstance(record.get("params"), dict) else {}
+                values = (
+                    record.get("symbol", ""),
+                    record.get("name", ""),
+                    params.get("mode", ""),
+                    f"{signal.get('strategy_label', result.get('strategy_label', ''))} {signal.get('fast', '')}/{signal.get('slow', '')}",
+                    signal.get("date", ""),
+                )
+                self.cache_tree.insert("", "end", iid=key_text, values=values)
+            existing_selected = [key for key in selected if self.cache_tree.exists(key)]
+            if existing_selected:
+                focus_key = self.selected_cache_key if self.selected_cache_key in existing_selected else existing_selected[0]
+                self.cache_tree.selection_set(existing_selected)
+                self.cache_tree.focus(focus_key)
+                self.cache_tree.see(focus_key)
+        finally:
+            self.rendering_cache_list = False
         self._render_saved_stock_picker()
         self._render_monitor_strategy_list()
 
@@ -1635,10 +1650,13 @@ class StrategyDesktopApp(tk.Tk):
         self.status_var.set(f"{code} 盘中监控已切换为：{strategy_name}")
 
     def _on_cache_select(self, _event: object | None = None) -> None:
+        if self.rendering_cache_list:
+            return
         selection = self.cache_tree.selection()
         if not selection:
             return
         key_text = selection[0]
+        self.selected_cache_key = key_text
         try:
             key = json.loads(key_text)
         except Exception:
@@ -2736,6 +2754,8 @@ class StrategyDesktopApp(tk.Tk):
         except Exception:
             pass
         engine.save_persistent_strategy_cache()
+        if self.selected_cache_key == key_text:
+            self.selected_cache_key = None
         self._render_strategy_cache_list()
         self.status_var.set("已删除选中的保存策略")
 
