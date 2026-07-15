@@ -2100,6 +2100,9 @@ def load_latest_saved_daily_gate_for_symbol(
     newest_key: tuple[str, str, str, str, str, str] | None = None
     newest_record: dict[str, object] | None = None
     newest_saved_at = ""
+    active_key: tuple[str, str, str, str, str, str] | None = None
+    active_record: dict[str, object] | None = None
+    active_saved_at = ""
     for key_text, record in load_persistent_strategy_cache().items():
         if not isinstance(record, dict) or normalize_symbol(str(record.get("symbol", ""))) != code:
             continue
@@ -2109,16 +2112,26 @@ def load_latest_saved_daily_gate_for_symbol(
         if not _daily_gate_matches_filter(result, strategy_type, exclude_strategy_type):
             continue
         saved_at = str(record.get("saved_at", ""))
+        try:
+            parsed = tuple(json.loads(key_text))
+            if len(parsed) != 6:
+                continue
+            parsed_key: tuple[str, str, str, str, str, str] | None = parsed  # type: ignore[assignment]
+        except Exception:
+            parsed_key = None
+        if bool(record.get("active_for_trading")) and (active_record is None or saved_at > active_saved_at):
+            active_key = parsed_key
+            active_record = record
+            active_saved_at = saved_at
         if newest_record is None or saved_at > newest_saved_at:
-            try:
-                parsed = tuple(json.loads(key_text))
-                if len(parsed) != 6:
-                    continue
-                newest_key = parsed  # type: ignore[assignment]
-            except Exception:
-                newest_key = None
+            newest_key = parsed_key
             newest_record = record
             newest_saved_at = saved_at
+    if active_record is not None:
+        result = active_record["result"]
+        if active_key is not None:
+            DAILY_GATE_CACHE[active_key] = result
+        return result
     if newest_record is None:
         return None
     result = newest_record["result"]
@@ -2131,6 +2144,7 @@ def save_daily_gate(cache_key: tuple[str, str, str, str, str, str], result: dict
     cache = load_persistent_strategy_cache()
     symbol = cache_key[0]
     key_text = strategy_cache_key_text(cache_key)
+    make_active = bool(result.get("_active_for_trading"))
     display_name = str(result.get("name") or "")
     existing_position: dict[str, object] = {}
     existing_record = cache.get(key_text)
@@ -2180,10 +2194,21 @@ def save_daily_gate(cache_key: tuple[str, str, str, str, str, str], result: dict
             if saved_at >= newest_saved_at:
                 newest_saved_at = saved_at
                 existing_position = dict(record["position"])
+    if make_active:
+        for record in cache.values():
+            if not isinstance(record, dict):
+                continue
+            try:
+                same_symbol = normalize_symbol(str(record.get("symbol", ""))) == normalize_symbol(symbol)
+            except Exception:
+                same_symbol = str(record.get("symbol", "")) == symbol
+            if same_symbol:
+                record["active_for_trading"] = False
     cache[key_text] = {
         "symbol": symbol,
         "name": display_name,
         "saved_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "active_for_trading": make_active or bool(existing_record.get("active_for_trading")) if isinstance(existing_record, dict) else make_active,
         "params": {
             "symbol": cache_key[0],
             "start": cache_key[1],

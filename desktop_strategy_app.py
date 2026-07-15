@@ -125,7 +125,9 @@ def _daily_gate_from_backtest_payload(
     }
     engine.attach_ml_risk_snapshot(result, data, fast, slow, strategy_type, stop_line)
     engine.DAILY_GATE_CACHE[cache_key] = result
-    engine.save_daily_gate(cache_key, result)
+    if str(form.get("_save_strategy", "")).lower() in {"1", "true", "yes"}:
+        result["_active_for_trading"] = True
+        engine.save_daily_gate(cache_key, result)
     return result
 
 
@@ -719,16 +721,18 @@ class StrategyDesktopApp(tk.Tk):
         ttk.Button(batch_buttons, text="清空代码", command=lambda: self.bt_batch_text.delete("1.0", tk.END)).grid(row=0, column=1, sticky="ew", padx=(4, 0))
         ttk.Label(cache_frame, text="已保存策略").grid(row=1, column=0, sticky="w", pady=(0, 4))
         cache_columns = ("symbol", "name", "mode", "strategy", "date")
-        self.cache_tree = ttk.Treeview(cache_frame, columns=cache_columns, show="headings", height=18)
+        self.cache_tree = ttk.Treeview(cache_frame, columns=cache_columns, show="tree headings", height=18)
         cache_headings = {"symbol": "代码", "name": "名称", "mode": "模式", "strategy": "策略", "date": "日期"}
         cache_widths = {"symbol": 70, "name": 95, "mode": 120, "strategy": 115, "date": 90}
         self._setup_tree(self.cache_tree, cache_headings, cache_widths)
+        self.cache_tree.heading("#0", text="股票/策略")
+        self.cache_tree.column("#0", width=165, minwidth=120, anchor="w", stretch=True)
         self.cache_tree.grid(row=2, column=0, sticky="nsew")
         cache_vscroll = ttk.Scrollbar(cache_frame, orient=tk.VERTICAL, command=self.cache_tree.yview)
         cache_vscroll.grid(row=2, column=1, sticky="ns")
         self.cache_tree.configure(yscrollcommand=cache_vscroll.set)
         self.cache_tree.bind("<<TreeviewSelect>>", self._on_cache_select)
-        self.cache_tree.bind("<Double-1>", lambda _event: self.run_backtest())
+        self.cache_tree.bind("<Double-1>", lambda _event: "break")
         cache_buttons = ttk.Frame(cache_frame)
         cache_buttons.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         cache_buttons.columnconfigure(0, weight=1)
@@ -1190,7 +1194,48 @@ class StrategyDesktopApp(tk.Tk):
                 continue
             rows.append((key_text, record))
         rows.sort(key=lambda item: str(item[1].get("saved_at", "")), reverse=True)
+        rows.sort(key=lambda item: 0 if bool(item[1].get("active_for_trading")) else 1)
         return rows
+
+    def _cache_stock_iid(self, symbol: str) -> str:
+        try:
+            code = engine.normalize_symbol(symbol)
+        except Exception:
+            code = str(symbol)
+        return f"stock:{code}"
+
+    def _cache_iid_symbol(self, iid: str) -> str:
+        return iid.split(":", 1)[1] if iid.startswith("stock:") else ""
+
+    def _strategy_display_name(self, record: dict[str, Any]) -> str:
+        result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
+        signal = result.get("daily_signal", {}) if isinstance(result.get("daily_signal"), dict) else {}
+        return f"{signal.get('strategy_label', result.get('strategy_label', ''))} {signal.get('fast', '')}/{signal.get('slow', '')}".strip()
+
+    def _set_active_strategy_for_symbol(self, key_text: str) -> None:
+        cache = engine.load_persistent_strategy_cache()
+        record = cache.get(key_text)
+        if not isinstance(record, dict):
+            return
+        try:
+            code = engine.normalize_symbol(str(record.get("symbol", "")))
+        except Exception:
+            code = str(record.get("symbol", ""))
+        if not code:
+            return
+        for other in cache.values():
+            if not isinstance(other, dict):
+                continue
+            try:
+                same_symbol = engine.normalize_symbol(str(other.get("symbol", ""))) == code
+            except Exception:
+                same_symbol = str(other.get("symbol", "")) == code
+            if same_symbol:
+                other["active_for_trading"] = False
+        record["active_for_trading"] = True
+        engine.save_persistent_strategy_cache()
+        self.monitor_strategy_keys[code] = key_text
+        self.ml_monitor_strategy_keys[code] = key_text
 
     def _stock_position(self, symbol: str) -> dict[str, Any]:
         rows = self._saved_records_for_symbol(symbol, exclude_strategy_type="ml")
@@ -1729,25 +1774,52 @@ class StrategyDesktopApp(tk.Tk):
         for iid in self.cache_tree.get_children():
             self.cache_tree.delete(iid)
         cache = engine.load_persistent_strategy_cache()
-        rows: list[tuple[str, dict[str, Any]]] = []
+        grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
         for key_text, record in cache.items():
             if isinstance(record, dict):
                 if not self._record_matches_strategy_filter(record, exclude_strategy_type="ml"):
                     continue
-                rows.append((key_text, record))
-        rows.sort(key=lambda item: str(item[1].get("saved_at", "")), reverse=True)
-        for key_text, record in rows:
-            result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
-            signal = result.get("daily_signal", {}) if isinstance(result.get("daily_signal"), dict) else {}
-            params = record.get("params", {}) if isinstance(record.get("params"), dict) else {}
-            values = (
-                record.get("symbol", ""),
-                record.get("name", ""),
-                params.get("mode", ""),
-                f"{signal.get('strategy_label', result.get('strategy_label', ''))} {signal.get('fast', '')}/{signal.get('slow', '')}",
-                signal.get("date", ""),
+                try:
+                    code = engine.normalize_symbol(str(record.get("symbol", "")))
+                except Exception:
+                    code = str(record.get("symbol", ""))
+                if code:
+                    grouped.setdefault(code, []).append((key_text, record))
+        parent_rows: list[tuple[str, list[tuple[str, dict[str, Any]]]]] = []
+        for code, rows in grouped.items():
+            rows.sort(key=lambda item: str(item[1].get("saved_at", "")), reverse=True)
+            rows.sort(key=lambda item: 0 if bool(item[1].get("active_for_trading")) else 1)
+            parent_rows.append((code, rows))
+        parent_rows.sort(key=lambda item: str(item[1][0][1].get("saved_at", "")) if item[1] else "", reverse=True)
+        for code, rows in parent_rows:
+            active = rows[0][1] if rows else {}
+            latest = str(rows[0][1].get("saved_at", "")) if rows else ""
+            name = str(active.get("name") or engine.stock_display_name(code))
+            active_strategy = self._strategy_display_name(active) if isinstance(active, dict) else ""
+            parent_iid = self._cache_stock_iid(code)
+            self.cache_tree.insert(
+                "",
+                "end",
+                iid=parent_iid,
+                text=f"{code} {name}".strip(),
+                values=(code, name, f"共 {len(rows)} 条", active_strategy, latest[:10]),
+                open=False,
             )
-            self.cache_tree.insert("", "end", iid=key_text, values=values)
+            for key_text, record in rows:
+                params = record.get("params", {}) if isinstance(record.get("params"), dict) else {}
+                strategy = self._strategy_display_name(record)
+                marker = "★ " if bool(record.get("active_for_trading")) else ""
+                result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
+                signal = result.get("daily_signal", {}) if isinstance(result.get("daily_signal"), dict) else {}
+                saved_at = str(record.get("saved_at", ""))
+                values = (
+                    "",
+                    "",
+                    params.get("mode", ""),
+                    strategy,
+                    signal.get("date", "") or saved_at[:10],
+                )
+                self.cache_tree.insert(parent_iid, "end", iid=key_text, text=f"{marker}{strategy}", values=values)
         self._render_saved_stock_picker()
         self._render_monitor_strategy_list()
 
@@ -1777,6 +1849,7 @@ class StrategyDesktopApp(tk.Tk):
                 continue
             rows.append((key_text, record))
         rows.sort(key=lambda item: str(item[1].get("saved_at", "")), reverse=True)
+        rows.sort(key=lambda item: 0 if bool(item[1].get("active_for_trading")) else 1)
 
         output: list[tuple[str, tuple[str, str, str]]] = []
         for key_text, record in rows:
@@ -1784,6 +1857,8 @@ class StrategyDesktopApp(tk.Tk):
             signal = result.get("daily_signal", {}) if isinstance(result.get("daily_signal"), dict) else {}
             params = record.get("params", {}) if isinstance(record.get("params"), dict) else {}
             strategy = f"{signal.get('strategy_label', result.get('strategy_label', ''))} {signal.get('fast', '')}/{signal.get('slow', '')}".strip()
+            if bool(record.get("active_for_trading")):
+                strategy = f"★ {strategy}"
             output.append((key_text, (strategy, str(params.get("mode", "")), str(record.get("saved_at", "")))))
         return output
 
@@ -1814,6 +1889,7 @@ class StrategyDesktopApp(tk.Tk):
             return
         code = engine.normalize_symbol(symbol)
         self.monitor_strategy_keys[code] = selection[0]
+        self._set_active_strategy_for_symbol(selection[0])
         values = self.monitor_strategy_tree.item(selection[0], "values")
         strategy_name = values[0] if values else "选中策略"
         self.status_var.set(f"{code} 盘中监控已切换为：{strategy_name}")
@@ -1823,6 +1899,11 @@ class StrategyDesktopApp(tk.Tk):
         if not selection:
             return
         key_text = selection[0]
+        if key_text.startswith("stock:"):
+            symbol = self._cache_iid_symbol(key_text)
+            self.cache_tree.item(key_text, open=True)
+            self._show_saved_stock_strategies(symbol)
+            return
         try:
             key = json.loads(key_text)
         except Exception:
@@ -1852,8 +1933,40 @@ class StrategyDesktopApp(tk.Tk):
             self.ml_risk.set(str(risk))
             self.notebook.select(self.ml_tab)
         if str(strategy) != "ml":
+            self._set_active_strategy_for_symbol(key_text)
             self._start_saved_strategy_preview(key_text)
-        self.status_var.set(f"已载入缓存策略：{symbol} {mode}，正在刷新右侧信息")
+            self._render_strategy_cache_list()
+        self.status_var.set(f"已选择并载入策略：{symbol} {mode}，盘中监控和 ML 会优先使用它")
+
+    def _show_saved_stock_strategies(self, symbol: str) -> None:
+        rows = self._saved_records_for_symbol(symbol, exclude_strategy_type="ml")
+        for iid in self.bt_tree.get_children():
+            self.bt_tree.delete(iid)
+        if not rows:
+            self.summary_var.set(f"{symbol} 暂无保存策略")
+            self.status_var.set("左侧展开股票后，点击具体保存策略可加载曲线")
+            return
+        for rank, (key_text, record) in enumerate(rows, start=1):
+            result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
+            signal = result.get("daily_signal", {}) if isinstance(result.get("daily_signal"), dict) else {}
+            best = result.get("best") if isinstance(result.get("best"), dict) else {}
+            strategy = self._strategy_display_name(record)
+            values = (
+                rank,
+                ("★ " if record.get("active_for_trading") else "") + strategy,
+                f"{signal.get('fast', '')}/{signal.get('slow', '')}",
+                self._fmt_number(best.get("total_return_pct"), 2),
+                self._fmt_number(best.get("max_drawdown_pct"), 2),
+                self._fmt_number(best.get("sharpe"), 2),
+                int(float(best.get("trades", 0) or 0)),
+                self._fmt_number(best.get("final_value"), 2),
+                self._fmt_number(best.get("score"), 2),
+            )
+            self.bt_tree.insert("", "end", iid=f"saved:{rank}", values=values, tags=(key_text,))
+        active_key = rows[0][0]
+        self.summary_var.set(f"{symbol} 已保存 {len(rows)} 条策略；带 ★ 的策略会进入盘中监控和 ML")
+        self.status_var.set("点击左侧某条具体策略可加载曲线；删除按钮可删单条策略或整只股票")
+        self.cache_preview_key = active_key
 
     def _start_saved_strategy_preview(self, key_text: str) -> None:
         self.cache_preview_key = key_text
@@ -2130,6 +2243,7 @@ class StrategyDesktopApp(tk.Tk):
         self.backtest_stop_event.clear()
         self.backtest_target = "traditional"
         self.pending_backtest_form = self._backtest_form()
+        self.pending_backtest_form["_save_strategy"] = "1"
         self._set_backtest_running(True)
         self.summary_var.set(f"批量回测中：准备回测 {len(symbols)} 只已保存股票...")
         self.status_var.set("批量回测运行中，请稍等")
@@ -2148,6 +2262,7 @@ class StrategyDesktopApp(tk.Tk):
         self.backtest_target = "traditional"
         form = self._backtest_form()
         form["batch_symbols"] = " ".join(symbols)
+        form["_save_strategy"] = "1"
         self.pending_backtest_form = form
         self._set_backtest_running(True)
         self.summary_var.set(f"批量回测中：准备回测 {len(symbols)} 只输入股票，成功后自动保存最佳策略...")
@@ -2438,7 +2553,9 @@ class StrategyDesktopApp(tk.Tk):
         }
         engine.attach_ml_risk_snapshot(result, data, fast, slow, strategy_type, stop_line)
         engine.DAILY_GATE_CACHE[cache_key] = result
-        engine.save_daily_gate(cache_key, result)
+        if str(form.get("_save_strategy", "")).lower() in {"1", "true", "yes"}:
+            result["_active_for_trading"] = True
+            engine.save_daily_gate(cache_key, result)
         return result
 
     def _poll_queue(self) -> None:
@@ -3010,6 +3127,9 @@ class StrategyDesktopApp(tk.Tk):
 
     def _show_backtest_context_menu(self, event: tk.Event) -> None:
         row_id = self.bt_tree.identify_row(event.y)
+        if row_id.startswith("saved:"):
+            self.status_var.set("这是已保存策略汇总；请在左侧展开股票后选择具体策略加载或删除")
+            return
         if row_id:
             self.bt_tree.selection_set(row_id)
             self.bt_tree.focus(row_id)
@@ -3045,6 +3165,9 @@ class StrategyDesktopApp(tk.Tk):
         return scan.iloc[idx]
 
     def _on_backtest_rank_select(self, _event: object | None = None) -> None:
+        selection = self.bt_tree.selection()
+        if selection and str(selection[0]).startswith("saved:"):
+            return
         row = self._selected_scan_row()
         if row is None or not self.backtest_result:
             return
@@ -3066,21 +3189,39 @@ class StrategyDesktopApp(tk.Tk):
             selection = (self.cache_preview_key,)
         key_text = selection[0] if selection else ""
         if not key_text or not self.cache_tree.exists(key_text):
-            self.status_var.set("请先在左侧选择一条已保存策略")
-            return
-        key_text = selection[0]
-        if not messagebox.askyesno("删除策略", "确认删除这条已保存策略？"):
+            self.status_var.set("请先在左侧选择股票或已保存策略")
             return
         cache = engine.load_persistent_strategy_cache()
-        cache.pop(key_text, None)
-        try:
-            cache_key = tuple(json.loads(key_text))
-            engine.DAILY_GATE_CACHE.pop(cache_key, None)
-        except Exception:
-            pass
+        if key_text.startswith("stock:"):
+            symbol = self._cache_iid_symbol(key_text)
+            rows = self._saved_records_for_symbol(symbol, exclude_strategy_type="ml")
+            if not rows:
+                self.status_var.set("这只股票没有可删除的保存策略")
+                return
+            if not messagebox.askyesno("删除股票策略", f"确认删除 {symbol} 的全部 {len(rows)} 条保存策略？"):
+                return
+            for child_key, _record in rows:
+                cache.pop(child_key, None)
+                try:
+                    engine.DAILY_GATE_CACHE.pop(tuple(json.loads(child_key)), None)
+                except Exception:
+                    pass
+            self.monitor_strategy_keys.pop(symbol, None)
+            self.ml_monitor_strategy_keys.pop(symbol, None)
+            deleted_text = f"已删除 {symbol} 的全部保存策略"
+        else:
+            if not messagebox.askyesno("删除策略", "确认删除这条已保存策略？"):
+                return
+            cache.pop(key_text, None)
+            try:
+                cache_key = tuple(json.loads(key_text))
+                engine.DAILY_GATE_CACHE.pop(cache_key, None)
+            except Exception:
+                pass
+            deleted_text = "已删除选中的保存策略"
         engine.save_persistent_strategy_cache()
         self._render_strategy_cache_list()
-        self.status_var.set("已删除选中的保存策略")
+        self.status_var.set(deleted_text)
 
     def _save_selected_rank_strategy(self) -> None:
         result = self.backtest_result
@@ -3089,6 +3230,7 @@ class StrategyDesktopApp(tk.Tk):
             self.status_var.set("请先完成回测并在右侧选择一条策略")
             return
         form = self._backtest_form()
+        form["_save_strategy"] = "1"
         self.status_var.set("正在后台保存选中策略...")
         worker = threading.Thread(target=self._save_selected_rank_strategy_worker, args=(result, row.copy(), form), daemon=True)
         worker.start()
