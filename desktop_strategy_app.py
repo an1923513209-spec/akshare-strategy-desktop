@@ -418,6 +418,7 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_backtest_result: dict[str, Any] | None = None
         self.ml_prediction_results: dict[str, dict[str, Any]] = {}
         self.selected_scan_rank: int = 0
+        self.backtest_checked_symbols: set[str] = set()
         self.backtest_chart_payload: dict[str, Any] | None = None
         self.backtest_zoom: tuple[int, int] | None = None
         self.backtest_drag_start_x: int | None = None
@@ -785,18 +786,30 @@ class StrategyDesktopApp(tk.Tk):
         cache_vscroll = ttk.Scrollbar(cache_frame, orient=tk.VERTICAL, command=self.cache_tree.yview)
         cache_vscroll.grid(row=2, column=1, sticky="ns")
         self.cache_tree.configure(yscrollcommand=cache_vscroll.set)
+        self.cache_tree.bind("<Button-1>", self._on_cache_tree_click)
         self.cache_tree.bind("<<TreeviewSelect>>", self._on_cache_select)
         self.cache_tree.bind("<Double-1>", lambda _event: "break")
+        self.cache_tree.bind("<Button-3>", self._show_cache_context_menu)
         cache_buttons = ttk.Frame(cache_frame)
         cache_buttons.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         cache_buttons.columnconfigure(0, weight=1)
         cache_buttons.columnconfigure(1, weight=1)
         cache_buttons.columnconfigure(2, weight=1)
         cache_buttons.columnconfigure(3, weight=1)
+        cache_buttons.columnconfigure(4, weight=1)
         ttk.Button(cache_buttons, text="载入回测", command=self.run_backtest).grid(row=0, column=0, sticky="ew", padx=(0, 4))
         ttk.Button(cache_buttons, text="删除策略", command=self._delete_selected_cache).grid(row=0, column=1, sticky="ew", padx=(0, 4))
         ttk.Button(cache_buttons, text="刷新", command=self._render_strategy_cache_list).grid(row=0, column=2, sticky="ew", padx=(0, 4))
-        ttk.Button(cache_buttons, text="回测选中/全部股票", command=self.run_saved_stock_backtests).grid(row=0, column=3, sticky="ew")
+        ttk.Button(cache_buttons, text="回测勾选股票", command=self.run_checked_saved_stock_backtests).grid(row=0, column=3, sticky="ew", padx=(0, 4))
+        ttk.Button(cache_buttons, text="回测全部股票", command=self.run_all_saved_stock_backtests).grid(row=0, column=4, sticky="ew")
+        self.cache_stock_context_menu = tk.Menu(self, tearoff=0)
+        self.cache_stock_context_menu.add_command(label="勾选/取消勾选", command=self._toggle_selected_cache_stock_check)
+        self.cache_stock_context_menu.add_command(label="回测这只股票", command=self.run_selected_cache_stock_backtest)
+        self.cache_stock_context_menu.add_separator()
+        self.cache_stock_context_menu.add_command(label="删除这只股票的左侧策略", command=self._delete_selected_cache)
+        self.cache_strategy_context_menu = tk.Menu(self, tearoff=0)
+        self.cache_strategy_context_menu.add_command(label="查看这条策略曲线", command=self._load_left_cache_strategy_preview)
+        self.cache_strategy_context_menu.add_command(label="删除这条策略", command=self._delete_selected_cache)
 
         right_frame.columnconfigure(0, weight=1)
         right_frame.rowconfigure(0, weight=4)
@@ -1283,15 +1296,6 @@ class StrategyDesktopApp(tk.Tk):
             code = str(record.get("symbol", ""))
         if not code:
             return
-        for other in cache.values():
-            if not isinstance(other, dict):
-                continue
-            try:
-                same_symbol = engine.normalize_symbol(str(other.get("symbol", ""))) == code
-            except Exception:
-                same_symbol = str(other.get("symbol", "")) == code
-            if same_symbol:
-                other["active_for_trading"] = False
         record["active_for_trading"] = True
         record["selected_for_left"] = True
         engine.save_persistent_strategy_cache()
@@ -1414,6 +1418,15 @@ class StrategyDesktopApp(tk.Tk):
             if selected:
                 return selected
         return all_symbols
+
+    def _all_strategy_cache_symbols(self) -> list[str]:
+        rows = self._saved_stock_rows(exclude_strategy_type="ml")
+        return [str(row["symbol"]) for row in rows]
+
+    def _checked_strategy_cache_symbols(self) -> list[str]:
+        all_symbols = self._all_strategy_cache_symbols()
+        checked = set(self.backtest_checked_symbols)
+        return [symbol for symbol in all_symbols if symbol in checked]
 
     def _batch_input_symbols(self) -> list[str]:
         if not hasattr(self, "bt_batch_text"):
@@ -1847,6 +1860,13 @@ class StrategyDesktopApp(tk.Tk):
         for iid in self.cache_tree.get_children():
             self.cache_tree.delete(iid)
         cache = engine.load_persistent_strategy_cache()
+        cache_changed = False
+        for record in cache.values():
+            if isinstance(record, dict) and bool(record.get("selected_for_left")) and not bool(record.get("active_for_trading")):
+                record["active_for_trading"] = True
+                cache_changed = True
+        if cache_changed:
+            engine.save_persistent_strategy_cache()
         grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
         for key_text, record in cache.items():
             if isinstance(record, dict):
@@ -1863,6 +1883,8 @@ class StrategyDesktopApp(tk.Tk):
             rows.sort(key=lambda item: str(item[1].get("saved_at", "")), reverse=True)
             rows.sort(key=lambda item: 0 if bool(item[1].get("active_for_trading")) else 1)
             parent_rows.append((code, rows))
+        existing_symbols = {code for code, _rows in parent_rows}
+        self.backtest_checked_symbols.intersection_update(existing_symbols)
         parent_rows.sort(key=lambda item: str(item[1][0][1].get("saved_at", "")) if item[1] else "", reverse=True)
         for code, rows in parent_rows:
             visible_rows = [item for item in rows if bool(item[1].get("selected_for_left"))]
@@ -1872,11 +1894,12 @@ class StrategyDesktopApp(tk.Tk):
             name = str(active.get("name") or engine.stock_display_name(code))
             active_strategy = self._strategy_display_name(active_candidates[0][1]) if active_candidates else ""
             parent_iid = self._cache_stock_iid(code)
+            check = "☑" if code in self.backtest_checked_symbols else "☐"
             self.cache_tree.insert(
                 "",
                 "end",
                 iid=parent_iid,
-                text=f"{code} {name}".strip(),
+                text=f"{check} {code} {name}".strip(),
                 values=(code, name, f"已选 {len(visible_rows)} / 全部 {len(rows)}", active_strategy, latest[:10]),
                 open=False,
             )
@@ -1970,6 +1993,89 @@ class StrategyDesktopApp(tk.Tk):
         values = self.monitor_strategy_tree.item(selection[0], "values")
         strategy_name = values[0] if values else "选中策略"
         self.status_var.set(f"{code} 盘中监控已切换为：{strategy_name}")
+
+    def _cache_selected_iid(self) -> str:
+        selection = self.cache_tree.selection() if hasattr(self, "cache_tree") else ()
+        return str(selection[0]) if selection else ""
+
+    def _cache_symbol_from_iid(self, iid: str) -> str:
+        if iid.startswith("stock:"):
+            return self._cache_iid_symbol(iid)
+        record = engine.load_persistent_strategy_cache().get(iid)
+        if isinstance(record, dict):
+            try:
+                return engine.normalize_symbol(str(record.get("symbol", "")))
+            except Exception:
+                return str(record.get("symbol", ""))
+        parent = self.cache_tree.parent(iid) if hasattr(self, "cache_tree") and self.cache_tree.exists(iid) else ""
+        return self._cache_iid_symbol(parent) if parent.startswith("stock:") else ""
+
+    def _toggle_cache_stock_check(self, symbol: str) -> None:
+        try:
+            code = engine.normalize_symbol(symbol)
+        except Exception:
+            code = str(symbol)
+        if not code:
+            return
+        if code in self.backtest_checked_symbols:
+            self.backtest_checked_symbols.remove(code)
+            state = "取消勾选"
+        else:
+            self.backtest_checked_symbols.add(code)
+            state = "已勾选"
+        self._render_strategy_cache_list()
+        iid = self._cache_stock_iid(code)
+        if self.cache_tree.exists(iid):
+            self.cache_tree.selection_set(iid)
+            self.cache_tree.focus(iid)
+        self.status_var.set(f"{code} {state}，用于“回测勾选股票”")
+
+    def _toggle_selected_cache_stock_check(self) -> None:
+        iid = self._cache_selected_iid()
+        symbol = self._cache_symbol_from_iid(iid)
+        if not symbol:
+            self.status_var.set("请先在左侧选择一只股票")
+            return
+        self._toggle_cache_stock_check(symbol)
+
+    def _on_cache_tree_click(self, event: tk.Event) -> str | None:
+        row_id = self.cache_tree.identify_row(event.y)
+        if not row_id or not row_id.startswith("stock:"):
+            return None
+        if self.cache_tree.identify_column(event.x) != "#0":
+            return None
+        bbox = self.cache_tree.bbox(row_id, "#0")
+        if bbox and bbox[0] + 18 <= event.x <= bbox[0] + 48:
+            self.cache_tree.selection_set(row_id)
+            self.cache_tree.focus(row_id)
+            self._toggle_cache_stock_check(self._cache_iid_symbol(row_id))
+            return "break"
+        return None
+
+    def _show_cache_context_menu(self, event: tk.Event) -> str | None:
+        row_id = self.cache_tree.identify_row(event.y)
+        if not row_id:
+            return None
+        self.cache_tree.selection_set(row_id)
+        self.cache_tree.focus(row_id)
+        try:
+            if row_id.startswith("stock:"):
+                self.cache_stock_context_menu.tk_popup(event.x_root, event.y_root)
+            else:
+                self.cache_strategy_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            if row_id.startswith("stock:"):
+                self.cache_stock_context_menu.grab_release()
+            else:
+                self.cache_strategy_context_menu.grab_release()
+        return "break"
+
+    def _load_left_cache_strategy_preview(self) -> None:
+        key_text = self._cache_selected_iid()
+        if not key_text or key_text.startswith("stock:"):
+            self.status_var.set("请先在左侧选择一条具体策略")
+            return
+        self._start_saved_strategy_preview(key_text)
 
     def _on_cache_select(self, _event: object | None = None) -> None:
         selection = self.cache_tree.selection()
@@ -2311,13 +2417,12 @@ class StrategyDesktopApp(tk.Tk):
         self.backtest_worker = threading.Thread(target=self._backtest_worker, daemon=True)
         self.backtest_worker.start()
 
-    def run_saved_stock_backtests(self) -> None:
+    def _start_saved_stock_backtests(self, symbols: list[str], source_label: str) -> None:
         if self.backtest_worker and self.backtest_worker.is_alive():
             self.status_var.set("回测仍在运行，请稍等")
             return
-        symbols = self._selected_or_all_saved_symbols()
         if not symbols:
-            self.status_var.set("还没有已保存股票，先单只回测并保存一个策略")
+            self.status_var.set("没有可回测的保存股票")
             return
         self.backtest_stop_event.clear()
         self.backtest_target = "traditional"
@@ -2325,10 +2430,34 @@ class StrategyDesktopApp(tk.Tk):
         self.pending_backtest_form["_save_strategy"] = "1"
         self.pending_backtest_form["_save_all_strategies"] = "1"
         self._set_backtest_running(True)
-        self.summary_var.set(f"批量回测中：准备回测 {len(symbols)} 只已保存股票...")
+        self.summary_var.set(f"{source_label}：准备回测 {len(symbols)} 只已保存股票...")
         self.status_var.set("批量回测运行中，请稍等")
         self.backtest_worker = threading.Thread(target=self._backtest_batch_worker, args=(symbols,), daemon=True)
         self.backtest_worker.start()
+
+    def run_saved_stock_backtests(self) -> None:
+        self.run_checked_saved_stock_backtests()
+
+    def run_checked_saved_stock_backtests(self) -> None:
+        symbols = self._checked_strategy_cache_symbols()
+        if not symbols:
+            self.status_var.set("请先在左侧股票名前勾选要回测的股票")
+            return
+        self._start_saved_stock_backtests(symbols, "勾选股票回测")
+
+    def run_all_saved_stock_backtests(self) -> None:
+        symbols = self._all_strategy_cache_symbols()
+        if not symbols:
+            self.status_var.set("还没有已保存股票，先单只回测并保存一个策略")
+            return
+        self._start_saved_stock_backtests(symbols, "全部股票回测")
+
+    def run_selected_cache_stock_backtest(self) -> None:
+        symbol = self._cache_symbol_from_iid(self._cache_selected_iid())
+        if not symbol:
+            self.status_var.set("请先在左侧选择一只股票")
+            return
+        self._start_saved_stock_backtests([symbol], f"{symbol} 单股回测")
 
     def run_input_stock_backtests(self) -> None:
         if self.backtest_worker and self.backtest_worker.is_alive():
