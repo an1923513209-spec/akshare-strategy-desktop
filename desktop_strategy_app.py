@@ -977,15 +977,13 @@ class StrategyDesktopApp(tk.Tk):
 
         top = ttk.LabelFrame(ml_result_frame, text="ML 风控与组合权重")
         top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        for idx in range(6):
+        for idx in range(4):
             top.columnconfigure(idx, weight=1)
         self._labeled_combo(top, "建议周期", self.ml_advice_days, ("1", "3", "10"), 0)
         self._labeled_entry(top, "开始日期", self.ml_start, 1, width=10)
         self._labeled_combo(top, "复权", self.ml_adjust, ("qfq", "", "hfq"), 2)
         self._labeled_entry(top, "手续费", self.ml_fee, 3, width=10)
-        self._labeled_combo(top, "风险", self.ml_risk, ("normal", "tight", "loose"), 4)
-        self._labeled_combo(top, "周期", self.ml_horizon, ("short", "swing", "trend"), 5)
-        ttk.Label(top, text=note, foreground="#405269", justify=tk.LEFT).grid(row=2, column=0, columnspan=6, sticky="ew", padx=8, pady=(6, 8))
+        ttk.Label(top, text=note, foreground="#405269", justify=tk.LEFT).grid(row=2, column=0, columnspan=4, sticky="ew", padx=8, pady=(6, 8))
 
         self.ml_summary_var = tk.StringVar(value="尚未 ML 风控评估")
         ttk.Label(ml_result_frame, textvariable=self.ml_summary_var, anchor="w").grid(row=1, column=0, sticky="ew", pady=(0, 8))
