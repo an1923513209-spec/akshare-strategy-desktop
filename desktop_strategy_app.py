@@ -960,11 +960,13 @@ class StrategyDesktopApp(tk.Tk):
         ml_eval_buttons.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 8))
         ml_eval_buttons.columnconfigure(0, weight=1)
         ml_eval_buttons.columnconfigure(1, weight=1)
+        ml_eval_buttons.columnconfigure(2, weight=1)
         ttk.Button(ml_eval_buttons, text="评估当前股票", command=self.run_ml_backtest, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(ml_eval_buttons, text="评估选中/全部股票池", command=self.run_saved_stock_ml_backtests).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ttk.Button(ml_eval_buttons, text="评估选中股票", command=self.run_selected_saved_stock_ml_backtests).grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        ttk.Button(ml_eval_buttons, text="评估全部股票池", command=self.run_all_saved_stock_ml_backtests).grid(row=0, column=2, sticky="ew", padx=(4, 0))
         self.ml_stop_backtest_button = ttk.Button(ml_eval_buttons, text="终止", command=self.stop_backtest, state=tk.DISABLED)
-        self.ml_stop_backtest_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Label(ml_eval_buttons, text="逐只点股票，在右上角填持股/成本并保存；持股数>0 的股票会自动并入评估。", foreground="#607086").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.ml_stop_backtest_button.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Label(ml_eval_buttons, text="逐只点股票，在右上角填持股/成本并保存；持股数>0 的股票会排在前面。", foreground="#607086").grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.ml_saved_stock_tree = ttk.Treeview(
             saved_box,
             columns=("symbol", "name", "shares", "cost", "count", "latest"),
@@ -1386,6 +1388,9 @@ class StrategyDesktopApp(tk.Tk):
             selected = set(tree.selection())
             for iid in tree.get_children():
                 tree.delete(iid)
+            if tree_name == "ml_saved_stock_tree":
+                rows = sorted(rows, key=lambda row: str(row.get("latest", "")), reverse=True)
+                rows = sorted(rows, key=lambda row: 0 if self._position_shares_count(str(row["symbol"])) > 0 else 1)
             for row in rows:
                 symbol = str(row["symbol"])
                 if tree_name == "saved_stock_tree":
@@ -1416,6 +1421,13 @@ class StrategyDesktopApp(tk.Tk):
             for symbol in selected:
                 if tree.exists(symbol):
                     tree.selection_add(symbol)
+
+    def _position_shares_count(self, symbol: str) -> int:
+        position = self._stock_position(symbol)
+        try:
+            return int(float(position.get("shares", "") or 0))
+        except Exception:
+            return 0
 
     def _selected_or_all_saved_symbols(self) -> list[str]:
         rows = self._saved_stock_rows(exclude_strategy_type="ml")
@@ -2572,22 +2584,38 @@ class StrategyDesktopApp(tk.Tk):
         self.backtest_worker = threading.Thread(target=self._backtest_worker, daemon=True)
         self.backtest_worker.start()
 
-    def run_saved_stock_ml_backtests(self) -> None:
+    def _start_saved_stock_ml_backtests(self, symbols: list[str], source_label: str) -> None:
         if self.backtest_worker and self.backtest_worker.is_alive():
             self.status_var.set("ML风控评估仍在运行，请稍等")
             return
-        symbols = self._selected_ml_saved_symbols()
         if not symbols:
-            self.status_var.set("还没有已保存股票，先在传统回测保存至少一只股票")
+            self.status_var.set("没有可评估的 ML 股票")
             return
         self.backtest_stop_event.clear()
         self.backtest_target = "ml"
         self.pending_backtest_form = self._ml_backtest_form()
         self._set_backtest_running(True)
-        self.ml_summary_var.set(f"ML组合风控中：准备评估 {len(symbols)} 只持仓池股票...")
+        self.ml_summary_var.set(f"{source_label}：准备评估 {len(symbols)} 只股票...")
         self.status_var.set("ML组合风控运行中，请稍等")
         self.backtest_worker = threading.Thread(target=self._backtest_batch_worker, args=(symbols,), daemon=True)
         self.backtest_worker.start()
+
+    def run_saved_stock_ml_backtests(self) -> None:
+        self.run_selected_saved_stock_ml_backtests()
+
+    def run_selected_saved_stock_ml_backtests(self) -> None:
+        symbols = self._selected_ml_saved_symbols()
+        if not symbols:
+            self.status_var.set("请先在 ML 股票池左侧选中要评估的股票")
+            return
+        self._start_saved_stock_ml_backtests(symbols, "ML选中股票评估")
+
+    def run_all_saved_stock_ml_backtests(self) -> None:
+        symbols = self._all_ml_saved_symbols()
+        if not symbols:
+            self.status_var.set("还没有传统回测左侧已选策略股票，先保存至少一只股票")
+            return
+        self._start_saved_stock_ml_backtests(symbols, "ML全部股票池评估")
 
     def _ml_backtest_form(self) -> dict[str, str]:
         return {
@@ -2607,15 +2635,17 @@ class StrategyDesktopApp(tk.Tk):
         }
 
     def _selected_ml_saved_symbols(self) -> list[str]:
-        rows = self._saved_stock_rows(exclude_strategy_type="ml", selected_for_left_only=True)
-        all_symbols = [str(row["symbol"]) for row in rows]
-        held_symbols = set(self._held_saved_symbols())
+        all_symbols = set(self._all_ml_saved_symbols())
         if hasattr(self, "ml_saved_stock_tree"):
             selected = [symbol for symbol in self.ml_saved_stock_tree.selection() if symbol in all_symbols]
-            if selected:
-                merged = list(dict.fromkeys([*selected, *[symbol for symbol in all_symbols if symbol in held_symbols]]))
-                return merged
-        return all_symbols
+            return selected
+        return []
+
+    def _all_ml_saved_symbols(self) -> list[str]:
+        rows = self._saved_stock_rows(exclude_strategy_type="ml", selected_for_left_only=True)
+        rows = sorted(rows, key=lambda row: str(row.get("latest", "")), reverse=True)
+        rows = sorted(rows, key=lambda row: 0 if self._position_shares_count(str(row["symbol"])) > 0 else 1)
+        return [str(row["symbol"]) for row in rows]
 
     def _held_saved_symbols(self) -> list[str]:
         held: list[str] = []
