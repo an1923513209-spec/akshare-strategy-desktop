@@ -776,7 +776,7 @@ class StrategyDesktopApp(tk.Tk):
         ttk.Button(batch_buttons, text="清空代码", command=lambda: self.bt_batch_text.delete("1.0", tk.END)).grid(row=0, column=1, sticky="ew", padx=(4, 0))
         ttk.Label(cache_frame, text="已保存策略").grid(row=1, column=0, sticky="w", pady=(0, 4))
         cache_columns = ("symbol", "name", "mode", "strategy", "date")
-        self.cache_tree = ttk.Treeview(cache_frame, columns=cache_columns, show="tree headings", height=18)
+        self.cache_tree = ttk.Treeview(cache_frame, columns=cache_columns, show="tree headings", height=18, selectmode="extended")
         cache_headings = {"symbol": "代码", "name": "名称", "mode": "模式", "strategy": "策略", "date": "日期"}
         cache_widths = {"symbol": 70, "name": 95, "mode": 120, "strategy": 115, "date": 90}
         self._setup_tree(self.cache_tree, cache_headings, cache_widths)
@@ -803,13 +803,20 @@ class StrategyDesktopApp(tk.Tk):
         ttk.Button(cache_buttons, text="回测勾选股票", command=self.run_checked_saved_stock_backtests).grid(row=0, column=3, sticky="ew", padx=(0, 4))
         ttk.Button(cache_buttons, text="回测全部股票", command=self.run_all_saved_stock_backtests).grid(row=0, column=4, sticky="ew")
         self.cache_stock_context_menu = tk.Menu(self, tearoff=0)
-        self.cache_stock_context_menu.add_command(label="勾选/取消勾选", command=self._toggle_selected_cache_stock_check)
+        self.cache_stock_context_menu.add_command(label="勾选选中股票", command=lambda: self._set_selected_cache_stock_checks(True))
+        self.cache_stock_context_menu.add_command(label="取消勾选选中股票", command=lambda: self._set_selected_cache_stock_checks(False))
         self.cache_stock_context_menu.add_command(label="回测这只股票", command=self.run_selected_cache_stock_backtest)
+        self.cache_stock_context_menu.add_separator()
+        self.cache_stock_context_menu.add_command(label="全部勾选", command=self._check_all_cache_stocks)
+        self.cache_stock_context_menu.add_command(label="全部取消勾选", command=self._uncheck_all_cache_stocks)
         self.cache_stock_context_menu.add_separator()
         self.cache_stock_context_menu.add_command(label="删除这只股票的左侧策略", command=self._delete_selected_cache)
         self.cache_strategy_context_menu = tk.Menu(self, tearoff=0)
         self.cache_strategy_context_menu.add_command(label="查看这条策略曲线", command=self._load_left_cache_strategy_preview)
         self.cache_strategy_context_menu.add_command(label="删除这条策略", command=self._delete_selected_cache)
+        self.cache_bulk_context_menu = tk.Menu(self, tearoff=0)
+        self.cache_bulk_context_menu.add_command(label="全部勾选", command=self._check_all_cache_stocks)
+        self.cache_bulk_context_menu.add_command(label="全部取消勾选", command=self._uncheck_all_cache_stocks)
 
         right_frame.columnconfigure(0, weight=1)
         right_frame.rowconfigure(0, weight=4)
@@ -2038,11 +2045,65 @@ class StrategyDesktopApp(tk.Tk):
             return
         self._toggle_cache_stock_check(symbol)
 
+    def _selected_cache_stock_symbols(self) -> list[str]:
+        if not hasattr(self, "cache_tree"):
+            return []
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for iid in self.cache_tree.selection():
+            symbol = self._cache_symbol_from_iid(str(iid))
+            if symbol and symbol not in seen:
+                symbols.append(symbol)
+                seen.add(symbol)
+        return symbols
+
+    def _set_selected_cache_stock_checks(self, checked: bool) -> None:
+        symbols = self._selected_cache_stock_symbols()
+        if not symbols:
+            self.status_var.set("请先在左侧选中一只或多只股票")
+            return
+        if checked:
+            self.backtest_checked_symbols.update(symbols)
+            action = "勾选"
+        else:
+            self.backtest_checked_symbols.difference_update(symbols)
+            action = "取消勾选"
+        selected_iids = list(self.cache_tree.selection())
+        focused = self.cache_tree.focus()
+        self._render_strategy_cache_list()
+        keep_selected = [iid for iid in selected_iids if self.cache_tree.exists(iid)]
+        if keep_selected:
+            self.cache_tree.selection_set(keep_selected)
+        if focused and self.cache_tree.exists(focused):
+            self.cache_tree.focus(focused)
+        self.status_var.set(f"已{action}选中的 {len(symbols)} 只股票")
+
+    def _check_all_cache_stocks(self) -> None:
+        symbols = self._all_strategy_cache_symbols()
+        if not symbols:
+            self.status_var.set("还没有可勾选的保存股票")
+            return
+        self.backtest_checked_symbols.update(symbols)
+        self._render_strategy_cache_list()
+        self.status_var.set(f"已全部勾选 {len(symbols)} 只股票，可点击“回测勾选股票”")
+
+    def _uncheck_all_cache_stocks(self) -> None:
+        count = len(self.backtest_checked_symbols)
+        self.backtest_checked_symbols.clear()
+        self._render_strategy_cache_list()
+        self.status_var.set(f"已取消全部勾选，原勾选 {count} 只")
+
     def _on_cache_tree_click(self, event: tk.Event) -> str | None:
         row_id = self.cache_tree.identify_row(event.y)
         if not row_id or not row_id.startswith("stock:"):
             return None
         if self.cache_tree.identify_column(event.x) != "#0":
+            return None
+        try:
+            element = str(self.cache_tree.identify_element(event.x, event.y)).lower()
+        except Exception:
+            element = ""
+        if "indicator" in element:
             return None
         bbox = self.cache_tree.bbox(row_id, "#0")
         if bbox and bbox[0] + 18 <= event.x <= bbox[0] + 48:
@@ -2055,8 +2116,13 @@ class StrategyDesktopApp(tk.Tk):
     def _show_cache_context_menu(self, event: tk.Event) -> str | None:
         row_id = self.cache_tree.identify_row(event.y)
         if not row_id:
-            return None
-        self.cache_tree.selection_set(row_id)
+            try:
+                self.cache_bulk_context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.cache_bulk_context_menu.grab_release()
+            return "break"
+        if row_id not in self.cache_tree.selection():
+            self.cache_tree.selection_set(row_id)
         self.cache_tree.focus(row_id)
         try:
             if row_id.startswith("stock:"):
@@ -2084,7 +2150,6 @@ class StrategyDesktopApp(tk.Tk):
         key_text = selection[0]
         if key_text.startswith("stock:"):
             symbol = self._cache_iid_symbol(key_text)
-            self.cache_tree.item(key_text, open=True)
             self._show_saved_stock_strategies(symbol)
             return
         try:
