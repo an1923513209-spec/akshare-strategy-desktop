@@ -65,6 +65,21 @@ def _short_error_text(error: object) -> str:
     return text[:260]
 
 
+def _scan_row_payload(row: pd.Series) -> dict[str, Any]:
+    return {
+        "strategy_type": str(row.get("strategy_type", "")),
+        "strategy_label": str(row.get("strategy_label", "")),
+        "fast": int(row.get("fast", 0) or 0),
+        "slow": int(row.get("slow", 0) or 0),
+        "total_return_pct": float(row.get("total_return_pct", np.nan)),
+        "max_drawdown_pct": float(row.get("max_drawdown_pct", np.nan)),
+        "sharpe": float(row.get("sharpe", np.nan)),
+        "trades": int(row.get("trades", 0) or 0),
+        "final_value": float(row.get("final_value", np.nan)),
+        "score": float(row.get("score", np.nan)),
+    }
+
+
 def _daily_gate_from_backtest_payload(
     form: dict[str, str],
     symbol: str,
@@ -80,13 +95,16 @@ def _daily_gate_from_backtest_payload(
     strategy_filter = form.get("strategy_type", "auto")
     cash = float(form.get("cash") or 100000)
     fee = float(form.get("fee") or 0.0003)
-    cache_key = engine.strategy_cache_key(symbol, form.get("start", "20200101"), form.get("adjust", "qfq"), cash, fee, horizon, strategy_filter, risk)
     latest_date = data.index[-1]
     latest_close = float(data["Close"].iloc[-1])
     strategy_type = str(best.get("strategy_type", "sma"))
     strategy_label = engine.STRATEGY_TYPES.get(strategy_type, strategy_type)
     fast = int(best["fast"])
     slow = int(best["slow"])
+    save_strategy = str(form.get("_save_strategy", "")).lower() in {"1", "true", "yes"}
+    active_strategy = str(form.get("_active_strategy", "")).lower() in {"1", "true", "yes"}
+    cache_strategy_filter = f"{strategy_type}_{fast}_{slow}" if save_strategy else strategy_filter
+    cache_key = engine.strategy_cache_key(symbol, form.get("start", "20200101"), form.get("adjust", "qfq"), cash, fee, horizon, cache_strategy_filter, risk)
     latest_fast = float(fast_line.iloc[-1])
     latest_slow = float(slow_line.iloc[-1])
     entry_today = bool(entries.iloc[-1])
@@ -104,6 +122,7 @@ def _daily_gate_from_backtest_payload(
     result = {
         "strategy_label": strategy_label,
         "best_params": f"{fast}/{slow}",
+        "best": _scan_row_payload(best),
         "signal_lines": [f"Latest daily: {latest_date:%Y-%m-%d}, close {engine.money(latest_close)}."],
         "daily_signal": {
             "date": latest_date.strftime("%Y-%m-%d"),
@@ -125,10 +144,33 @@ def _daily_gate_from_backtest_payload(
     }
     engine.attach_ml_risk_snapshot(result, data, fast, slow, strategy_type, stop_line)
     engine.DAILY_GATE_CACHE[cache_key] = result
-    if str(form.get("_save_strategy", "")).lower() in {"1", "true", "yes"}:
-        result["_active_for_trading"] = True
+    if save_strategy:
+        result["_active_for_trading"] = active_strategy
         engine.save_daily_gate(cache_key, result)
     return result
+
+
+def _save_all_scan_strategies_from_payload(
+    form: dict[str, str],
+    symbol: str,
+    data: pd.DataFrame,
+    scan: pd.DataFrame,
+    horizon: str,
+    active_index: Any,
+) -> dict[str, Any] | None:
+    active_gate: dict[str, Any] | None = None
+    for index, row in scan.iterrows():
+        strategy_type = str(row.get("strategy_type", "sma"))
+        fast = int(row["fast"])
+        slow = int(row["slow"])
+        fast_line, slow_line, entries, exits = engine.strategy_signals(data, fast, slow, horizon, strategy_type)
+        save_form = form.copy()
+        save_form["_save_strategy"] = "1"
+        save_form["_active_strategy"] = "1" if index == active_index else "0"
+        gate = _daily_gate_from_backtest_payload(save_form, symbol, data, row, fast_line, slow_line, entries, exits, horizon)
+        if index == active_index:
+            active_gate = gate
+    return active_gate
 
 
 def _compute_backtest_payload(form: dict[str, str]) -> dict[str, Any]:
@@ -154,7 +196,12 @@ def _compute_backtest_payload(form: dict[str, str]) -> dict[str, Any]:
     portfolio = engine.strategy_portfolio(data, entries, exits, cash, fee, horizon)
     trades = portfolio.trades.records_readable
     equity = portfolio.value()
-    gate = _daily_gate_from_backtest_payload(form, symbol, data, best, fast_line, slow_line, entries, exits, horizon)
+    if str(form.get("_save_all_strategies", "")).lower() in {"1", "true", "yes"}:
+        gate = _save_all_scan_strategies_from_payload(form, symbol, data, scan, horizon, best.name)
+        if gate is None:
+            gate = _daily_gate_from_backtest_payload(form, symbol, data, best, fast_line, slow_line, entries, exits, horizon)
+    else:
+        gate = _daily_gate_from_backtest_payload(form, symbol, data, best, fast_line, slow_line, entries, exits, horizon)
 
     return {
         "symbol": symbol,
@@ -1935,7 +1982,6 @@ class StrategyDesktopApp(tk.Tk):
         if str(strategy) != "ml":
             self._set_active_strategy_for_symbol(key_text)
             self._start_saved_strategy_preview(key_text)
-            self._render_strategy_cache_list()
         self.status_var.set(f"已选择并载入策略：{symbol} {mode}，盘中监控和 ML 会优先使用它")
 
     def _show_saved_stock_strategies(self, symbol: str) -> None:
@@ -2222,6 +2268,7 @@ class StrategyDesktopApp(tk.Tk):
         self.backtest_stop_event.clear()
         self.backtest_target = "traditional"
         self.pending_backtest_form = self._backtest_form()
+        self.pending_backtest_form["_save_all_strategies"] = "1"
         self._set_backtest_running(True)
         strategy = self.bt_strategy.get()
         if strategy in {"auto", "ml"}:
@@ -2244,6 +2291,7 @@ class StrategyDesktopApp(tk.Tk):
         self.backtest_target = "traditional"
         self.pending_backtest_form = self._backtest_form()
         self.pending_backtest_form["_save_strategy"] = "1"
+        self.pending_backtest_form["_save_all_strategies"] = "1"
         self._set_backtest_running(True)
         self.summary_var.set(f"批量回测中：准备回测 {len(symbols)} 只已保存股票...")
         self.status_var.set("批量回测运行中，请稍等")
@@ -2263,6 +2311,7 @@ class StrategyDesktopApp(tk.Tk):
         form = self._backtest_form()
         form["batch_symbols"] = " ".join(symbols)
         form["_save_strategy"] = "1"
+        form["_save_all_strategies"] = "1"
         self.pending_backtest_form = form
         self._set_backtest_running(True)
         self.summary_var.set(f"批量回测中：准备回测 {len(symbols)} 只输入股票，成功后自动保存最佳策略...")
@@ -2507,13 +2556,16 @@ class StrategyDesktopApp(tk.Tk):
         strategy_filter = form.get("strategy_type", "auto")
         cash = float(form.get("cash") or 100000)
         fee = float(form.get("fee") or 0.0003)
-        cache_key = engine.strategy_cache_key(symbol, form.get("start", "20200101"), form.get("adjust", "qfq"), cash, fee, horizon, strategy_filter, risk)
         latest_date = data.index[-1]
         latest_close = float(data["Close"].iloc[-1])
         strategy_type = str(best.get("strategy_type", "sma"))
         strategy_label = engine.STRATEGY_TYPES.get(strategy_type, strategy_type)
         fast = int(best["fast"])
         slow = int(best["slow"])
+        save_strategy = str(form.get("_save_strategy", "")).lower() in {"1", "true", "yes"}
+        active_strategy = str(form.get("_active_strategy", "")).lower() in {"1", "true", "yes"}
+        cache_strategy_filter = f"{strategy_type}_{fast}_{slow}" if save_strategy else strategy_filter
+        cache_key = engine.strategy_cache_key(symbol, form.get("start", "20200101"), form.get("adjust", "qfq"), cash, fee, horizon, cache_strategy_filter, risk)
         latest_fast = float(fast_line.iloc[-1])
         latest_slow = float(slow_line.iloc[-1])
         entry_today = bool(entries.iloc[-1])
@@ -2532,6 +2584,7 @@ class StrategyDesktopApp(tk.Tk):
             "name": display_name,
             "strategy_label": strategy_label,
             "best_params": f"{fast}/{slow}",
+            "best": _scan_row_payload(best),
             "signal_lines": [f"Latest daily: {latest_date:%Y-%m-%d}, close {engine.money(latest_close)}."],
             "daily_signal": {
                 "date": latest_date.strftime("%Y-%m-%d"),
@@ -2553,8 +2606,8 @@ class StrategyDesktopApp(tk.Tk):
         }
         engine.attach_ml_risk_snapshot(result, data, fast, slow, strategy_type, stop_line)
         engine.DAILY_GATE_CACHE[cache_key] = result
-        if str(form.get("_save_strategy", "")).lower() in {"1", "true", "yes"}:
-            result["_active_for_trading"] = True
+        if save_strategy:
+            result["_active_for_trading"] = active_strategy
             engine.save_daily_gate(cache_key, result)
         return result
 
@@ -3185,8 +3238,6 @@ class StrategyDesktopApp(tk.Tk):
 
     def _delete_selected_cache(self) -> None:
         selection = self.cache_tree.selection()
-        if not selection and self.cache_preview_key:
-            selection = (self.cache_preview_key,)
         key_text = selection[0] if selection else ""
         if not key_text or not self.cache_tree.exists(key_text):
             self.status_var.set("请先在左侧选择股票或已保存策略")
@@ -3231,6 +3282,7 @@ class StrategyDesktopApp(tk.Tk):
             return
         form = self._backtest_form()
         form["_save_strategy"] = "1"
+        form["_active_strategy"] = "1"
         self.status_var.set("正在后台保存选中策略...")
         worker = threading.Thread(target=self._save_selected_rank_strategy_worker, args=(result, row.copy(), form), daemon=True)
         worker.start()
