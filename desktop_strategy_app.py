@@ -2773,7 +2773,9 @@ class StrategyDesktopApp(tk.Tk):
     def _render_ml_prediction_table(self, results: list[dict[str, Any]]) -> None:
         for iid in self.ml_tree.get_children():
             self.ml_tree.delete(iid)
-        ranked = self._apply_portfolio_weights(results)
+        ranked = list(results)
+        if not all("target_weight" in item for item in ranked):
+            ranked = self._apply_portfolio_weights(ranked)
         self.ml_prediction_results = {str(item["symbol"]): item for item in ranked}
         for rank, result in enumerate(ranked, start=1):
             row = result.get("row") or _ml_prediction_row(result)
@@ -2797,8 +2799,11 @@ class StrategyDesktopApp(tk.Tk):
 
     def _select_ml_prediction(self, symbol: str) -> None:
         if symbol in self.ml_tree.get_children():
-            self.ml_tree.selection_set(symbol)
-            self.ml_tree.focus(symbol)
+            current_selection = tuple(self.ml_tree.selection())
+            if current_selection != (symbol,):
+                self.ml_tree.selection_set(symbol)
+            if self.ml_tree.focus() != symbol:
+                self.ml_tree.focus(symbol)
         result = self.ml_prediction_results.get(symbol)
         if not result:
             return
