@@ -705,21 +705,32 @@ class StrategyDesktopApp(tk.Tk):
         body.add(right_frame, weight=5)
 
         cache_frame.columnconfigure(0, weight=1)
-        cache_frame.rowconfigure(1, weight=1)
-        ttk.Label(cache_frame, text="已保存策略").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        cache_frame.rowconfigure(2, weight=1)
+        batch_box = ttk.LabelFrame(cache_frame, text="批量股票代码")
+        batch_box.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        batch_box.columnconfigure(0, weight=1)
+        self.bt_batch_text = tk.Text(batch_box, height=4, wrap="word", background="#ffffff", foreground="#14213d", relief=tk.FLAT, padx=8, pady=6)
+        self.bt_batch_text.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+        batch_buttons = ttk.Frame(batch_box)
+        batch_buttons.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        batch_buttons.columnconfigure(0, weight=1)
+        batch_buttons.columnconfigure(1, weight=1)
+        ttk.Button(batch_buttons, text="批量回测输入代码", command=self.run_input_stock_backtests, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(batch_buttons, text="清空代码", command=lambda: self.bt_batch_text.delete("1.0", tk.END)).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ttk.Label(cache_frame, text="已保存策略").grid(row=1, column=0, sticky="w", pady=(0, 4))
         cache_columns = ("symbol", "name", "mode", "strategy", "date")
         self.cache_tree = ttk.Treeview(cache_frame, columns=cache_columns, show="headings", height=18)
         cache_headings = {"symbol": "代码", "name": "名称", "mode": "模式", "strategy": "策略", "date": "日期"}
         cache_widths = {"symbol": 70, "name": 95, "mode": 120, "strategy": 115, "date": 90}
         self._setup_tree(self.cache_tree, cache_headings, cache_widths)
-        self.cache_tree.grid(row=1, column=0, sticky="nsew")
+        self.cache_tree.grid(row=2, column=0, sticky="nsew")
         cache_vscroll = ttk.Scrollbar(cache_frame, orient=tk.VERTICAL, command=self.cache_tree.yview)
-        cache_vscroll.grid(row=1, column=1, sticky="ns")
+        cache_vscroll.grid(row=2, column=1, sticky="ns")
         self.cache_tree.configure(yscrollcommand=cache_vscroll.set)
         self.cache_tree.bind("<<TreeviewSelect>>", self._on_cache_select)
         self.cache_tree.bind("<Double-1>", lambda _event: self.run_backtest())
         cache_buttons = ttk.Frame(cache_frame)
-        cache_buttons.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        cache_buttons.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         cache_buttons.columnconfigure(0, weight=1)
         cache_buttons.columnconfigure(1, weight=1)
         cache_buttons.columnconfigure(2, weight=1)
@@ -1286,6 +1297,27 @@ class StrategyDesktopApp(tk.Tk):
                 return selected
         return all_symbols
 
+    def _batch_input_symbols(self) -> list[str]:
+        if not hasattr(self, "bt_batch_text"):
+            return []
+        text = self.bt_batch_text.get("1.0", tk.END)
+        for sep in ("\n", "\r", "\t", ",", "，", ";", "；", "、", "|"):
+            text = text.replace(sep, " ")
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for token in text.split():
+            raw = token.strip().strip("'\"")
+            if not raw:
+                continue
+            try:
+                symbol = engine.resolve_stock_identifier(raw)
+            except Exception:
+                symbol = raw
+            if symbol not in seen:
+                symbols.append(symbol)
+                seen.add(symbol)
+        return symbols
+
     def _use_selected_saved_monitor_symbols(self) -> None:
         symbols = self._selected_or_all_saved_symbols()
         if not symbols:
@@ -1693,6 +1725,7 @@ class StrategyDesktopApp(tk.Tk):
     def _render_strategy_cache_list(self) -> None:
         if not hasattr(self, "cache_tree"):
             return
+        engine.PERSISTENT_STRATEGY_CACHE = None
         for iid in self.cache_tree.get_children():
             self.cache_tree.delete(iid)
         cache = engine.load_persistent_strategy_cache()
@@ -2100,6 +2133,25 @@ class StrategyDesktopApp(tk.Tk):
         self._set_backtest_running(True)
         self.summary_var.set(f"批量回测中：准备回测 {len(symbols)} 只已保存股票...")
         self.status_var.set("批量回测运行中，请稍等")
+        self.backtest_worker = threading.Thread(target=self._backtest_batch_worker, args=(symbols,), daemon=True)
+        self.backtest_worker.start()
+
+    def run_input_stock_backtests(self) -> None:
+        if self.backtest_worker and self.backtest_worker.is_alive():
+            self.status_var.set("回测仍在运行，请稍等")
+            return
+        symbols = self._batch_input_symbols()
+        if not symbols:
+            self.status_var.set("请先在左侧批量股票代码框里输入代码")
+            return
+        self.backtest_stop_event.clear()
+        self.backtest_target = "traditional"
+        form = self._backtest_form()
+        form["batch_symbols"] = " ".join(symbols)
+        self.pending_backtest_form = form
+        self._set_backtest_running(True)
+        self.summary_var.set(f"批量回测中：准备回测 {len(symbols)} 只输入股票，成功后自动保存最佳策略...")
+        self.status_var.set("批量代码回测运行中，请稍等")
         self.backtest_worker = threading.Thread(target=self._backtest_batch_worker, args=(symbols,), daemon=True)
         self.backtest_worker.start()
 
@@ -2590,8 +2642,8 @@ class StrategyDesktopApp(tk.Tk):
         if results:
             self._apply_backtest_result(results[0])
             prefix = "批量回测已终止" if cancelled else "批量回测完成"
-            self.summary_var.set(f"{prefix}：成功 {len(results)}/{total}，当前展示 {results[0]['symbol']} {results[0]['name']}")
-            self.status_var.set(f"{prefix}：成功 {len(results)} 只，失败 {len(errors)} 只；策略缓存已刷新")
+            self.summary_var.set(f"{prefix}：成功 {len(results)}/{total}，已自动保存每只成功股票的最佳策略，当前展示 {results[0]['symbol']} {results[0]['name']}")
+            self.status_var.set(f"{prefix}：成功 {len(results)} 只，失败 {len(errors)} 只；最佳策略已保存并刷新")
         elif cancelled:
             self.summary_var.set("批量回测已终止")
             self.status_var.set("批量回测已终止，未产生新结果")
