@@ -1178,12 +1178,15 @@ class StrategyDesktopApp(tk.Tk):
         self,
         strategy_filter: str | None = None,
         exclude_strategy_type: str | None = None,
+        selected_for_left_only: bool = False,
     ) -> list[dict[str, Any]]:
         stocks: dict[str, dict[str, Any]] = {}
         for record in engine.load_persistent_strategy_cache().values():
             if not isinstance(record, dict):
                 continue
             if not self._record_matches_strategy_filter(record, strategy_filter, exclude_strategy_type):
+                continue
+            if selected_for_left_only and not bool(record.get("selected_for_left")):
                 continue
             symbol = str(record.get("symbol", "")).strip()
             if not symbol:
@@ -1349,13 +1352,10 @@ class StrategyDesktopApp(tk.Tk):
         engine.save_persistent_strategy_cache()
 
     def _latest_strategy_label_for_symbol(self, symbol: str) -> str:
-        rows = self._saved_records_for_symbol(symbol, exclude_strategy_type="ml")
+        rows = self._saved_strategy_rows_for_symbol(symbol, exclude_strategy_type="ml")
         if not rows:
             return ""
-        record = rows[0][1]
-        result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
-        signal = result.get("daily_signal", {}) if isinstance(result.get("daily_signal"), dict) else {}
-        return f"{signal.get('strategy_label', result.get('strategy_label', ''))} {signal.get('fast', '')}/{signal.get('slow', '')}".strip()
+        return str(rows[0][1][0]).lstrip("★ ").strip()
 
     def _monitor_enabled_symbols(self) -> list[str]:
         rows = self._saved_stock_rows(exclude_strategy_type="ml")
@@ -1364,7 +1364,7 @@ class StrategyDesktopApp(tk.Tk):
     def _render_saved_stock_picker(self) -> None:
         tree_rows = {
             "saved_stock_tree": self._saved_stock_rows(exclude_strategy_type="ml"),
-            "ml_saved_stock_tree": self._saved_stock_rows(),
+            "ml_saved_stock_tree": self._saved_stock_rows(exclude_strategy_type="ml", selected_for_left_only=True),
             "ml_monitor_saved_stock_tree": self._saved_stock_rows(strategy_filter="ml"),
         }
         for tree_name, rows in tree_rows.items():
@@ -2412,7 +2412,7 @@ class StrategyDesktopApp(tk.Tk):
         }
 
     def _selected_ml_saved_symbols(self) -> list[str]:
-        rows = self._saved_stock_rows()
+        rows = self._saved_stock_rows(exclude_strategy_type="ml", selected_for_left_only=True)
         all_symbols = [str(row["symbol"]) for row in rows]
         held_symbols = set(self._held_saved_symbols())
         if hasattr(self, "ml_saved_stock_tree"):
@@ -2424,7 +2424,7 @@ class StrategyDesktopApp(tk.Tk):
 
     def _held_saved_symbols(self) -> list[str]:
         held: list[str] = []
-        for row in self._saved_stock_rows(exclude_strategy_type="ml"):
+        for row in self._saved_stock_rows(exclude_strategy_type="ml", selected_for_left_only=True):
             symbol = str(row["symbol"])
             position = self._stock_position(symbol)
             try:
@@ -2956,7 +2956,11 @@ class StrategyDesktopApp(tk.Tk):
             anomaly = prediction.get("anomaly", {}) if isinstance(prediction.get("anomaly"), dict) else {}
             news = prediction.get("news_sentiment", {}) if isinstance(prediction.get("news_sentiment"), dict) else {}
             holding = prediction.get("holding_risk", {}) if isinstance(prediction.get("holding_risk"), dict) else {}
-            saved_rows = self._saved_records_for_symbol(symbol, exclude_strategy_type="ml")
+            saved_rows = [
+                item
+                for item in self._saved_records_for_symbol(symbol, exclude_strategy_type="ml")
+                if bool(item[1].get("selected_for_left"))
+            ]
             saved_result = saved_rows[0][1].get("result", {}) if saved_rows and isinstance(saved_rows[0][1].get("result"), dict) else {}
             saved_signal = saved_result.get("daily_signal", {}) if isinstance(saved_result.get("daily_signal"), dict) else {}
             risk_score = float(prediction.get("risk_score", 50) or 50)
