@@ -864,6 +864,9 @@ class StrategyDesktopApp(tk.Tk):
         self.bt_context_menu.add_command(label="保存选中策略", command=self._save_selected_rank_strategy)
         self.bt_context_menu.add_separator()
         self.bt_context_menu.add_command(label="全屏查看曲线", command=self._open_backtest_fullscreen)
+        self.saved_bt_context_menu = tk.Menu(self, tearoff=0)
+        self.saved_bt_context_menu.add_command(label="加入左侧并设为使用策略", command=self._add_right_saved_strategy_to_left)
+        self.saved_bt_context_menu.add_command(label="加载这条策略曲线", command=self._load_right_saved_strategy_preview)
         self._render_strategy_cache_list()
 
     def _build_ml_tab(self) -> None:
@@ -1290,6 +1293,21 @@ class StrategyDesktopApp(tk.Tk):
         engine.save_persistent_strategy_cache()
         self.monitor_strategy_keys[code] = key_text
         self.ml_monitor_strategy_keys[code] = key_text
+
+    def _select_strategy_for_left_from_key(self, key_text: str, refresh: bool = True) -> None:
+        self._set_active_strategy_for_symbol(key_text)
+        if refresh:
+            self._render_strategy_cache_list()
+        self.status_var.set("已把该策略加入左侧，并设为盘中监控/ML使用策略")
+
+    def _right_table_saved_key(self, row_id: str | None = None) -> str:
+        if row_id is None:
+            selection = self.bt_tree.selection()
+            row_id = str(selection[0]) if selection else ""
+        if not row_id or not row_id.startswith("saved:"):
+            return ""
+        tags = self.bt_tree.item(row_id, "tags")
+        return str(tags[0]) if tags else ""
 
     def _stock_position(self, symbol: str) -> dict[str, Any]:
         rows = self._saved_records_for_symbol(symbol, exclude_strategy_type="ml")
@@ -2682,8 +2700,8 @@ class StrategyDesktopApp(tk.Tk):
                 elif message.kind == "cache_preview":
                     payload = message.payload if isinstance(message.payload, dict) else {}
                     if payload.get("key_text") == self.cache_preview_key:
-                        self._apply_backtest_result(payload["result"])
-                        self.status_var.set("已用保存策略刷新右侧曲线；右键排名行可查看说明/保存")
+                        self._apply_saved_strategy_preview_chart(payload["result"])
+                        self.status_var.set("已用保存策略刷新上方曲线；右侧全部策略表保持不变")
                 elif message.kind == "cache_preview_error":
                     payload = message.payload if isinstance(message.payload, dict) else {}
                     if payload.get("key_text") == self.cache_preview_key:
@@ -2820,6 +2838,21 @@ class StrategyDesktopApp(tk.Tk):
         except Exception as exc:
             self.status_var.set(f"回测完成，但画图失败：{exc}")
             messagebox.showerror("画图失败", traceback.format_exc())
+
+    def _apply_saved_strategy_preview_chart(self, result: dict[str, Any]) -> None:
+        self.backtest_result = result
+        self.selected_scan_rank = 0
+        best = result["best"]
+        strategy_label = engine.STRATEGY_TYPES.get(str(best.get("strategy_type", "")), str(best.get("strategy_type", "")))
+        self.summary_var.set(
+            f"{result['symbol']} {result['name']} | 当前查看 {strategy_label} {int(best['fast'])}/{int(best['slow'])} | "
+            f"收益 {float(best['total_return_pct']):.2f}% | 最大回撤 {float(best['max_drawdown_pct']):.2f}% | "
+            f"夏普 {float(best['sharpe']):.2f} | 交易 {int(best['trades'])} 次 | 最终权益 {engine.money(float(best['final_value']))}"
+        )
+        try:
+            self._draw_backtest_chart(result, best)
+        except Exception as exc:
+            self.status_var.set(f"保存策略曲线绘制失败：{exc}")
 
     def _apply_backtest_batch_result(self, payload: dict[str, Any]) -> None:
         results: list[dict[str, Any]] = list(payload.get("results") or [])
@@ -3198,7 +3231,12 @@ class StrategyDesktopApp(tk.Tk):
     def _show_backtest_context_menu(self, event: tk.Event) -> None:
         row_id = self.bt_tree.identify_row(event.y)
         if row_id.startswith("saved:"):
-            self.status_var.set("这是已保存策略汇总；请在左侧展开股票后选择具体策略加载或删除")
+            self.bt_tree.selection_set(row_id)
+            self.bt_tree.focus(row_id)
+            try:
+                self.saved_bt_context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.saved_bt_context_menu.grab_release()
             return
         if row_id:
             self.bt_tree.selection_set(row_id)
@@ -3237,13 +3275,10 @@ class StrategyDesktopApp(tk.Tk):
     def _on_backtest_rank_select(self, _event: object | None = None) -> None:
         selection = self.bt_tree.selection()
         if selection and str(selection[0]).startswith("saved:"):
-            tags = self.bt_tree.item(selection[0], "tags")
-            key_text = str(tags[0]) if tags else ""
+            key_text = self._right_table_saved_key(str(selection[0]))
             if key_text:
-                self._set_active_strategy_for_symbol(key_text)
                 self._start_saved_strategy_preview(key_text)
-                self._render_strategy_cache_list()
-                self.status_var.set("已把右侧选中的保存策略加入左侧，并设为盘中/ML使用策略")
+                self.status_var.set("正在加载右侧选中策略曲线；右键可加入左侧用于盘中/ML")
             return
         row = self._selected_scan_row()
         if row is None or not self.backtest_result:
@@ -3253,6 +3288,20 @@ class StrategyDesktopApp(tk.Tk):
             self._draw_backtest_chart(self.backtest_result, row)
         except Exception as exc:
             self.status_var.set(f"选中策略画图失败：{exc}")
+
+    def _add_right_saved_strategy_to_left(self) -> None:
+        key_text = self._right_table_saved_key()
+        if not key_text:
+            self.status_var.set("请先在右侧全部策略表里选择一条策略")
+            return
+        self._select_strategy_for_left_from_key(key_text, refresh=True)
+
+    def _load_right_saved_strategy_preview(self) -> None:
+        key_text = self._right_table_saved_key()
+        if not key_text:
+            self.status_var.set("请先在右侧全部策略表里选择一条策略")
+            return
+        self._start_saved_strategy_preview(key_text)
 
     def _on_ml_rank_select(self, _event: object | None = None) -> None:
         selection = self.ml_tree.selection()
@@ -3273,27 +3322,32 @@ class StrategyDesktopApp(tk.Tk):
             if not rows:
                 self.status_var.set("这只股票没有可删除的保存策略")
                 return
-            if not messagebox.askyesno("删除股票策略", f"确认删除 {symbol} 的全部 {len(rows)} 条保存策略？"):
+            if not messagebox.askyesno("移出左侧", f"确认把 {symbol} 的左侧已选策略全部移出？历史回测结果仍会保留在右侧。"):
                 return
             for child_key, _record in rows:
-                cache.pop(child_key, None)
-                try:
-                    engine.DAILY_GATE_CACHE.pop(tuple(json.loads(child_key)), None)
-                except Exception:
-                    pass
+                editable = cache.get(child_key)
+                if isinstance(editable, dict):
+                    editable["selected_for_left"] = False
+                    editable["active_for_trading"] = False
             self.monitor_strategy_keys.pop(symbol, None)
             self.ml_monitor_strategy_keys.pop(symbol, None)
-            deleted_text = f"已删除 {symbol} 的全部保存策略"
+            deleted_text = f"已把 {symbol} 的已选策略移出左侧；历史策略仍保留"
         else:
-            if not messagebox.askyesno("删除策略", "确认删除这条已保存策略？"):
+            if not messagebox.askyesno("移出左侧", "确认把这条策略从左侧移出？历史回测结果仍会保留在右侧。"):
                 return
-            cache.pop(key_text, None)
-            try:
-                cache_key = tuple(json.loads(key_text))
-                engine.DAILY_GATE_CACHE.pop(cache_key, None)
-            except Exception:
-                pass
-            deleted_text = "已删除选中的保存策略"
+            editable = cache.get(key_text)
+            if isinstance(editable, dict):
+                editable["selected_for_left"] = False
+                editable["active_for_trading"] = False
+                try:
+                    code = engine.normalize_symbol(str(editable.get("symbol", "")))
+                    if self.monitor_strategy_keys.get(code) == key_text:
+                        self.monitor_strategy_keys.pop(code, None)
+                    if self.ml_monitor_strategy_keys.get(code) == key_text:
+                        self.ml_monitor_strategy_keys.pop(code, None)
+                except Exception:
+                    pass
+            deleted_text = "已把选中策略移出左侧；历史策略仍保留"
         engine.save_persistent_strategy_cache()
         self._render_strategy_cache_list()
         self.status_var.set(deleted_text)
