@@ -1743,8 +1743,38 @@ class StrategyDesktopApp(tk.Tk):
                 self.monitor_pending_symbols = {str(symbol) for symbol in symbols}
             self.status_var.set("上一轮监控刷新尚未完成，已排队下一轮刷新")
             return
-        self.monitor_worker = threading.Thread(target=self._monitor_worker_loop, args=(loop, symbols), daemon=True)
+        tasks = self._build_monitor_tasks(symbols)
+        interval = self._monitor_interval_seconds()
+        self.monitor_worker = threading.Thread(target=self._monitor_worker_loop, args=(loop, tasks, interval), daemon=True)
         self.monitor_worker.start()
+
+    def _build_monitor_tasks(self, symbols: list[str] | None = None) -> list[dict[str, str]]:
+        if symbols is None:
+            symbols = [str(self.selected_monitor_symbol)] if self.selected_monitor_symbol else []
+        period = self.monitor_period.get()
+        tasks: list[dict[str, str]] = []
+        for symbol in symbols:
+            try:
+                code = engine.resolve_stock_identifier(symbol)
+            except Exception:
+                code = str(symbol)
+            strategy_key = self.monitor_strategy_keys.get(code, "")
+            if not strategy_key:
+                rows = self._saved_strategy_rows_for_symbol(code, exclude_strategy_type="ml")
+                if rows:
+                    strategy_key = rows[0][0]
+                    self.monitor_strategy_keys[code] = strategy_key
+            position = self._stock_position(code)
+            tasks.append(
+                {
+                    "symbol": str(symbol),
+                    "period": str(period),
+                    "shares": str(position.get("shares", "")),
+                    "cost": str(position.get("cost", "")),
+                    "strategy_key": str(strategy_key),
+                }
+            )
+        return tasks
 
     def _run_pending_monitor_refresh(self) -> None:
         if not self.monitor_refresh_pending:
@@ -1759,39 +1789,29 @@ class StrategyDesktopApp(tk.Tk):
         if symbols:
             self._start_monitor_worker(loop=False, symbols=symbols)
 
-    def _monitor_worker_loop(self, loop: bool, symbols: list[str] | None = None) -> None:
+    def _monitor_worker_loop(self, loop: bool, tasks: list[dict[str, str]], interval: int) -> None:
         while True:
-            self._fetch_monitor_once(symbols)
+            self._fetch_monitor_once(tasks)
             if not loop or not self.monitor_running:
                 break
-            symbols = None
-            time.sleep(self._monitor_interval_seconds())
+            time.sleep(interval)
 
-    def _fetch_monitor_once(self, symbols: list[str] | None = None) -> None:
-        if symbols is None:
-            symbols = [str(self.selected_monitor_symbol)] if self.selected_monitor_symbol else []
-        if not symbols:
+    def _fetch_monitor_once(self, tasks: list[dict[str, str]]) -> None:
+        if not tasks:
             self.queue.put(WorkerMessage("monitor_error", error="请先在左侧点选一只股票"))
             return
 
         results: list[dict[str, Any]] = []
-        for symbol in symbols:
+        for task in tasks:
+            symbol = task["symbol"]
             try:
-                code = engine.resolve_stock_identifier(symbol)
-                strategy_key = self.monitor_strategy_keys.get(code, "")
-                if not strategy_key:
-                    rows = self._saved_strategy_rows_for_symbol(code, exclude_strategy_type="ml")
-                    if rows:
-                        strategy_key = rows[0][0]
-                        self.monitor_strategy_keys[code] = strategy_key
-                position = self._stock_position(code)
                 results.append(
                     engine.build_monitor_item(
                         symbol,
-                        self.monitor_period.get(),
-                        str(position.get("shares", "")),
-                        str(position.get("cost", "")),
-                        strategy_key,
+                        task.get("period", "5"),
+                        task.get("shares", ""),
+                        task.get("cost", ""),
+                        task.get("strategy_key", ""),
                     )
                 )
             except Exception as exc:
@@ -1837,35 +1857,56 @@ class StrategyDesktopApp(tk.Tk):
         if self.ml_monitor_worker and self.ml_monitor_worker.is_alive():
             self.status_var.set("上一轮 ML 监控刷新尚未完成")
             return
-        self.ml_monitor_worker = threading.Thread(target=self._ml_monitor_worker_loop, args=(loop,), daemon=True)
+        tasks = self._build_ml_monitor_tasks()
+        interval = self._ml_monitor_interval_seconds()
+        self.ml_monitor_worker = threading.Thread(target=self._ml_monitor_worker_loop, args=(loop, tasks, interval), daemon=True)
         self.ml_monitor_worker.start()
 
-    def _ml_monitor_worker_loop(self, loop: bool) -> None:
-        while True:
-            self._fetch_ml_monitor_once()
-            if not loop or not self.ml_monitor_running:
-                break
-            time.sleep(self._ml_monitor_interval_seconds())
-
-    def _fetch_ml_monitor_once(self) -> None:
+    def _build_ml_monitor_tasks(self) -> list[dict[str, str]]:
         try:
             symbols = engine.parse_symbol_text(self._ml_monitor_symbols_text())
         except Exception as exc:
             self.queue.put(WorkerMessage("ml_monitor_error", error=str(exc)))
-            return
-
-        results: list[dict[str, Any]] = []
+            return []
+        period = self.ml_monitor_period.get()
+        shares = self.ml_monitor_shares.get()
+        buy_price = self.ml_monitor_buy_price.get()
+        tasks: list[dict[str, str]] = []
         for symbol in symbols:
             try:
                 code = engine.resolve_stock_identifier(symbol)
-                strategy_key = self.ml_monitor_strategy_keys.get(code, "")
+            except Exception:
+                code = str(symbol)
+            tasks.append(
+                {
+                    "symbol": str(symbol),
+                    "period": str(period),
+                    "shares": str(shares),
+                    "buy_price": str(buy_price),
+                    "strategy_key": str(self.ml_monitor_strategy_keys.get(code, "")),
+                }
+            )
+        return tasks
+
+    def _ml_monitor_worker_loop(self, loop: bool, tasks: list[dict[str, str]], interval: int) -> None:
+        while True:
+            self._fetch_ml_monitor_once(tasks)
+            if not loop or not self.ml_monitor_running:
+                break
+            time.sleep(interval)
+
+    def _fetch_ml_monitor_once(self, tasks: list[dict[str, str]]) -> None:
+        results: list[dict[str, Any]] = []
+        for task in tasks:
+            symbol = task["symbol"]
+            try:
                 results.append(
                     engine.build_monitor_item(
                         symbol,
-                        self.ml_monitor_period.get(),
-                        self.ml_monitor_shares.get(),
-                        self.ml_monitor_buy_price.get(),
-                        strategy_key,
+                        task.get("period", "5"),
+                        task.get("shares", ""),
+                        task.get("buy_price", ""),
+                        task.get("strategy_key", ""),
                         strategy_type="ml",
                         exclude_strategy_type=None,
                     )
