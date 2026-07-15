@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import json
 import multiprocessing as mp
+import pickle
 import queue
+import subprocess
+import sys
 import threading
 import time
 import traceback
+import tempfile
 import webbrowser
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -336,7 +341,7 @@ class StrategyDesktopApp(tk.Tk):
         self.backtest_worker: threading.Thread | None = None
         self.cache_preview_worker: threading.Thread | None = None
         self.cache_preview_key: str | None = None
-        self.backtest_process: mp.Process | None = None
+        self.backtest_process: Any | None = None
         self.backtest_stop_event = threading.Event()
         self.backtest_target = "traditional"
         self.pending_backtest_form: dict[str, str] | None = None
@@ -2192,7 +2197,12 @@ class StrategyDesktopApp(tk.Tk):
     def stop_backtest(self) -> None:
         process = self.backtest_process
         worker_alive = bool(self.backtest_worker and self.backtest_worker.is_alive())
-        process_alive = bool(process and process.is_alive())
+        if hasattr(process, "is_alive"):
+            process_alive = bool(process and process.is_alive())
+        elif hasattr(process, "poll"):
+            process_alive = bool(process and process.poll() is None)
+        else:
+            process_alive = False
         if not worker_alive and not process_alive:
             self.status_var.set("当前没有正在运行的回测")
             self._set_backtest_running(False)
@@ -2239,52 +2249,60 @@ class StrategyDesktopApp(tk.Tk):
         self.queue.put(WorkerMessage("backtest_batch", payload={"target": target, "results": results, "errors": errors, "total": len(symbols), "cancelled": cancelled}))
 
     def _run_backtest_process(self, form: dict[str, str]) -> dict[str, Any]:
-        ctx = mp.get_context("spawn")
-        result_queue = ctx.Queue(maxsize=1)
-        process = ctx.Process(target=_backtest_process_entry, args=(form, result_queue), daemon=True)
-        self.backtest_process = process
-        process.start()
-        started_at = time.monotonic()
         timeout_seconds = 240 if form.get("_job") == "ml_predict" else 180
-        message: tuple[str, Any] | None = None
-        try:
-            while True:
+        worker_path = engine.ROOT / "desktop_worker.py"
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        with tempfile.TemporaryDirectory(prefix="strategy_worker_") as tmp_dir:
+            input_path = Path(tmp_dir) / "input.json"
+            output_path = Path(tmp_dir) / "output.pkl"
+            with input_path.open("w", encoding="utf-8") as handle:
+                json.dump(form, handle, ensure_ascii=False)
+            process = subprocess.Popen(
+                [sys.executable, str(worker_path), str(input_path), str(output_path)],
+                cwd=str(engine.ROOT),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            self.backtest_process = process
+            started_at = time.monotonic()
+            try:
+                while process.poll() is None:
+                    if self.backtest_stop_event.is_set():
+                        process.terminate()
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                        raise BacktestCancelled()
+                    if time.monotonic() - started_at > timeout_seconds:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                        symbol = form.get("symbol", "")
+                        raise RuntimeError(f"{symbol} 单只评估超过 {timeout_seconds} 秒，已自动跳过；通常是网络/代理或模型进程卡住。")
+                    time.sleep(0.2)
                 if self.backtest_stop_event.is_set():
-                    process.terminate()
-                    process.join(timeout=3)
                     raise BacktestCancelled()
-                if time.monotonic() - started_at > timeout_seconds:
+                if not output_path.exists():
+                    raise RuntimeError(f"评估子进程没有返回结果，退出码 {process.returncode}")
+                with output_path.open("rb") as handle:
+                    message = pickle.load(handle)
+                if isinstance(message, dict) and message.get("kind") == "ok":
+                    return message["payload"]
+                error = message.get("error") if isinstance(message, dict) else str(message)
+                raise RuntimeError(str(error))
+            finally:
+                if process.poll() is None:
                     process.terminate()
-                    process.join(timeout=3)
-                    symbol = form.get("symbol", "")
-                    raise RuntimeError(f"{symbol} 单只评估超过 {timeout_seconds} 秒，已自动跳过；通常是网络/代理或模型进程卡住。")
-                try:
-                    message = result_queue.get(timeout=0.2)
-                    break
-                except queue.Empty:
-                    if not process.is_alive():
-                        break
-            if self.backtest_stop_event.is_set():
-                raise BacktestCancelled()
-            if message is None:
-                try:
-                    message = result_queue.get(timeout=1)
-                except queue.Empty:
-                    message = None
-            process.join(timeout=5)
-            if process.exitcode not in (0, None) and message is None:
-                raise RuntimeError(f"回测子进程异常退出，退出码 {process.exitcode}")
-            if message is None:
-                raise RuntimeError("回测子进程没有返回结果")
-            kind, payload = message
-            if kind == "ok":
-                return payload
-            raise RuntimeError(str(payload))
-        finally:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=1)
-            self.backtest_process = None
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                self.backtest_process = None
 
     def _backtest_form(self) -> dict[str, str]:
         return {
