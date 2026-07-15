@@ -396,6 +396,7 @@ class StrategyDesktopApp(tk.Tk):
         self.backtest_worker: threading.Thread | None = None
         self.cache_preview_worker: threading.Thread | None = None
         self.cache_preview_key: str | None = None
+        self.pending_saved_description_key: str | None = None
         self.backtest_process: Any | None = None
         self.backtest_stop_event = threading.Event()
         self.backtest_target = "traditional"
@@ -865,8 +866,8 @@ class StrategyDesktopApp(tk.Tk):
         self.bt_context_menu.add_separator()
         self.bt_context_menu.add_command(label="全屏查看曲线", command=self._open_backtest_fullscreen)
         self.saved_bt_context_menu = tk.Menu(self, tearoff=0)
+        self.saved_bt_context_menu.add_command(label="查看策略说明", command=self._show_saved_strategy_description_popup)
         self.saved_bt_context_menu.add_command(label="加入左侧并设为使用策略", command=self._add_right_saved_strategy_to_left)
-        self.saved_bt_context_menu.add_command(label="加载这条策略曲线", command=self._load_right_saved_strategy_preview)
         self._render_strategy_cache_list()
 
     def _build_ml_tab(self) -> None:
@@ -2701,10 +2702,15 @@ class StrategyDesktopApp(tk.Tk):
                     payload = message.payload if isinstance(message.payload, dict) else {}
                     if payload.get("key_text") == self.cache_preview_key:
                         self._apply_saved_strategy_preview_chart(payload["result"])
+                        if payload.get("key_text") == self.pending_saved_description_key:
+                            self.pending_saved_description_key = None
+                            self._show_strategy_description_popup()
                         self.status_var.set("已用保存策略刷新上方曲线；右侧全部策略表保持不变")
                 elif message.kind == "cache_preview_error":
                     payload = message.payload if isinstance(message.payload, dict) else {}
                     if payload.get("key_text") == self.cache_preview_key:
+                        if payload.get("key_text") == self.pending_saved_description_key:
+                            self.pending_saved_description_key = None
                         self.status_var.set(message.error or "保存策略预览失败")
                 elif message.kind == "strategy_saved":
                     self._apply_saved_strategy_result(message.payload)
@@ -3231,6 +3237,21 @@ class StrategyDesktopApp(tk.Tk):
         buttons.grid(row=1, column=0, columnspan=2, sticky="ew")
         ttk.Button(buttons, text="保存这个策略", command=self._save_selected_rank_strategy).pack(side=tk.LEFT)
         ttk.Button(buttons, text="关闭", command=window.destroy).pack(side=tk.RIGHT)
+
+    def _show_saved_strategy_description_popup(self) -> None:
+        key_text = self._right_table_saved_key()
+        if not key_text:
+            self.status_var.set("请先在右侧全部策略表里选择一条策略")
+            return
+        if self.backtest_result and self.backtest_result.get("cache_key_text") == key_text:
+            self._show_strategy_description_popup()
+            return
+        self.pending_saved_description_key = key_text
+        if self.cache_preview_key == key_text and self.cache_preview_worker and self.cache_preview_worker.is_alive():
+            self.status_var.set("正在加载这条保存策略，加载完成后会自动打开策略说明")
+            return
+        self.status_var.set("正在读取保存策略，加载完成后会自动打开策略说明")
+        self._start_saved_strategy_preview(key_text)
 
     def _show_backtest_context_menu(self, event: tk.Event) -> None:
         row_id = self.bt_tree.identify_row(event.y)
