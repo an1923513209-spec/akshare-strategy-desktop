@@ -419,6 +419,7 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_prediction_results: dict[str, dict[str, Any]] = {}
         self.selected_scan_rank: int = 0
         self.backtest_checked_symbols: set[str] = set()
+        self.ml_checked_symbols: set[str] = set()
         self.backtest_chart_payload: dict[str, Any] | None = None
         self.backtest_zoom: tuple[int, int] | None = None
         self.backtest_drag_start_x: int | None = None
@@ -960,29 +961,28 @@ class StrategyDesktopApp(tk.Tk):
         ml_eval_buttons.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 8))
         ml_eval_buttons.columnconfigure(0, weight=1)
         ml_eval_buttons.columnconfigure(1, weight=1)
-        ml_eval_buttons.columnconfigure(2, weight=1)
-        ttk.Button(ml_eval_buttons, text="评估当前股票", command=self.run_ml_backtest, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(ml_eval_buttons, text="评估选中股票", command=self.run_selected_saved_stock_ml_backtests).grid(row=0, column=1, sticky="ew", padx=(4, 4))
-        ttk.Button(ml_eval_buttons, text="评估全部股票池", command=self.run_all_saved_stock_ml_backtests).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        ttk.Button(ml_eval_buttons, text="评估勾选股票", command=self.run_selected_saved_stock_ml_backtests, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(ml_eval_buttons, text="评估全部股票池", command=self.run_all_saved_stock_ml_backtests).grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self.ml_stop_backtest_button = ttk.Button(ml_eval_buttons, text="终止", command=self.stop_backtest, state=tk.DISABLED)
-        self.ml_stop_backtest_button.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        ttk.Label(ml_eval_buttons, text="逐只点股票，在右上角填持股/成本并保存；持股数>0 的股票会排在前面。", foreground="#607086").grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.ml_stop_backtest_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(ml_eval_buttons, text="勾选列决定 ML 评估范围；蓝色选中只用于编辑右上角持股/成本。持股数>0 的股票会排在前面。", foreground="#607086").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.ml_saved_stock_tree = ttk.Treeview(
             saved_box,
-            columns=("symbol", "name", "shares", "cost", "count", "latest"),
+            columns=("checked", "symbol", "name", "shares", "cost", "count", "latest"),
             show="headings",
             height=12,
             selectmode="extended",
         )
         self._setup_tree(
             self.ml_saved_stock_tree,
-            {"symbol": "代码", "name": "名称", "shares": "持股数", "cost": "成本价", "count": "策略数", "latest": "最近保存"},
-            {"symbol": 80, "name": 100, "shares": 80, "cost": 80, "count": 60, "latest": 135},
+            {"checked": "选择", "symbol": "代码", "name": "名称", "shares": "持股数", "cost": "成本价", "count": "策略数", "latest": "最近保存"},
+            {"checked": 48, "symbol": 80, "name": 100, "shares": 80, "cost": 80, "count": 60, "latest": 135},
         )
         self.ml_saved_stock_tree.grid(row=1, column=0, sticky="nsew")
         ml_saved_vscroll = ttk.Scrollbar(saved_box, orient=tk.VERTICAL, command=self.ml_saved_stock_tree.yview)
         ml_saved_vscroll.grid(row=1, column=1, sticky="ns")
         self.ml_saved_stock_tree.configure(yscrollcommand=ml_saved_vscroll.set)
+        self.ml_saved_stock_tree.bind("<Button-1>", self._on_ml_saved_stock_click)
         self.ml_saved_stock_tree.bind("<<TreeviewSelect>>", self._on_ml_saved_stock_select)
         self._render_saved_stock_picker()
 
@@ -1391,6 +1391,7 @@ class StrategyDesktopApp(tk.Tk):
             if tree_name == "ml_saved_stock_tree":
                 rows = sorted(rows, key=lambda row: str(row.get("latest", "")), reverse=True)
                 rows = sorted(rows, key=lambda row: 0 if self._position_shares_count(str(row["symbol"])) > 0 else 1)
+                self.ml_checked_symbols.intersection_update({str(row["symbol"]) for row in rows})
             for row in rows:
                 symbol = str(row["symbol"])
                 if tree_name == "saved_stock_tree":
@@ -1408,6 +1409,7 @@ class StrategyDesktopApp(tk.Tk):
                 elif tree_name == "ml_saved_stock_tree":
                     position = self._stock_position(symbol)
                     values = (
+                        "☑" if symbol in self.ml_checked_symbols else "☐",
                         symbol,
                         row.get("name", ""),
                         position.get("shares", ""),
@@ -1871,6 +1873,31 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_shares.set(str(position.get("shares", "")))
         self.ml_buy_price.set(str(position.get("cost", "")))
         self.status_var.set(f"ML 板块已选择股票：{symbol} {name}；右侧仓位仅用于编辑，点保存后才会修改")
+
+    def _on_ml_saved_stock_click(self, event: tk.Event) -> str | None:
+        row_id = self.ml_saved_stock_tree.identify_row(event.y)
+        if not row_id:
+            return None
+        column_name = self._tree_column_name(self.ml_saved_stock_tree, self.ml_saved_stock_tree.identify_column(event.x))
+        if column_name != "checked":
+            return None
+        symbol = str(row_id)
+        if symbol in self.ml_checked_symbols:
+            self.ml_checked_symbols.remove(symbol)
+            state = "取消勾选"
+        else:
+            self.ml_checked_symbols.add(symbol)
+            state = "已勾选"
+        selected = list(self.ml_saved_stock_tree.selection())
+        focused = self.ml_saved_stock_tree.focus()
+        self._render_saved_stock_picker()
+        keep_selected = [item for item in selected if self.ml_saved_stock_tree.exists(item)]
+        if keep_selected:
+            self.ml_saved_stock_tree.selection_set(keep_selected)
+        if focused and self.ml_saved_stock_tree.exists(focused):
+            self.ml_saved_stock_tree.focus(focused)
+        self.status_var.set(f"ML评估范围：{symbol} {state}")
+        return "break"
 
     def _render_strategy_cache_list(self) -> None:
         if not hasattr(self, "cache_tree"):
@@ -2606,9 +2633,9 @@ class StrategyDesktopApp(tk.Tk):
     def run_selected_saved_stock_ml_backtests(self) -> None:
         symbols = self._selected_ml_saved_symbols()
         if not symbols:
-            self.status_var.set("请先在 ML 股票池左侧选中要评估的股票")
+            self.status_var.set("请先在 ML 股票池的“选择”列勾选要评估的股票")
             return
-        self._start_saved_stock_ml_backtests(symbols, "ML选中股票评估")
+        self._start_saved_stock_ml_backtests(symbols, "ML勾选股票评估")
 
     def run_all_saved_stock_ml_backtests(self) -> None:
         symbols = self._all_ml_saved_symbols()
@@ -2636,10 +2663,7 @@ class StrategyDesktopApp(tk.Tk):
 
     def _selected_ml_saved_symbols(self) -> list[str]:
         all_symbols = set(self._all_ml_saved_symbols())
-        if hasattr(self, "ml_saved_stock_tree"):
-            selected = [symbol for symbol in self.ml_saved_stock_tree.selection() if symbol in all_symbols]
-            return selected
-        return []
+        return [symbol for symbol in self._all_ml_saved_symbols() if symbol in all_symbols and symbol in self.ml_checked_symbols]
 
     def _all_ml_saved_symbols(self) -> list[str]:
         rows = self._saved_stock_rows(exclude_strategy_type="ml", selected_for_left_only=True)
