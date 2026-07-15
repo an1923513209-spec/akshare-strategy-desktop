@@ -910,33 +910,18 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_fee = tk.StringVar(value=self.bt_fee.get())
         self.ml_risk = tk.StringVar(value=self.bt_risk.get())
         self.ml_horizon = tk.StringVar(value=self.bt_horizon.get())
+        self.ml_advice_days = tk.StringVar(value="3")
         self.ml_shares = tk.StringVar(value=self.bt_shares.get())
         self.ml_buy_price = tk.StringVar(value=self.bt_buy_price.get())
         self.ml_buy_date = tk.StringVar(value=self.bt_buy_date.get())
         self.ml_position_symbol = tk.StringVar(value="")
 
-        self._labeled_entry(top, "股票", self.ml_symbol, 0, width=14)
+        self._labeled_combo(top, "建议周期", self.ml_advice_days, ("1", "3", "10"), 0)
         self._labeled_entry(top, "开始日期", self.ml_start, 1, width=10)
         self._labeled_combo(top, "复权", self.ml_adjust, ("qfq", "", "hfq"), 2)
         self._labeled_entry(top, "手续费", self.ml_fee, 3, width=10)
         self._labeled_combo(top, "风险", self.ml_risk, ("normal", "tight", "loose"), 4)
         self._labeled_combo(top, "周期", self.ml_horizon, ("short", "swing", "trend"), 5)
-
-        portfolio_box = ttk.LabelFrame(top, text="我的真实资金/仓位")
-        portfolio_box.grid(row=0, column=6, rowspan=2, columnspan=7, sticky="ew", padx=(14, 0), pady=(0, 2))
-        for idx in range(8):
-            portfolio_box.columnconfigure(idx, weight=1 if idx in {1, 3, 5} else 0)
-        ttk.Label(portfolio_box, text="总资金").grid(row=0, column=0, sticky="w", padx=(10, 6), pady=(8, 3))
-        ttk.Entry(portfolio_box, textvariable=self.ml_cash, width=12).grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=(8, 3))
-        ttk.Label(portfolio_box, text="目标总仓位%").grid(row=0, column=2, sticky="w", padx=(0, 6), pady=(8, 3))
-        ttk.Entry(portfolio_box, textvariable=self.ml_target_position, width=10).grid(row=0, column=3, sticky="ew", padx=(0, 10), pady=(8, 3))
-        ttk.Label(portfolio_box, text="选中股票").grid(row=0, column=4, sticky="w", padx=(0, 6), pady=(8, 3))
-        ttk.Label(portfolio_box, textvariable=self.ml_position_symbol, foreground="#405269").grid(row=0, column=5, sticky="ew", padx=(0, 10), pady=(8, 3))
-        ttk.Label(portfolio_box, text="持股数").grid(row=1, column=0, sticky="w", padx=(10, 6), pady=(3, 8))
-        ttk.Entry(portfolio_box, textvariable=self.ml_shares, width=12).grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(3, 8))
-        ttk.Label(portfolio_box, text="成本价").grid(row=1, column=2, sticky="w", padx=(0, 6), pady=(3, 8))
-        ttk.Entry(portfolio_box, textvariable=self.ml_buy_price, width=12).grid(row=1, column=3, sticky="ew", padx=(0, 10), pady=(3, 8))
-        ttk.Button(portfolio_box, text="保存当前股票仓位", command=self._save_selected_ml_position, style="Primary.TButton").grid(row=1, column=4, columnspan=2, sticky="ew", padx=(0, 10), pady=(3, 8))
 
         note = (
             "ML 现在只做持仓风险、异常检测和组合权重分配；传统回测仍负责买入/卖出点。\n"
@@ -956,9 +941,27 @@ class StrategyDesktopApp(tk.Tk):
         ml_body.add(ml_result_frame, weight=5)
         saved_box.columnconfigure(0, weight=1)
         saved_box.rowconfigure(0, weight=0)
-        saved_box.rowconfigure(1, weight=1)
+        saved_box.rowconfigure(1, weight=0)
+        saved_box.rowconfigure(2, weight=1)
+
+        portfolio_box = ttk.LabelFrame(saved_box, text="我的真实资金/仓位")
+        portfolio_box.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 8))
+        for idx in range(4):
+            portfolio_box.columnconfigure(idx, weight=1 if idx in {1, 3} else 0)
+        ttk.Label(portfolio_box, text="总资金").grid(row=0, column=0, sticky="w", padx=(10, 6), pady=(8, 3))
+        ttk.Entry(portfolio_box, textvariable=self.ml_cash, width=12).grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=(8, 3))
+        ttk.Label(portfolio_box, text="目标总仓位%").grid(row=0, column=2, sticky="w", padx=(0, 6), pady=(8, 3))
+        ttk.Entry(portfolio_box, textvariable=self.ml_target_position, width=10).grid(row=0, column=3, sticky="ew", padx=(0, 10), pady=(8, 3))
+        ttk.Label(portfolio_box, text="选中股票").grid(row=1, column=0, sticky="w", padx=(10, 6), pady=3)
+        ttk.Label(portfolio_box, textvariable=self.ml_position_symbol, foreground="#405269").grid(row=1, column=1, columnspan=3, sticky="ew", padx=(0, 10), pady=3)
+        ttk.Label(portfolio_box, text="持股数").grid(row=2, column=0, sticky="w", padx=(10, 6), pady=(3, 8))
+        ttk.Entry(portfolio_box, textvariable=self.ml_shares, width=12).grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=(3, 8))
+        ttk.Label(portfolio_box, text="成本价").grid(row=2, column=2, sticky="w", padx=(0, 6), pady=(3, 8))
+        ttk.Entry(portfolio_box, textvariable=self.ml_buy_price, width=12).grid(row=2, column=3, sticky="ew", padx=(0, 10), pady=(3, 8))
+        ttk.Button(portfolio_box, text="保存当前股票仓位", command=self._save_selected_ml_position, style="Primary.TButton").grid(row=3, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 8))
+
         ml_eval_buttons = ttk.Frame(saved_box)
-        ml_eval_buttons.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 8))
+        ml_eval_buttons.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 8))
         ml_eval_buttons.columnconfigure(0, weight=1)
         ml_eval_buttons.columnconfigure(1, weight=1)
         ttk.Button(ml_eval_buttons, text="评估勾选股票", command=self.run_selected_saved_stock_ml_backtests, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 4))
@@ -978,9 +981,9 @@ class StrategyDesktopApp(tk.Tk):
             {"checked": "选择", "symbol": "代码", "name": "名称", "shares": "持股数", "cost": "成本价", "count": "策略数", "latest": "最近保存"},
             {"checked": 48, "symbol": 80, "name": 100, "shares": 80, "cost": 80, "count": 60, "latest": 135},
         )
-        self.ml_saved_stock_tree.grid(row=1, column=0, sticky="nsew")
+        self.ml_saved_stock_tree.grid(row=2, column=0, sticky="nsew")
         ml_saved_vscroll = ttk.Scrollbar(saved_box, orient=tk.VERTICAL, command=self.ml_saved_stock_tree.yview)
-        ml_saved_vscroll.grid(row=1, column=1, sticky="ns")
+        ml_saved_vscroll.grid(row=2, column=1, sticky="ns")
         self.ml_saved_stock_tree.configure(yscrollcommand=ml_saved_vscroll.set)
         self.ml_saved_stock_tree.bind("<Button-1>", self._on_ml_saved_stock_click)
         self.ml_saved_stock_tree.bind("<<TreeviewSelect>>", self._on_ml_saved_stock_select)
@@ -1027,6 +1030,7 @@ class StrategyDesktopApp(tk.Tk):
         ml_vscroll = ttk.Scrollbar(ml_table_frame, orient=tk.VERTICAL, command=self.ml_tree.yview)
         ml_vscroll.grid(row=0, column=1, sticky="ns")
         self.ml_tree.configure(yscrollcommand=ml_vscroll.set)
+        self.ml_advice_days.trace_add("write", lambda *_args: self._refresh_ml_advice_view())
 
     def _build_ml_monitor_tab(self) -> None:
         self.ml_monitor_tab.columnconfigure(0, weight=1)
@@ -3300,6 +3304,84 @@ class StrategyDesktopApp(tk.Tk):
             weighted.append(item)
         return sorted(weighted, key=lambda item: float(item.get("target_weight", 0)), reverse=True)
 
+    def _ml_selected_advice_days(self) -> int:
+        try:
+            days = int(str(self.ml_advice_days.get()).strip() or "3")
+        except Exception:
+            days = 3
+        return days if days in {1, 3, 10} else 3
+
+    def _ml_period_projection(self, result: dict[str, Any], days: int) -> dict[str, Any]:
+        prediction = result.get("prediction", {}) if isinstance(result.get("prediction"), dict) else {}
+        horizons = {int(item.get("days", 0)): item for item in prediction.get("horizons", []) or [] if isinstance(item, dict)}
+        factor = prediction.get("factor", {}) if isinstance(prediction.get("factor"), dict) else {}
+        anomaly = prediction.get("anomaly", {}) if isinstance(prediction.get("anomaly"), dict) else {}
+        risk_score = float(prediction.get("risk_score", 50) or 50)
+        if days == 1:
+            factor_score = float(factor.get("score", 50) or 50)
+            ret5 = float(factor.get("ret5_pct", 0) or 0)
+            anomaly_penalty = {"normal": 0, "watch": 5, "high": 14, "severe": 25, "unknown": 5}.get(str(anomaly.get("level", "unknown")), 5)
+            strength = float(np.clip(45 + (factor_score - 50) * 0.38 + (risk_score - 50) * 0.18 - anomaly_penalty, 5, 95))
+            return {"prob_pct": strength, "expected_return_pct": ret5 / 5.0, "label": "1日强度", "detail": "1日建议用最新因子、异常和风险即时估算。"}
+        horizon = horizons.get(days) or {}
+        return {
+            "prob_pct": float(horizon.get("up_prob", np.nan)) * 100,
+            "expected_return_pct": float(horizon.get("expected_return_pct", np.nan)),
+            "label": f"{days}日上涨",
+            "detail": str(horizon.get("detail", "")),
+        }
+
+    def _ml_period_advice(self, result: dict[str, Any], days: int | None = None) -> dict[str, Any]:
+        days = self._ml_selected_advice_days() if days is None else days
+        projection = self._ml_period_projection(result, days)
+        prediction = result.get("prediction", {}) if isinstance(result.get("prediction"), dict) else {}
+        anomaly = prediction.get("anomaly", {}) if isinstance(prediction.get("anomaly"), dict) else {}
+        holding = prediction.get("holding_risk", {}) if isinstance(prediction.get("holding_risk"), dict) else {}
+        shares = self._position_shares_count(str(result.get("symbol", "")))
+        prob = float(projection.get("prob_pct", np.nan))
+        exp = float(projection.get("expected_return_pct", np.nan))
+        risk_score = float(prediction.get("risk_score", 50) or 50)
+        anomaly_level = str(anomaly.get("level", "unknown"))
+        holding_level = str(holding.get("level", "观察"))
+        reasons: list[str] = []
+        if anomaly_level in {"high", "severe"}:
+            reasons.append(f"异常等级 {anomaly_level}")
+        if holding_level in {"高风险", "风险升高"}:
+            reasons.append(f"持仓风险 {holding_level}")
+        if np.isfinite(prob):
+            reasons.append(f"{projection.get('label')} {prob:.1f}%")
+        if np.isfinite(exp):
+            reasons.append(f"{days}日预期 {exp:.1f}%")
+
+        if anomaly_level == "severe" or holding_level == "高风险" or risk_score < 30:
+            action = "卖出/减仓" if shares > 0 else "暂不买入"
+        elif anomaly_level == "high" or holding_level == "风险升高":
+            action = "减仓/观察" if shares > 0 else "暂不买入"
+        elif np.isfinite(exp) and exp <= -0.8:
+            action = "卖出/减仓" if shares > 0 else "暂不买入"
+        elif np.isfinite(prob) and prob < 43:
+            action = "减仓/观察" if shares > 0 else "暂不买入"
+        elif np.isfinite(prob) and prob >= 58 and (not np.isfinite(exp) or exp >= 0.4) and risk_score >= 55:
+            action = "持有/加仓" if shares > 0 else "买入观察"
+        elif shares > 0:
+            action = "持有/观察"
+        else:
+            action = "暂不买入"
+        return {
+            "action": action,
+            "prob_pct": prob,
+            "expected_return_pct": exp,
+            "detail": "；".join(reasons) if reasons else str(projection.get("detail", "")) or "暂无明确优势。",
+        }
+
+    def _refresh_ml_advice_view(self) -> None:
+        if not hasattr(self, "ml_tree") or not self.ml_prediction_results:
+            return
+        current = str(self.ml_tree.selection()[0]) if self.ml_tree.selection() else next(iter(self.ml_prediction_results), "")
+        self._render_ml_prediction_table(list(self.ml_prediction_results.values()))
+        if current and current in self.ml_prediction_results:
+            self._select_ml_prediction(current)
+
     def _render_ml_prediction_table(self, results: list[dict[str, Any]]) -> None:
         for iid in self.ml_tree.get_children():
             self.ml_tree.delete(iid)
@@ -3307,23 +3389,28 @@ class StrategyDesktopApp(tk.Tk):
         if not all("target_weight" in item for item in ranked):
             ranked = self._apply_portfolio_weights(ranked)
         self.ml_prediction_results = {str(item["symbol"]): item for item in ranked}
+        days = self._ml_selected_advice_days()
+        self.ml_tree.heading("action", text=f"{days}日建议")
+        self.ml_tree.heading("prob10", text=("1日强度%" if days == 1 else f"{days}日涨%"))
+        self.ml_tree.heading("exp10", text=f"{days}日预期%")
         for rank, result in enumerate(ranked, start=1):
             row = result.get("row") or _ml_prediction_row(result)
+            advice = self._ml_period_advice(result, days)
             symbol = str(row["symbol"])
             values = (
                 rank,
                 symbol,
                 row.get("name", ""),
-                row.get("rebalance_action", "-"),
+                advice.get("action", "-"),
                 self._fmt_number(row.get("current_weight")),
                 self._fmt_number(row.get("target_weight")),
                 int(row.get("trade_shares", 0) or 0),
                 row.get("holding_risk", "-"),
                 self._fmt_number(row.get("risk")),
-                self._fmt_number(row.get("prob10")),
-                self._fmt_number(row.get("exp10")),
+                self._fmt_number(advice.get("prob_pct")),
+                self._fmt_number(advice.get("expected_return_pct")),
                 self._fmt_number(row.get("factor")),
-                row.get("risk_detail", "-"),
+                advice.get("detail") or row.get("risk_detail", "-"),
             )
             self.ml_tree.insert("", "end", iid=symbol, values=values)
 
@@ -3339,10 +3426,14 @@ class StrategyDesktopApp(tk.Tk):
             return
         self.ml_backtest_result = result
         row = result.get("row") or _ml_prediction_row(result)
+        days = self._ml_selected_advice_days()
+        advice = self._ml_period_advice(result, days)
         self.ml_summary_var.set(
             f"{row['symbol']} {row['name']} | 持仓风险 {row.get('holding_risk', '-')} | "
-            f"目标仓位 {self._fmt_number(row.get('target_weight'))}% | 风险分 {self._fmt_number(row.get('risk'))} | "
-            f"10日上涨 {self._fmt_number(row.get('prob10'))}% | 缓冲/现金 {self._fmt_number(result.get('cash_reserve', 0))}%"
+            f"{days}日建议 {advice.get('action', '-')} | "
+            f"{'1日强度' if days == 1 else str(days) + '日上涨'} {self._fmt_number(advice.get('prob_pct'))}% | "
+            f"{days}日预期 {self._fmt_number(advice.get('expected_return_pct'))}% | "
+            f"目标仓位 {self._fmt_number(row.get('target_weight'))}% | 缓冲/现金 {self._fmt_number(result.get('cash_reserve', 0))}%"
         )
         try:
             self._draw_ml_prediction_chart(result)
@@ -4165,25 +4256,28 @@ class StrategyDesktopApp(tk.Tk):
 
         panel_x = width - pad_right + 20
         panel_y = pad_top
-        horizons = {int(item["days"]): item for item in prediction.get("horizons", [])}
         factor = prediction.get("factor", {}) if isinstance(prediction.get("factor"), dict) else {}
         anomaly = prediction.get("anomaly", {}) if isinstance(prediction.get("anomaly"), dict) else {}
         mc = prediction.get("monte_carlo", {}) if isinstance(prediction.get("monte_carlo"), dict) else {}
         holding = prediction.get("holding_risk", {}) if isinstance(prediction.get("holding_risk"), dict) else {}
         news = prediction.get("news_sentiment", {}) if isinstance(prediction.get("news_sentiment"), dict) else {}
+        days = self._ml_selected_advice_days()
+        advice = self._ml_period_advice(result, days)
         lines = [
             f"持仓风险：{holding.get('level', '-')}",
+            f"{days}日建议：{advice.get('action', '-')}",
             f"目标仓位：{self._fmt_number(result.get('target_weight'))}%",
             f"现金/缓冲：{self._fmt_number(result.get('cash_reserve', 0))}%",
             f"风险分：{self._fmt_number(prediction.get('risk_score'))}",
             f"异常：{anomaly.get('level', '-')}",
             f"新闻风险：{news.get('level', '-')}",
             f"波动：{self._fmt_number(factor.get('atr_pct'))}%",
-            f"10日上涨：{self._fmt_number(float(horizons.get(10, {}).get('up_prob', np.nan)) * 100)}%",
-            f"10日预期：{self._fmt_number(horizons.get(10, {}).get('expected_return_pct'))}%",
+            f"{'1日强度' if days == 1 else str(days) + '日上涨'}：{self._fmt_number(advice.get('prob_pct'))}%",
+            f"{days}日预期：{self._fmt_number(advice.get('expected_return_pct'))}%",
             f"因子分：{self._fmt_number(factor.get('score'))}",
             f"蒙特卡洛10日上涨：{self._fmt_number(float(mc.get('up_prob', np.nan)) * 100)}%",
             f"VaR 95%：{self._fmt_number(mc.get('var_95_pct'))}%",
+            f"周期说明：{advice.get('detail', '-')}",
             f"风控说明：{holding.get('detail', '-')}",
             f"新闻/公告：{news.get('detail', '-')}",
         ]
