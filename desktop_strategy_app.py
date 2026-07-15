@@ -893,13 +893,7 @@ class StrategyDesktopApp(tk.Tk):
 
     def _build_ml_tab(self) -> None:
         self.ml_tab.columnconfigure(0, weight=1)
-        self.ml_tab.rowconfigure(3, weight=1)
-
-        top = ttk.LabelFrame(self.ml_tab, text="ML 风控与组合权重")
-        top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        for idx in range(11):
-            top.columnconfigure(idx, weight=0)
-        top.columnconfigure(11, weight=1)
+        self.ml_tab.rowconfigure(0, weight=1)
 
         self.ml_symbol = tk.StringVar(value=self.bt_symbol.get())
         self.ml_start = tk.StringVar(value=self.bt_start.get())
@@ -916,24 +910,13 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_buy_date = tk.StringVar(value=self.bt_buy_date.get())
         self.ml_position_symbol = tk.StringVar(value="")
 
-        self._labeled_combo(top, "建议周期", self.ml_advice_days, ("1", "3", "10"), 0)
-        self._labeled_entry(top, "开始日期", self.ml_start, 1, width=10)
-        self._labeled_combo(top, "复权", self.ml_adjust, ("qfq", "", "hfq"), 2)
-        self._labeled_entry(top, "手续费", self.ml_fee, 3, width=10)
-        self._labeled_combo(top, "风险", self.ml_risk, ("normal", "tight", "loose"), 4)
-        self._labeled_combo(top, "周期", self.ml_horizon, ("short", "swing", "trend"), 5)
-
         note = (
             "ML 现在只做持仓风险、异常检测和组合权重分配；传统回测仍负责买入/卖出点。\n"
             "多只股票一起评估时，会按风险分、波动率和异常状态给目标仓位；新闻/资金流源未接入时会明确标注，不会假装已分析。"
         )
-        ttk.Label(self.ml_tab, text=note, foreground="#405269", justify=tk.LEFT).grid(row=1, column=0, sticky="ew", pady=(0, 8))
-
-        self.ml_summary_var = tk.StringVar(value="尚未 ML 风控评估")
-        ttk.Label(self.ml_tab, textvariable=self.ml_summary_var, anchor="w").grid(row=2, column=0, sticky="ew", pady=(0, 8))
 
         ml_body = ttk.PanedWindow(self.ml_tab, orient=tk.HORIZONTAL)
-        ml_body.grid(row=3, column=0, sticky="nsew")
+        ml_body.grid(row=0, column=0, sticky="nsew")
 
         saved_box = ttk.LabelFrame(self.ml_tab, text="已保存股票 / 我的持仓")
         ml_result_frame = ttk.Frame(ml_body)
@@ -990,9 +973,25 @@ class StrategyDesktopApp(tk.Tk):
         self._render_saved_stock_picker()
 
         ml_result_frame.columnconfigure(0, weight=1)
-        ml_result_frame.rowconfigure(0, weight=1)
+        ml_result_frame.rowconfigure(2, weight=1)
+
+        top = ttk.LabelFrame(ml_result_frame, text="ML 风控与组合权重")
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for idx in range(6):
+            top.columnconfigure(idx, weight=1)
+        self._labeled_combo(top, "建议周期", self.ml_advice_days, ("1", "3", "10"), 0)
+        self._labeled_entry(top, "开始日期", self.ml_start, 1, width=10)
+        self._labeled_combo(top, "复权", self.ml_adjust, ("qfq", "", "hfq"), 2)
+        self._labeled_entry(top, "手续费", self.ml_fee, 3, width=10)
+        self._labeled_combo(top, "风险", self.ml_risk, ("normal", "tight", "loose"), 4)
+        self._labeled_combo(top, "周期", self.ml_horizon, ("short", "swing", "trend"), 5)
+        ttk.Label(top, text=note, foreground="#405269", justify=tk.LEFT).grid(row=2, column=0, columnspan=6, sticky="ew", padx=8, pady=(6, 8))
+
+        self.ml_summary_var = tk.StringVar(value="尚未 ML 风控评估")
+        ttk.Label(ml_result_frame, textvariable=self.ml_summary_var, anchor="w").grid(row=1, column=0, sticky="ew", pady=(0, 8))
+
         ml_result_pane = ttk.PanedWindow(ml_result_frame, orient=tk.VERTICAL)
-        ml_result_pane.grid(row=0, column=0, sticky="nsew")
+        ml_result_pane.grid(row=2, column=0, sticky="nsew")
         ml_chart_frame = ttk.Frame(ml_result_pane)
         ml_table_frame = ttk.Frame(ml_result_pane)
         ml_result_pane.add(ml_chart_frame, weight=3)
