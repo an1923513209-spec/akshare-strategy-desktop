@@ -103,6 +103,7 @@ def _daily_gate_from_backtest_payload(
     slow = int(best["slow"])
     save_strategy = str(form.get("_save_strategy", "")).lower() in {"1", "true", "yes"}
     active_strategy = str(form.get("_active_strategy", "")).lower() in {"1", "true", "yes"}
+    selected_for_left = str(form.get("_selected_for_left", "")).lower() in {"1", "true", "yes"}
     cache_strategy_filter = f"{strategy_type}_{fast}_{slow}" if save_strategy else strategy_filter
     cache_key = engine.strategy_cache_key(symbol, form.get("start", "20200101"), form.get("adjust", "qfq"), cash, fee, horizon, cache_strategy_filter, risk)
     latest_fast = float(fast_line.iloc[-1])
@@ -145,7 +146,10 @@ def _daily_gate_from_backtest_payload(
     engine.attach_ml_risk_snapshot(result, data, fast, slow, strategy_type, stop_line)
     engine.DAILY_GATE_CACHE[cache_key] = result
     if save_strategy:
-        result["_active_for_trading"] = active_strategy
+        if active_strategy:
+            result["_active_for_trading"] = True
+        if selected_for_left or active_strategy:
+            result["_selected_for_left"] = True
         engine.save_daily_gate(cache_key, result)
     return result
 
@@ -156,7 +160,7 @@ def _save_all_scan_strategies_from_payload(
     data: pd.DataFrame,
     scan: pd.DataFrame,
     horizon: str,
-    active_index: Any,
+    active_index: Any | None,
 ) -> dict[str, Any] | None:
     active_gate: dict[str, Any] | None = None
     for index, row in scan.iterrows():
@@ -166,7 +170,9 @@ def _save_all_scan_strategies_from_payload(
         fast_line, slow_line, entries, exits = engine.strategy_signals(data, fast, slow, horizon, strategy_type)
         save_form = form.copy()
         save_form["_save_strategy"] = "1"
-        save_form["_active_strategy"] = "1" if index == active_index else "0"
+        if active_index is not None and index == active_index:
+            save_form["_active_strategy"] = "1"
+            save_form["_selected_for_left"] = "1"
         gate = _daily_gate_from_backtest_payload(save_form, symbol, data, row, fast_line, slow_line, entries, exits, horizon)
         if index == active_index:
             active_gate = gate
@@ -197,7 +203,7 @@ def _compute_backtest_payload(form: dict[str, str]) -> dict[str, Any]:
     trades = portfolio.trades.records_readable
     equity = portfolio.value()
     if str(form.get("_save_all_strategies", "")).lower() in {"1", "true", "yes"}:
-        gate = _save_all_scan_strategies_from_payload(form, symbol, data, scan, horizon, best.name)
+        gate = _save_all_scan_strategies_from_payload(form, symbol, data, scan, horizon, None)
         if gate is None:
             gate = _daily_gate_from_backtest_payload(form, symbol, data, best, fast_line, slow_line, entries, exits, horizon)
     else:
@@ -1280,6 +1286,7 @@ class StrategyDesktopApp(tk.Tk):
             if same_symbol:
                 other["active_for_trading"] = False
         record["active_for_trading"] = True
+        record["selected_for_left"] = True
         engine.save_persistent_strategy_cache()
         self.monitor_strategy_keys[code] = key_text
         self.ml_monitor_strategy_keys[code] = key_text
@@ -1839,20 +1846,22 @@ class StrategyDesktopApp(tk.Tk):
             parent_rows.append((code, rows))
         parent_rows.sort(key=lambda item: str(item[1][0][1].get("saved_at", "")) if item[1] else "", reverse=True)
         for code, rows in parent_rows:
-            active = rows[0][1] if rows else {}
+            visible_rows = [item for item in rows if bool(item[1].get("selected_for_left"))]
+            active_candidates = [item for item in visible_rows if bool(item[1].get("active_for_trading"))]
+            active = active_candidates[0][1] if active_candidates else (visible_rows[0][1] if visible_rows else rows[0][1])
             latest = str(rows[0][1].get("saved_at", "")) if rows else ""
             name = str(active.get("name") or engine.stock_display_name(code))
-            active_strategy = self._strategy_display_name(active) if isinstance(active, dict) else ""
+            active_strategy = self._strategy_display_name(active_candidates[0][1]) if active_candidates else ""
             parent_iid = self._cache_stock_iid(code)
             self.cache_tree.insert(
                 "",
                 "end",
                 iid=parent_iid,
                 text=f"{code} {name}".strip(),
-                values=(code, name, f"共 {len(rows)} 条", active_strategy, latest[:10]),
+                values=(code, name, f"已选 {len(visible_rows)} / 全部 {len(rows)}", active_strategy, latest[:10]),
                 open=False,
             )
-            for key_text, record in rows:
+            for key_text, record in visible_rows:
                 params = record.get("params", {}) if isinstance(record.get("params"), dict) else {}
                 strategy = self._strategy_display_name(record)
                 marker = "★ " if bool(record.get("active_for_trading")) else ""
@@ -1889,6 +1898,8 @@ class StrategyDesktopApp(tk.Tk):
             if engine.normalize_symbol(str(record.get("symbol", ""))) != code:
                 continue
             if not self._record_matches_strategy_filter(record, strategy_filter, exclude_strategy_type):
+                continue
+            if not bool(record.get("selected_for_left")):
                 continue
             result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
             signal = result.get("daily_signal", {}) if isinstance(result.get("daily_signal"), dict) else {}
@@ -2091,6 +2102,8 @@ class StrategyDesktopApp(tk.Tk):
                 if rows:
                     strategy_key = rows[0][0]
                     self.monitor_strategy_keys[code] = strategy_key
+            if not strategy_key:
+                continue
             position = self._stock_position(code)
             tasks.append(
                 {
@@ -2564,6 +2577,7 @@ class StrategyDesktopApp(tk.Tk):
         slow = int(best["slow"])
         save_strategy = str(form.get("_save_strategy", "")).lower() in {"1", "true", "yes"}
         active_strategy = str(form.get("_active_strategy", "")).lower() in {"1", "true", "yes"}
+        selected_for_left = str(form.get("_selected_for_left", "")).lower() in {"1", "true", "yes"}
         cache_strategy_filter = f"{strategy_type}_{fast}_{slow}" if save_strategy else strategy_filter
         cache_key = engine.strategy_cache_key(symbol, form.get("start", "20200101"), form.get("adjust", "qfq"), cash, fee, horizon, cache_strategy_filter, risk)
         latest_fast = float(fast_line.iloc[-1])
@@ -2607,7 +2621,10 @@ class StrategyDesktopApp(tk.Tk):
         engine.attach_ml_risk_snapshot(result, data, fast, slow, strategy_type, stop_line)
         engine.DAILY_GATE_CACHE[cache_key] = result
         if save_strategy:
-            result["_active_for_trading"] = active_strategy
+            if active_strategy:
+                result["_active_for_trading"] = True
+            if selected_for_left or active_strategy:
+                result["_selected_for_left"] = True
             engine.save_daily_gate(cache_key, result)
         return result
 
@@ -3220,6 +3237,13 @@ class StrategyDesktopApp(tk.Tk):
     def _on_backtest_rank_select(self, _event: object | None = None) -> None:
         selection = self.bt_tree.selection()
         if selection and str(selection[0]).startswith("saved:"):
+            tags = self.bt_tree.item(selection[0], "tags")
+            key_text = str(tags[0]) if tags else ""
+            if key_text:
+                self._set_active_strategy_for_symbol(key_text)
+                self._start_saved_strategy_preview(key_text)
+                self._render_strategy_cache_list()
+                self.status_var.set("已把右侧选中的保存策略加入左侧，并设为盘中/ML使用策略")
             return
         row = self._selected_scan_row()
         if row is None or not self.backtest_result:
@@ -3283,6 +3307,7 @@ class StrategyDesktopApp(tk.Tk):
         form = self._backtest_form()
         form["_save_strategy"] = "1"
         form["_active_strategy"] = "1"
+        form["_selected_for_left"] = "1"
         self.status_var.set("正在后台保存选中策略...")
         worker = threading.Thread(target=self._save_selected_rank_strategy_worker, args=(result, row.copy(), form), daemon=True)
         worker.start()

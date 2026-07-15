@@ -2119,7 +2119,7 @@ def load_latest_saved_daily_gate_for_symbol(
             parsed_key: tuple[str, str, str, str, str, str] | None = parsed  # type: ignore[assignment]
         except Exception:
             parsed_key = None
-        if bool(record.get("active_for_trading")) and (active_record is None or saved_at > active_saved_at):
+        if bool(record.get("selected_for_left")) and bool(record.get("active_for_trading")) and (active_record is None or saved_at > active_saved_at):
             active_key = parsed_key
             active_record = record
             active_saved_at = saved_at
@@ -2146,6 +2146,8 @@ def save_daily_gate(cache_key: tuple[str, str, str, str, str, str], result: dict
     key_text = strategy_cache_key_text(cache_key)
     has_active_marker = "_active_for_trading" in result
     make_active = bool(result.get("_active_for_trading"))
+    has_selected_marker = "_selected_for_left" in result
+    selected_for_left = bool(result.get("_selected_for_left"))
     display_name = str(result.get("name") or "")
     existing_position: dict[str, object] = {}
     existing_record = cache.get(key_text)
@@ -2210,6 +2212,7 @@ def save_daily_gate(cache_key: tuple[str, str, str, str, str, str], result: dict
         "name": display_name,
         "saved_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         "active_for_trading": make_active if has_active_marker else (bool(existing_record.get("active_for_trading")) if isinstance(existing_record, dict) else False),
+        "selected_for_left": selected_for_left if has_selected_marker else (bool(existing_record.get("selected_for_left")) if isinstance(existing_record, dict) else False),
         "params": {
             "symbol": cache_key[0],
             "start": cache_key[1],
