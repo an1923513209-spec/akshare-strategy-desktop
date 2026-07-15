@@ -20,6 +20,7 @@ from tkinter import messagebox, ttk
 import app as engine
 
 MONITOR_SNAPSHOT_PATH = engine.CACHE_DIR / "monitor_snapshot.json"
+ML_PORTFOLIO_SETTINGS_PATH = engine.CACHE_DIR / "ml_portfolio_settings.json"
 RESIZE_REDRAW_DELAY_MS = 260
 CONTENT_MIN_WIDTH = 1180
 CONTENT_MIN_HEIGHT = 650
@@ -788,28 +789,39 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_symbol = tk.StringVar(value=self.bt_symbol.get())
         self.ml_start = tk.StringVar(value=self.bt_start.get())
         self.ml_adjust = tk.StringVar(value=self.bt_adjust.get())
-        self.ml_cash = tk.StringVar(value=self.bt_cash.get())
+        ml_settings = self._load_ml_portfolio_settings()
+        self.ml_cash = tk.StringVar(value=str(ml_settings.get("cash") or self.bt_cash.get()))
+        self.ml_target_position = tk.StringVar(value=str(ml_settings.get("target_position") or "80"))
         self.ml_fee = tk.StringVar(value=self.bt_fee.get())
         self.ml_risk = tk.StringVar(value=self.bt_risk.get())
         self.ml_horizon = tk.StringVar(value=self.bt_horizon.get())
         self.ml_shares = tk.StringVar(value=self.bt_shares.get())
         self.ml_buy_price = tk.StringVar(value=self.bt_buy_price.get())
         self.ml_buy_date = tk.StringVar(value=self.bt_buy_date.get())
+        self.ml_position_symbol = tk.StringVar(value="")
 
         self._labeled_entry(top, "股票", self.ml_symbol, 0, width=14)
         self._labeled_entry(top, "开始日期", self.ml_start, 1, width=10)
         self._labeled_combo(top, "复权", self.ml_adjust, ("qfq", "", "hfq"), 2)
-        self._labeled_entry(top, "资金", self.ml_cash, 3, width=10)
-        self._labeled_entry(top, "手续费", self.ml_fee, 4, width=10)
-        self._labeled_combo(top, "风险", self.ml_risk, ("normal", "tight", "loose"), 5)
-        self._labeled_combo(top, "周期", self.ml_horizon, ("short", "swing", "trend"), 6)
-        self._labeled_entry(top, "持股数", self.ml_shares, 7, width=8)
-        self._labeled_entry(top, "成本价", self.ml_buy_price, 8, width=8)
-        self._labeled_entry(top, "买入日", self.ml_buy_date, 9, width=10)
-        ttk.Button(top, text="评估当前股票", command=self.run_ml_backtest, style="Primary.TButton").grid(row=1, column=10, padx=(8, 0))
-        ttk.Button(top, text="评估选中/全部持仓池", command=self.run_saved_stock_ml_backtests).grid(row=1, column=11, padx=(8, 0), sticky="w")
-        self.ml_stop_backtest_button = ttk.Button(top, text="终止 ML 风控", command=self.stop_backtest, state=tk.DISABLED)
-        self.ml_stop_backtest_button.grid(row=1, column=12, padx=(8, 0), sticky="w")
+        self._labeled_entry(top, "手续费", self.ml_fee, 3, width=10)
+        self._labeled_combo(top, "风险", self.ml_risk, ("normal", "tight", "loose"), 4)
+        self._labeled_combo(top, "周期", self.ml_horizon, ("short", "swing", "trend"), 5)
+
+        portfolio_box = ttk.LabelFrame(top, text="我的真实资金/仓位")
+        portfolio_box.grid(row=0, column=6, rowspan=2, columnspan=7, sticky="ew", padx=(14, 0), pady=(0, 2))
+        for idx in range(8):
+            portfolio_box.columnconfigure(idx, weight=1 if idx in {1, 3, 5} else 0)
+        ttk.Label(portfolio_box, text="总资金").grid(row=0, column=0, sticky="w", padx=(10, 6), pady=(8, 3))
+        ttk.Entry(portfolio_box, textvariable=self.ml_cash, width=12).grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=(8, 3))
+        ttk.Label(portfolio_box, text="目标总仓位%").grid(row=0, column=2, sticky="w", padx=(0, 6), pady=(8, 3))
+        ttk.Entry(portfolio_box, textvariable=self.ml_target_position, width=10).grid(row=0, column=3, sticky="ew", padx=(0, 10), pady=(8, 3))
+        ttk.Label(portfolio_box, text="选中股票").grid(row=0, column=4, sticky="w", padx=(0, 6), pady=(8, 3))
+        ttk.Label(portfolio_box, textvariable=self.ml_position_symbol, foreground="#405269").grid(row=0, column=5, sticky="ew", padx=(0, 10), pady=(8, 3))
+        ttk.Label(portfolio_box, text="持股数").grid(row=1, column=0, sticky="w", padx=(10, 6), pady=(3, 8))
+        ttk.Entry(portfolio_box, textvariable=self.ml_shares, width=12).grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(3, 8))
+        ttk.Label(portfolio_box, text="成本价").grid(row=1, column=2, sticky="w", padx=(0, 6), pady=(3, 8))
+        ttk.Entry(portfolio_box, textvariable=self.ml_buy_price, width=12).grid(row=1, column=3, sticky="ew", padx=(0, 10), pady=(3, 8))
+        ttk.Button(portfolio_box, text="保存总资金/仓位", command=self._save_selected_ml_position, style="Primary.TButton").grid(row=1, column=4, columnspan=2, sticky="ew", padx=(0, 10), pady=(3, 8))
 
         note = (
             "ML 现在只做持仓风险、异常检测和组合权重分配；传统回测仍负责买入/卖出点。\n"
@@ -828,7 +840,16 @@ class StrategyDesktopApp(tk.Tk):
         ml_body.add(saved_box, weight=1)
         ml_body.add(ml_result_frame, weight=5)
         saved_box.columnconfigure(0, weight=1)
-        saved_box.rowconfigure(0, weight=1)
+        saved_box.rowconfigure(0, weight=0)
+        saved_box.rowconfigure(1, weight=1)
+        ml_eval_buttons = ttk.Frame(saved_box)
+        ml_eval_buttons.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 8))
+        ml_eval_buttons.columnconfigure(0, weight=1)
+        ml_eval_buttons.columnconfigure(1, weight=1)
+        ttk.Button(ml_eval_buttons, text="评估当前股票", command=self.run_ml_backtest, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(ml_eval_buttons, text="评估选中/全部股票池", command=self.run_saved_stock_ml_backtests).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.ml_stop_backtest_button = ttk.Button(ml_eval_buttons, text="终止", command=self.stop_backtest, state=tk.DISABLED)
+        self.ml_stop_backtest_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.ml_saved_stock_tree = ttk.Treeview(
             saved_box,
             columns=("symbol", "name", "count", "latest"),
@@ -841,9 +862,9 @@ class StrategyDesktopApp(tk.Tk):
             {"symbol": "代码", "name": "名称", "count": "策略数", "latest": "最近保存"},
             {"symbol": 90, "name": 120, "count": 70, "latest": 150},
         )
-        self.ml_saved_stock_tree.grid(row=0, column=0, sticky="nsew")
+        self.ml_saved_stock_tree.grid(row=1, column=0, sticky="nsew")
         ml_saved_vscroll = ttk.Scrollbar(saved_box, orient=tk.VERTICAL, command=self.ml_saved_stock_tree.yview)
-        ml_saved_vscroll.grid(row=0, column=1, sticky="ns")
+        ml_saved_vscroll.grid(row=1, column=1, sticky="ns")
         self.ml_saved_stock_tree.configure(yscrollcommand=ml_saved_vscroll.set)
         self.ml_saved_stock_tree.bind("<<TreeviewSelect>>", self._on_ml_saved_stock_select)
         self._render_saved_stock_picker()
@@ -1018,6 +1039,28 @@ class StrategyDesktopApp(tk.Tk):
         for col in columns:
             tree.heading(col, text=headings.get(col, col))
             tree.column(col, width=widths.get(col, 90), anchor="center", stretch=(col == stretch_col))
+
+    def _load_ml_portfolio_settings(self) -> dict[str, Any]:
+        if not ML_PORTFOLIO_SETTINGS_PATH.exists():
+            return {}
+        try:
+            with ML_PORTFOLIO_SETTINGS_PATH.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_ml_portfolio_settings(self) -> None:
+        engine.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "cash": self.ml_cash.get().strip(),
+            "target_position": self.ml_target_position.get().strip(),
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        tmp_path = ML_PORTFOLIO_SETTINGS_PATH.with_suffix(".tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        tmp_path.replace(ML_PORTFOLIO_SETTINGS_PATH)
 
     def _record_strategy_type(self, record: dict[str, Any]) -> str:
         result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
@@ -1437,6 +1480,54 @@ class StrategyDesktopApp(tk.Tk):
         if symbol == self.selected_monitor_symbol:
             self.refresh_monitor_symbol(symbol)
 
+    def _save_selected_ml_position(self) -> None:
+        symbol = ""
+        if hasattr(self, "ml_saved_stock_tree"):
+            selection = self.ml_saved_stock_tree.selection()
+            symbol = str(selection[0]) if selection else ""
+        shares = self.ml_shares.get().strip()
+        cost = self.ml_buy_price.get().strip()
+        cash = self.ml_cash.get().strip()
+        target_position = self.ml_target_position.get().strip()
+
+        def is_number_or_blank(value: str) -> bool:
+            if not value:
+                return True
+            try:
+                float(value)
+                return True
+            except ValueError:
+                return False
+
+        if not is_number_or_blank(cash) or (cash and float(cash) <= 0):
+            messagebox.showwarning("总资金格式不对", "总资金只能填大于 0 的数字。")
+            return
+        if not is_number_or_blank(target_position):
+            messagebox.showwarning("总仓位格式不对", "目标总仓位只能填 0-100 的数字。")
+            return
+        if target_position:
+            target = float(target_position)
+            if target < 0 or target > 100:
+                messagebox.showwarning("总仓位格式不对", "目标总仓位只能填 0-100。")
+                return
+        if not is_number_or_blank(shares):
+            messagebox.showwarning("持仓格式不对", "持股数只能填数字，或留空。")
+            return
+        if not is_number_or_blank(cost):
+            messagebox.showwarning("成本格式不对", "成本价只能填数字，或留空。")
+            return
+
+        self._save_ml_portfolio_settings()
+        if symbol:
+            self._save_stock_position(symbol, shares=shares, cost=cost)
+            self._render_saved_stock_picker()
+            if self.ml_saved_stock_tree.exists(symbol):
+                self.ml_saved_stock_tree.selection_set(symbol)
+                self.ml_saved_stock_tree.focus(symbol)
+            self.status_var.set(f"{symbol} 仓位和组合资金已保存；下次 ML 组合评估会使用这些真实仓位")
+        else:
+            self.status_var.set("总资金和目标总仓位已保存；选择左侧股票后可保存单股持仓")
+
     def _load_monitor_snapshot(self) -> None:
         if not MONITOR_SNAPSHOT_PATH.exists():
             return
@@ -1553,7 +1644,12 @@ class StrategyDesktopApp(tk.Tk):
             return
         symbol = selection[0]
         self.ml_symbol.set(symbol)
-        self.status_var.set(f"ML 板块已选择股票：{symbol} {engine.stock_display_name(symbol)}")
+        name = self._saved_stock_name(symbol) or engine.stock_display_name(symbol)
+        position = self._stock_position(symbol)
+        self.ml_position_symbol.set(f"{symbol} {name}".strip())
+        self.ml_shares.set(str(position.get("shares", "")))
+        self.ml_buy_price.set(str(position.get("cost", "")))
+        self.status_var.set(f"ML 板块已选择股票：{symbol} {name}；右侧仓位仅用于编辑，点保存后才会修改")
 
     def _render_strategy_cache_list(self) -> None:
         if not hasattr(self, "cache_tree"):
@@ -2032,11 +2128,26 @@ class StrategyDesktopApp(tk.Tk):
     def _selected_ml_saved_symbols(self) -> list[str]:
         rows = self._saved_stock_rows()
         all_symbols = [str(row["symbol"]) for row in rows]
+        held_symbols = set(self._held_saved_symbols())
         if hasattr(self, "ml_saved_stock_tree"):
             selected = [symbol for symbol in self.ml_saved_stock_tree.selection() if symbol in all_symbols]
             if selected:
-                return selected
+                merged = list(dict.fromkeys([*selected, *[symbol for symbol in all_symbols if symbol in held_symbols]]))
+                return merged
         return all_symbols
+
+    def _held_saved_symbols(self) -> list[str]:
+        held: list[str] = []
+        for row in self._saved_stock_rows(exclude_strategy_type="ml"):
+            symbol = str(row["symbol"])
+            position = self._stock_position(symbol)
+            try:
+                shares = int(float(position.get("shares", "") or 0))
+            except Exception:
+                shares = 0
+            if shares > 0:
+                held.append(symbol)
+        return held
 
     def _set_backtest_running(self, running: bool) -> None:
         if hasattr(self, "stop_backtest_button"):
@@ -2500,6 +2611,11 @@ class StrategyDesktopApp(tk.Tk):
             total_capital = max(float(self.ml_cash.get() or 100000), 1.0)
         except Exception:
             total_capital = 100000.0
+        try:
+            target_total_position = float(self.ml_target_position.get() or 80) / 100.0
+        except Exception:
+            target_total_position = 0.80
+        target_total_position = float(np.clip(target_total_position, 0.0, 1.0))
         raw_scores: list[float] = []
         risk_scores: list[float] = []
         for result in results:
@@ -2543,16 +2659,17 @@ class StrategyDesktopApp(tk.Tk):
         avg_risk = float(np.nanmean(risk_scores)) if risk_scores else 50.0
         severe_count = sum(1 for result in results if str(result.get("prediction", {}).get("holding_risk", {}).get("level", "")) == "高风险")
         high_news_count = sum(1 for result in results if str(result.get("prediction", {}).get("news_sentiment", {}).get("level", "")) in {"high", "severe"})
-        cash_reserve = 0.10
+        risk_cash_reserve = 0.10
         if avg_risk < 45:
-            cash_reserve = 0.45
+            risk_cash_reserve = 0.45
         elif avg_risk < 58:
-            cash_reserve = 0.28
+            risk_cash_reserve = 0.28
         if severe_count:
-            cash_reserve = min(0.70, cash_reserve + 0.12 * severe_count)
+            risk_cash_reserve = min(0.70, risk_cash_reserve + 0.12 * severe_count)
         if high_news_count:
-            cash_reserve = min(0.75, cash_reserve + 0.08 * high_news_count)
-        invest_weight = max(0.0, 1.0 - cash_reserve)
+            risk_cash_reserve = min(0.75, risk_cash_reserve + 0.08 * high_news_count)
+        invest_weight = min(target_total_position, max(0.0, 1.0 - risk_cash_reserve))
+        cash_reserve = max(0.0, 1.0 - invest_weight)
         total_raw = float(np.nansum(raw_scores))
         weighted: list[dict[str, Any]] = []
         for result, raw in zip(results, raw_scores):
@@ -2588,6 +2705,8 @@ class StrategyDesktopApp(tk.Tk):
             item["trade_shares"] = trade_shares
             item["rebalance_action"] = action
             item["cash_reserve"] = round(cash_reserve * 100, 1)
+            item["target_total_position"] = round(target_total_position * 100, 1)
+            item["risk_cash_reserve"] = round(risk_cash_reserve * 100, 1)
             item["row"] = _ml_prediction_row(item)
             weighted.append(item)
         return sorted(weighted, key=lambda item: float(item.get("target_weight", 0)), reverse=True)
