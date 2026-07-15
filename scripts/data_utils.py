@@ -59,6 +59,38 @@ def normalize_ohlcv(raw: pd.DataFrame) -> pd.DataFrame:
     return data.dropna().set_index("Date").sort_index()
 
 
+def _read_daily_cache(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path, parse_dates=["Date"], index_col="Date")
+
+
+def _latest_daily_cache_path(code: str, start: str, end: str, adjust: str) -> Path | None:
+    label = adjust or "raw"
+    requested_end = pd.to_datetime(end).date()
+    candidates: list[tuple[datetime, Path]] = []
+    for path in DATA_DIR.glob(f"{code}_{start}_*_{label}.csv"):
+        parts = path.stem.split("_")
+        if len(parts) < 4:
+            continue
+        try:
+            cache_end = datetime.strptime(parts[2], "%Y%m%d")
+        except ValueError:
+            continue
+        if cache_end.date() <= requested_end:
+            candidates.append((cache_end, path))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _cached_or_latest_daily(code: str, start: str, end: str, adjust: str, exact_path: Path) -> pd.DataFrame | None:
+    if exact_path.exists():
+        return _read_daily_cache(exact_path)
+    latest_path = _latest_daily_cache_path(code, start, end, adjust)
+    if latest_path is not None:
+        return _read_daily_cache(latest_path)
+    return None
+
+
 def load_a_share_daily(
     symbol: str,
     start: str = "20180101",
@@ -72,8 +104,9 @@ def load_a_share_daily(
     end = end or datetime.now().strftime("%Y%m%d")
     cache_path = DATA_DIR / f"{code}_{start}_{end}_{adjust or 'raw'}.csv"
 
+    cached: pd.DataFrame | None = None
     if cache and cache_path.exists():
-        cached = pd.read_csv(cache_path, parse_dates=["Date"], index_col="Date")
+        cached = _read_daily_cache(cache_path)
         requested_end = pd.to_datetime(end).date()
         today = datetime.now().date()
         latest_cached = cached.index.max().date() if not cached.empty else None
@@ -90,14 +123,30 @@ def load_a_share_daily(
         )
     except Exception as first_error:
         print(f"AKShare Eastmoney source failed, falling back to Tencent source: {first_error}")
-        raw = ak.stock_zh_a_hist_tx(
-            symbol=tencent_symbol(code),
-            start_date=start,
-            end_date=end,
-            adjust=adjust,
-            timeout=20,
-        )
+        try:
+            raw = ak.stock_zh_a_hist_tx(
+                symbol=tencent_symbol(code),
+                start_date=start,
+                end_date=end,
+                adjust=adjust,
+                timeout=20,
+            )
+        except Exception as second_error:
+            if cache:
+                fallback = cached if cached is not None else _cached_or_latest_daily(code, start, end, adjust, cache_path)
+                if fallback is not None and not fallback.empty:
+                    print(f"AKShare sources failed, using cached daily data for {code}: {fallback.index.max():%Y-%m-%d}")
+                    return fallback
+            raise RuntimeError(
+                f"无法联网拉取 {code} 日线数据，且没有可用本地缓存。"
+                f"东方财富错误：{first_error}; 腾讯源错误：{second_error}"
+            ) from second_error
     if raw.empty:
+        if cache:
+            fallback = cached if cached is not None else _cached_or_latest_daily(code, start, end, adjust, cache_path)
+            if fallback is not None and not fallback.empty:
+                print(f"AKShare returned empty data, using cached daily data for {code}: {fallback.index.max():%Y-%m-%d}")
+                return fallback
         raise RuntimeError(f"AKShare returned no data for {code}")
 
     data = normalize_ohlcv(raw)

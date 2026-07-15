@@ -43,6 +43,23 @@ class BacktestCancelled(Exception):
     pass
 
 
+def _short_error_text(error: object) -> str:
+    text = str(error or "").strip()
+    if not text:
+        return "未知错误"
+    lower = text.lower()
+    if "proxyerror" in lower or "unable to connect to proxy" in lower or "remote end closed connection" in lower:
+        return "网络/代理连接失败；程序已尝试使用本地缓存，若仍失败请稍后重试或检查代理。"
+    if "无法联网拉取" in text:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return lines[-1] if lines else text
+    if "traceback" in lower:
+        for line in reversed([line.strip() for line in text.splitlines() if line.strip()]):
+            if line and not line.startswith("File ") and not line.startswith("^"):
+                return line[:260]
+    return text[:260]
+
+
 def _daily_gate_from_backtest_payload(
     form: dict[str, str],
     symbol: str,
@@ -2193,8 +2210,8 @@ class StrategyDesktopApp(tk.Tk):
             self.queue.put(WorkerMessage("backtest", payload={"target": target, "result": result}))
         except BacktestCancelled:
             self.queue.put(WorkerMessage("backtest_cancelled"))
-        except Exception:
-            self.queue.put(WorkerMessage("backtest_error", error=traceback.format_exc()))
+        except Exception as exc:
+            self.queue.put(WorkerMessage("backtest_error", error=_short_error_text(exc)))
 
     def _backtest_batch_worker(self, symbols: list[str]) -> None:
         results: list[dict[str, Any]] = []
@@ -2216,7 +2233,7 @@ class StrategyDesktopApp(tk.Tk):
                 cancelled = True
                 break
             except Exception as exc:
-                errors.append(f"{symbol}: {exc}")
+                errors.append(f"{symbol}: {_short_error_text(exc)}")
             task_name = "ML组合风控" if target == "ml" else "批量回测"
             self.queue.put(WorkerMessage("status", payload=f"{task_name}进度 {idx}/{len(symbols)}"))
         self.queue.put(WorkerMessage("backtest_batch", payload={"target": target, "results": results, "errors": errors, "total": len(symbols), "cancelled": cancelled}))
