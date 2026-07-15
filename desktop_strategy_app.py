@@ -2244,6 +2244,8 @@ class StrategyDesktopApp(tk.Tk):
         process = ctx.Process(target=_backtest_process_entry, args=(form, result_queue), daemon=True)
         self.backtest_process = process
         process.start()
+        started_at = time.monotonic()
+        timeout_seconds = 240 if form.get("_job") == "ml_predict" else 180
         message: tuple[str, Any] | None = None
         try:
             while True:
@@ -2251,6 +2253,11 @@ class StrategyDesktopApp(tk.Tk):
                     process.terminate()
                     process.join(timeout=3)
                     raise BacktestCancelled()
+                if time.monotonic() - started_at > timeout_seconds:
+                    process.terminate()
+                    process.join(timeout=3)
+                    symbol = form.get("symbol", "")
+                    raise RuntimeError(f"{symbol} 单只评估超过 {timeout_seconds} 秒，已自动跳过；通常是网络/代理或模型进程卡住。")
                 try:
                     message = result_queue.get(timeout=0.2)
                     break
