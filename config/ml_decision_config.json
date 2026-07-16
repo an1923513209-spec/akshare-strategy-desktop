@@ -1,0 +1,35 @@
+{
+  "account": {
+    "cash": 100000.0,
+    "total_asset": 100000.0,
+    "max_single_position_weight": 0.25,
+    "max_industry_weight": 0.45,
+    "max_total_position_weight": 0.8,
+    "minimum_trade_amount": 1000.0,
+    "lot_size": 100,
+    "commission_rate": 0.0003,
+    "minimum_commission": 5.0,
+    "stamp_duty_rate": 0.0005,
+    "slippage_rate": 0.001,
+    "risk_aversion": 1.8,
+    "turnover_penalty": 0.001
+  },
+  "decision": {
+    "start_date": "20200101",
+    "training_universe": "custom",
+    "external_factor_lag": 1,
+    "down_threshold": -0.02,
+    "utility_mode": "q10",
+    "minimum_action_edge": 0.001,
+    "add_probability_threshold": 0.55,
+    "add_q10_threshold": -0.025,
+    "max_add_downside_probability": 0.35,
+    "profitable_cost_buffer": 0.0,
+    "calibration_method": "sigmoid",
+    "test_years": 1,
+    "validation_years": 1,
+    "train_min_rows": 260,
+    "use_shap": true,
+    "feature_exclude": []
+  }
+}

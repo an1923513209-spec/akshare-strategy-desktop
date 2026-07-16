@@ -1,6 +1,8 @@
 akshare
 backtesting
 flask
+joblib
+lightgbm
 matplotlib
 numpy
 optuna

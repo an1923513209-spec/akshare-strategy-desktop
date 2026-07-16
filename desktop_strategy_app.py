@@ -23,9 +23,14 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import app as engine
+from ml_decision import AccountState, DecisionConfig
+from ml_decision.data_sources import fetch_external_factor_frame, merge_external_factors
+from ml_decision.engine import result_to_jsonable, run_holding_decision
 
 MONITOR_SNAPSHOT_PATH = engine.CACHE_DIR / "monitor_snapshot.json"
 ML_PORTFOLIO_SETTINGS_PATH = engine.CACHE_DIR / "ml_portfolio_settings.json"
+ML_STOCK_POOL_PATH = engine.CACHE_DIR / "ml_stock_pool.json"
+UI_DEBUG_LOG_PATH = engine.CACHE_DIR / "ui_debug.log"
 RESIZE_REDRAW_DELAY_MS = 260
 CONTENT_MIN_WIDTH = 1180
 CONTENT_MIN_HEIGHT = 650
@@ -63,6 +68,17 @@ def _short_error_text(error: object) -> str:
             if line and not line.startswith("File ") and not line.startswith("^"):
                 return line[:260]
     return text[:260]
+
+
+def _ui_debug(message: str) -> None:
+    try:
+        engine.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        if UI_DEBUG_LOG_PATH.exists() and UI_DEBUG_LOG_PATH.stat().st_size > 2_000_000:
+            UI_DEBUG_LOG_PATH.write_text("", encoding="utf-8")
+        with UI_DEBUG_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except Exception:
+        pass
 
 
 def _scan_row_payload(row: pd.Series) -> dict[str, Any]:
@@ -321,6 +337,7 @@ def _compute_saved_strategy_preview_payload(key_text: str) -> dict[str, Any]:
 
 def _ml_prediction_row(result: dict[str, Any]) -> dict[str, Any]:
     prediction = result["prediction"]
+    decision_row = result.get("decision_row") if isinstance(result.get("decision_row"), dict) else {}
     horizons = {int(item["days"]): item for item in prediction.get("horizons", [])}
     h3 = horizons.get(3, {})
     h5 = horizons.get(5, {})
@@ -340,6 +357,7 @@ def _ml_prediction_row(result: dict[str, Any]) -> dict[str, Any]:
         "target_shares": float(result.get("target_shares", np.nan)),
         "trade_shares": float(result.get("trade_shares", np.nan)),
         "rebalance_action": result.get("rebalance_action", "-"),
+        "utility": float(decision_row.get("utility_score", np.nan)),
         "prob3": float(h3.get("up_prob", np.nan)) * 100,
         "prob5": float(h5.get("up_prob", np.nan)) * 100,
         "prob10": float(h10.get("up_prob", np.nan)) * 100,
@@ -349,23 +367,238 @@ def _ml_prediction_row(result: dict[str, Any]) -> dict[str, Any]:
         "volatility": float(factor.get("atr_pct", np.nan)),
         "anomaly": anomaly.get("level", "-"),
         "news_risk": news.get("level", "-"),
+        "fund_flow": float(decision_row.get("main_net_ratio_3", np.nan)) * 100,
+        "news_factor": float(decision_row.get("news_sentiment_mean_3", np.nan)),
+        "institution": float(decision_row.get("institution_activity", np.nan)),
+        "weight_probability": float(decision_row.get("score_weight_probability", np.nan)),
+        "weight_expected": float(decision_row.get("score_weight_expected", np.nan)),
+        "weight_risk": float(decision_row.get("score_weight_risk", np.nan)),
         "score": float(prediction.get("composite_score", np.nan)),
     }
 
 
-def _compute_ml_prediction_payload(form: dict[str, str]) -> dict[str, Any]:
-    symbol = engine.resolve_stock_identifier(form["symbol"])
+def _parse_batch_symbols(text: str) -> list[str]:
+    for sep in ("\n", "\r", "\t", ",", "，", ";", "；", "、", "|"):
+        text = text.replace(sep, " ")
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for token in text.split():
+        try:
+            symbol = engine.resolve_stock_identifier(token)
+        except Exception:
+            symbol = token.strip()
+        if symbol and symbol not in seen:
+            symbols.append(symbol)
+            seen.add(symbol)
+    return symbols
+
+
+def _compute_ml_decision_payload(form: dict[str, Any]) -> dict[str, Any]:
+    batch_symbols = _parse_batch_symbols(str(form.get("batch_symbols", "")))
+    if not batch_symbols:
+        batch_symbols = [engine.resolve_stock_identifier(str(form["symbol"]))]
     start = form.get("start", "20200101")
     adjust = form.get("adjust", "qfq")
-    data = engine.cached_data(symbol, start, adjust).copy()
-    prediction = engine.build_ml_prediction_snapshot(data, symbol=symbol, fast=6, slow=20)
+    errors: list[str] = []
+    results: list[dict[str, Any]] = []
+    positions = form.get("positions", {})
+    if not isinstance(positions, dict):
+        positions = {}
+    force_external_refresh = str(form.get("refresh_external_data") or "").lower() in {"1", "true", "yes", "on"}
+    account = AccountState(
+        cash=float(form.get("cash") or 100000),
+        total_asset=float(form.get("cash") or 100000),
+        max_total_position_weight=float(form.get("target_position") or 80) / 100.0,
+        commission_rate=float(form.get("fee") or 0.0003),
+    )
+    min_daily_rows = 55
+    for symbol in batch_symbols:
+        try:
+            data = engine.cached_data(symbol, str(start), str(adjust)).copy()
+        except Exception as exc:
+            errors.append(f"{symbol}: 日线数据失败，已跳过：{_short_error_text(exc)}")
+            continue
+        if data is None or data.empty or len(data) < min_daily_rows:
+            actual_rows = 0 if data is None else len(data)
+            errors.append(f"{symbol}: 日线有效数据不足，仅 {actual_rows} 行，至少需要约 {min_daily_rows} 行；开始日期可能太近，已跳过")
+            continue
+        frame = data.reset_index()
+        frame = frame.rename(
+            columns={frame.columns[0]: "date", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
+        )
+        frame["code"] = symbol
+        frame["amount"] = frame["volume"] * frame["close"]
+        market_df = frame[["date", "code", "open", "high", "low", "close", "volume", "amount"]]
+        try:
+            external_df, source_notes = fetch_external_factor_frame([symbol], force_refresh=force_external_refresh)
+        except Exception as exc:
+            external_df, source_notes = pd.DataFrame(), []
+            errors.append(f"{symbol}: 外部因子拉取失败，已仅用日线继续：{_short_error_text(exc)}")
+        market_df = merge_external_factors(market_df, external_df)
+
+        position = positions.get(symbol, {}) if isinstance(positions.get(symbol, {}), dict) else {}
+        latest_close = float(data["Close"].iloc[-1])
+        shares = int(float(position.get("shares") or form.get("shares") or 0))
+        cost = float(position.get("cost") or form.get("buy_price") or latest_close)
+        holdings_df = pd.DataFrame(
+            [
+                {
+                    "code": symbol,
+                    "name": str(position.get("name") or ""),
+                    "shares": shares,
+                    "available_shares": shares,
+                    "average_cost": cost,
+                    "current_price": latest_close,
+                    "position_value": shares * latest_close,
+                    "holding_days": 0,
+                }
+            ]
+        )
+        config = DecisionConfig(start_date=str(start), train_min_rows=max(50, min(260, len(market_df) // 2)), external_factor_lag=0)
+        try:
+            decision = run_holding_decision(market_df, holdings_df, account=account, config=config, source_notes=source_notes)
+            decision_payload = result_to_jsonable(decision)
+        except Exception as exc:
+            errors.append(f"{symbol}: ML 训练失败，已跳过：{_short_error_text(exc)}")
+            continue
+        table_by_code = {str(row["code"]): row for row in decision_payload["table"]}
+        row = table_by_code.get(symbol)
+        if row is None:
+            errors.append(f"{symbol}: ML 未产生结果，已跳过")
+            continue
+        try:
+            result = _ml_decision_result_from_row(symbol, row, data, decision_payload, str(position.get("name") or ""))
+            results.append(result)
+        except Exception as exc:
+            errors.append(f"{symbol}: ML 结果整理失败，已跳过：{_short_error_text(exc)}")
+    if not results:
+        detail = "；".join(errors[:6])
+        raise ValueError(f"没有可展示的 ML 结果；全部股票训练失败或样本不足。{detail}")
+    if len(results) == 1 and len(batch_symbols) == 1:
+        return results[0]
+    return {"results": results, "errors": errors, "total": len(batch_symbols), "cancelled": False, "decision_meta": {}}
+
+
+def _compute_ml_prediction_payload(form: dict[str, Any]) -> dict[str, Any]:
+    return _compute_ml_decision_payload(form)
+
+
+def _safe_float(value: Any, default: float = np.nan) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_score(value: float) -> float:
+    if not np.isfinite(value):
+        return np.nan
+    return float(max(0.0, min(100.0, value)))
+
+
+def _ml_decision_risk_score(row: dict[str, Any]) -> float:
+    down_prob = max(0.0, _safe_float(row.get("probability_down_2pct"), 0.0))
+    q10 = _safe_float(row.get("return_q10"), 0.0)
+    downside = max(0.0, _safe_float(row.get("downside_risk"), 0.0))
+    unrealized = _safe_float(row.get("unrealized_return"), 0.0)
+    raw = down_prob * 55.0 + max(-q10, 0.0) * 900.0 + downside * 900.0 + max(-unrealized, 0.0) * 20.0
+    return _clamp_score(raw)
+
+
+def _ml_decision_factor_score(row: dict[str, Any]) -> float:
+    up_prob = _safe_float(row.get("probability_up"), 0.5)
+    expected = _safe_float(row.get("expected_open_to_open_return"), 0.0)
+    q50 = _safe_float(row.get("return_q50"), 0.0)
+    down_prob = _safe_float(row.get("probability_down_2pct"), 0.0)
+    raw = up_prob * 70.0 + expected * 800.0 + q50 * 400.0 - down_prob * 30.0
+    return _clamp_score(raw)
+
+
+def _ml_display_snapshot(data: pd.DataFrame) -> dict[str, Any]:
+    try:
+        atr_pct = float((engine.atr(data, 14) / data["Close"]).iloc[-1]) * 100
+    except Exception:
+        atr_pct = np.nan
+    try:
+        anomaly = engine.detect_latest_anomaly(data, 20, 60)
+    except Exception as exc:
+        anomaly = {"level": "unknown", "detail": f"异常检测暂不可用: {exc}"}
+    try:
+        mc = engine.monte_carlo_risk(data, stop_line=None, days=10, simulations=1200)
+    except Exception as exc:
+        mc = {"days": 10, "detail": f"蒙特卡洛暂不可用: {exc}"}
+    return {
+        "factor": {"atr_pct": atr_pct},
+        "anomaly": anomaly,
+        "monte_carlo": mc,
+    }
+
+
+def _ml_decision_horizon(row: dict[str, Any], days: int) -> dict[str, Any]:
+    up_prob_1 = _safe_float(row.get("probability_up"), np.nan)
+    expected_1 = _safe_float(row.get("expected_open_to_open_return"), np.nan)
+    q10_1 = _safe_float(row.get("return_q10"), np.nan)
+    if not np.isfinite(up_prob_1):
+        up_prob = np.nan
+    else:
+        shrink = 1.0 / np.sqrt(max(days, 1))
+        up_prob = 0.5 + (up_prob_1 - 0.5) * shrink
+    expected_pct = expected_1 * days * 100 if np.isfinite(expected_1) else np.nan
+    q10_pct = q10_1 * np.sqrt(max(days, 1)) * 100 if np.isfinite(q10_1) else np.nan
+    expected_text = f"{expected_pct:.2f}%" if np.isfinite(expected_pct) else "-"
+    q10_text = f"{q10_pct:.2f}%" if np.isfinite(q10_pct) else "-"
+    return {
+        "days": days,
+        "up_prob": up_prob,
+        "expected_return_pct": expected_pct,
+        "q10_return_pct": q10_pct,
+        "detail": f"{days}日为基于次日模型的保守折算；预期 {expected_text}，q10 {q10_text}。",
+    }
+
+
+def _ml_decision_result_from_row(
+    symbol: str,
+    row: dict[str, Any],
+    data: pd.DataFrame,
+    decision_payload: dict[str, Any],
+    display_name: str = "",
+) -> dict[str, Any]:
+    risk_score = _ml_decision_risk_score(row)
+    factor_score = _ml_decision_factor_score(row)
+    display = _ml_display_snapshot(data)
+    factor_display = display.get("factor", {}) if isinstance(display.get("factor"), dict) else {}
+    factor_display["score"] = factor_score
+    prediction = {
+        "date": row.get("date"),
+        "latest_close": row.get("current_price"),
+        "backend": str(decision_payload.get("metrics", {}).get("model_backend", "XGBoost CUDA")),
+        "factor": factor_display,
+        "risk_score": risk_score,
+        "holding_risk": {"level": row.get("confidence_level", "-"), "detail": row.get("reason", "")},
+        "anomaly": display.get("anomaly", {"level": "-"}),
+        "news_sentiment": {"level": "-"},
+        "monte_carlo": display.get("monte_carlo", {}),
+        "horizons": [_ml_decision_horizon(row, days) for days in (1, 3, 10)],
+        "decision_row": row,
+        "metrics": decision_payload.get("metrics", {}),
+        "feature_columns": decision_payload.get("feature_columns", []),
+        "source_notes": decision_payload.get("source_notes", []),
+    }
     result = {
         "symbol": symbol,
-        "name": engine.stock_display_name(symbol),
+        "name": display_name or str(row.get("name") or "") or engine.stock_display_name(symbol),
         "data": data,
         "prediction": prediction,
-        "start": start,
-        "adjust": adjust,
+        "start": "",
+        "adjust": "",
+        "target_weight": float(row.get("recommended_target_weight") or 0) * 100,
+        "target_shares": int(row.get("shares", 0) + row.get("recommended_trade_shares", 0)),
+        "trade_shares": int(row.get("recommended_trade_shares", 0)),
+        "current_shares": int(row.get("shares", 0)),
+        "current_weight": float(row.get("position_weight") or 0) * 100,
+        "rebalance_action": str(row.get("recommended_action", "-")),
+        "cash_reserve": np.nan,
+        "decision_row": row,
     }
     result["row"] = _ml_prediction_row(result)
     return result
@@ -417,6 +650,9 @@ class StrategyDesktopApp(tk.Tk):
         self.backtest_result: dict[str, Any] | None = None
         self.ml_backtest_result: dict[str, Any] | None = None
         self.ml_prediction_results: dict[str, dict[str, Any]] = {}
+        self.ml_sort_column: str | None = None
+        self.ml_sort_reverse = False
+        self.selected_ml_prediction_symbol: str | None = None
         self.selected_scan_rank: int = 0
         self.backtest_checked_symbols: set[str] = set()
         self.ml_checked_symbols: set[str] = set()
@@ -482,7 +718,7 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_tab = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(self.backtest_tab, text="传统回测")
         self.notebook.add(self.monitor_tab, text="盘中监控")
-        self.notebook.add(self.ml_tab, text="ML风控/组合")
+        self.notebook.add(self.ml_tab, text="ML持仓决策")
 
         self._build_backtest_tab()
         self._build_monitor_tab()
@@ -905,6 +1141,7 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_risk = tk.StringVar(value=self.bt_risk.get())
         self.ml_horizon = tk.StringVar(value=self.bt_horizon.get())
         self.ml_advice_days = tk.StringVar(value="3")
+        self.ml_refresh_external_data = tk.BooleanVar(value=False)
         self.ml_shares = tk.StringVar(value=self.bt_shares.get())
         self.ml_buy_price = tk.StringVar(value=self.bt_buy_price.get())
         self.ml_buy_date = tk.StringVar(value=self.bt_buy_date.get())
@@ -918,30 +1155,27 @@ class StrategyDesktopApp(tk.Tk):
         ml_body = ttk.PanedWindow(self.ml_tab, orient=tk.HORIZONTAL)
         ml_body.grid(row=0, column=0, sticky="nsew")
 
-        saved_box = ttk.LabelFrame(self.ml_tab, text="已保存股票 / 我的持仓")
+        saved_box = ttk.LabelFrame(self.ml_tab, text="ML股票池 / 我的持仓")
         ml_result_frame = ttk.Frame(ml_body)
         ml_body.add(saved_box, weight=1)
         ml_body.add(ml_result_frame, weight=5)
         saved_box.columnconfigure(0, weight=1)
         saved_box.rowconfigure(0, weight=0)
         saved_box.rowconfigure(1, weight=0)
-        saved_box.rowconfigure(2, weight=1)
+        saved_box.rowconfigure(2, weight=0)
+        saved_box.rowconfigure(3, weight=1)
 
-        portfolio_box = ttk.LabelFrame(saved_box, text="我的真实资金/仓位")
-        portfolio_box.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 8))
-        for idx in range(4):
-            portfolio_box.columnconfigure(idx, weight=1 if idx in {1, 3} else 0)
-        ttk.Label(portfolio_box, text="总资金").grid(row=0, column=0, sticky="w", padx=(10, 6), pady=(8, 3))
-        ttk.Entry(portfolio_box, textvariable=self.ml_cash, width=12).grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=(8, 3))
-        ttk.Label(portfolio_box, text="目标总仓位%").grid(row=0, column=2, sticky="w", padx=(0, 6), pady=(8, 3))
-        ttk.Entry(portfolio_box, textvariable=self.ml_target_position, width=10).grid(row=0, column=3, sticky="ew", padx=(0, 10), pady=(8, 3))
-        ttk.Label(portfolio_box, text="选中股票").grid(row=1, column=0, sticky="w", padx=(10, 6), pady=3)
-        ttk.Label(portfolio_box, textvariable=self.ml_position_symbol, foreground="#405269").grid(row=1, column=1, columnspan=3, sticky="ew", padx=(0, 10), pady=3)
-        ttk.Label(portfolio_box, text="持股数").grid(row=2, column=0, sticky="w", padx=(10, 6), pady=(3, 8))
-        ttk.Entry(portfolio_box, textvariable=self.ml_shares, width=12).grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=(3, 8))
-        ttk.Label(portfolio_box, text="成本价").grid(row=2, column=2, sticky="w", padx=(0, 6), pady=(3, 8))
-        ttk.Entry(portfolio_box, textvariable=self.ml_buy_price, width=12).grid(row=2, column=3, sticky="ew", padx=(0, 10), pady=(3, 8))
-        ttk.Button(portfolio_box, text="保存当前股票仓位", command=self._save_selected_ml_position, style="Primary.TButton").grid(row=3, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 8))
+        ml_pool_box = ttk.LabelFrame(saved_box, text="添加ML股票代码")
+        ml_pool_box.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 8))
+        ml_pool_box.columnconfigure(0, weight=1)
+        self.ml_pool_text = tk.Text(ml_pool_box, height=3, wrap="word", background="#ffffff", foreground="#14213d", relief=tk.FLAT, padx=8, pady=6)
+        self.ml_pool_text.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+        ml_pool_buttons = ttk.Frame(ml_pool_box)
+        ml_pool_buttons.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        ml_pool_buttons.columnconfigure(0, weight=1)
+        ml_pool_buttons.columnconfigure(1, weight=1)
+        ttk.Button(ml_pool_buttons, text="批量加入ML股票池", command=self._add_ml_pool_symbols, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(ml_pool_buttons, text="清空代码", command=lambda: self.ml_pool_text.delete("1.0", tk.END)).grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
         ml_eval_buttons = ttk.Frame(saved_box)
         ml_eval_buttons.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 8))
@@ -951,41 +1185,52 @@ class StrategyDesktopApp(tk.Tk):
         ttk.Button(ml_eval_buttons, text="评估全部股票池", command=self.run_all_saved_stock_ml_backtests).grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self.ml_stop_backtest_button = ttk.Button(ml_eval_buttons, text="终止", command=self.stop_backtest, state=tk.DISABLED)
         self.ml_stop_backtest_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Label(ml_eval_buttons, text="勾选列决定 ML 评估范围；蓝色选中只用于编辑右上角持股/成本。持股数>0 的股票会排在前面。", foreground="#607086").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(ml_eval_buttons, text="ML股票池和传统回测互不影响；右键股票可填持股/成本，或删除选中的多只股票。", foreground="#607086").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.ml_saved_stock_tree = ttk.Treeview(
             saved_box,
-            columns=("checked", "symbol", "name", "shares", "cost", "count", "latest"),
+            columns=("checked", "symbol", "name", "shares", "cost", "added"),
             show="headings",
             height=12,
             selectmode="extended",
         )
         self._setup_tree(
             self.ml_saved_stock_tree,
-            {"checked": "选择", "symbol": "代码", "name": "名称", "shares": "持股数", "cost": "成本价", "count": "策略数", "latest": "最近保存"},
-            {"checked": 48, "symbol": 80, "name": 100, "shares": 80, "cost": 80, "count": 60, "latest": 135},
+            {"checked": "选择", "symbol": "代码", "name": "名称", "shares": "持股数", "cost": "成本价", "added": "加入时间"},
+            {"checked": 48, "symbol": 80, "name": 100, "shares": 80, "cost": 80, "added": 135},
         )
-        self.ml_saved_stock_tree.grid(row=2, column=0, sticky="nsew")
+        self.ml_saved_stock_tree.grid(row=3, column=0, sticky="nsew")
         ml_saved_vscroll = ttk.Scrollbar(saved_box, orient=tk.VERTICAL, command=self.ml_saved_stock_tree.yview)
-        ml_saved_vscroll.grid(row=2, column=1, sticky="ns")
+        ml_saved_vscroll.grid(row=3, column=1, sticky="ns")
         self.ml_saved_stock_tree.configure(yscrollcommand=ml_saved_vscroll.set)
         self.ml_saved_stock_tree.bind("<Button-1>", self._on_ml_saved_stock_click)
         self.ml_saved_stock_tree.bind("<<TreeviewSelect>>", self._on_ml_saved_stock_select)
+        self.ml_saved_stock_tree.bind("<Button-3>", self._show_ml_stock_context_menu)
+        self.ml_saved_stock_tree.bind("<Double-1>", lambda _event: self._edit_selected_ml_position())
         self._render_saved_stock_picker()
 
         ml_result_frame.columnconfigure(0, weight=1)
         ml_result_frame.rowconfigure(2, weight=1)
 
-        top = ttk.LabelFrame(ml_result_frame, text="ML 风控与组合权重")
+        top = ttk.LabelFrame(ml_result_frame, text="ML 持仓次日决策参数")
         top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        for idx in range(4):
-            top.columnconfigure(idx, weight=1)
-        self._labeled_combo(top, "建议周期", self.ml_advice_days, ("1", "3", "10"), 0)
-        self._labeled_entry(top, "开始日期", self.ml_start, 1, width=10)
-        self._labeled_combo(top, "复权", self.ml_adjust, ("qfq", "", "hfq"), 2)
-        self._labeled_entry(top, "手续费", self.ml_fee, 3, width=10)
-        ttk.Label(top, text=note, foreground="#405269", justify=tk.LEFT).grid(row=2, column=0, columnspan=4, sticky="ew", padx=8, pady=(6, 8))
+        for idx in range(15):
+            top.columnconfigure(idx, weight=1 if idx == 14 else 0)
+        ttk.Label(top, text="建议周期").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=6)
+        ttk.Combobox(top, textvariable=self.ml_advice_days, values=("1", "3", "10"), width=6, state="readonly").grid(row=0, column=1, sticky="w", padx=(0, 14), pady=6)
+        ttk.Label(top, text="开始日期").grid(row=0, column=2, sticky="w", padx=(0, 4), pady=6)
+        ttk.Entry(top, textvariable=self.ml_start, width=10).grid(row=0, column=3, sticky="w", padx=(0, 14), pady=6)
+        ttk.Label(top, text="复权").grid(row=0, column=4, sticky="w", padx=(0, 4), pady=6)
+        ttk.Combobox(top, textvariable=self.ml_adjust, values=("qfq", "", "hfq"), width=7, state="readonly").grid(row=0, column=5, sticky="w", padx=(0, 14), pady=6)
+        ttk.Label(top, text="手续费").grid(row=0, column=6, sticky="w", padx=(0, 4), pady=6)
+        ttk.Entry(top, textvariable=self.ml_fee, width=9).grid(row=0, column=7, sticky="w", padx=(0, 14), pady=6)
+        ttk.Label(top, text="总资金").grid(row=0, column=8, sticky="w", padx=(0, 4), pady=6)
+        ttk.Entry(top, textvariable=self.ml_cash, width=11).grid(row=0, column=9, sticky="w", padx=(0, 14), pady=6)
+        ttk.Label(top, text="目标仓位%").grid(row=0, column=10, sticky="w", padx=(0, 4), pady=6)
+        ttk.Entry(top, textvariable=self.ml_target_position, width=8).grid(row=0, column=11, sticky="w", padx=(0, 14), pady=6)
+        ttk.Checkbutton(top, text="本次刷新外部数据", variable=self.ml_refresh_external_data).grid(row=0, column=12, sticky="w", padx=(0, 14), pady=6)
+        ttk.Label(top, text="默认复用缓存；勾选后重拉资金流/新闻/机构活跃度。", foreground="#405269").grid(row=0, column=13, columnspan=2, sticky="w", padx=(0, 8), pady=6)
 
-        self.ml_summary_var = tk.StringVar(value="尚未 ML 风控评估")
+        self.ml_summary_var = tk.StringVar(value="尚未 ML 持仓决策评估")
         ttk.Label(ml_result_frame, textvariable=self.ml_summary_var, anchor="w").grid(row=1, column=0, sticky="ew", pady=(0, 8))
 
         ml_result_pane = ttk.PanedWindow(ml_result_frame, orient=tk.VERTICAL)
@@ -995,38 +1240,127 @@ class StrategyDesktopApp(tk.Tk):
         ml_result_pane.add(ml_chart_frame, weight=3)
         ml_result_pane.add(ml_table_frame, weight=2)
 
-        ml_chart_frame.columnconfigure(0, weight=1)
+        ml_chart_frame.columnconfigure(0, weight=4)
+        ml_chart_frame.columnconfigure(1, weight=1)
         ml_chart_frame.rowconfigure(0, weight=1)
         self.ml_canvas = tk.Canvas(ml_chart_frame, background="#fbfdff", highlightthickness=1, highlightbackground="#d8e0ea")
         self.ml_canvas.grid(row=0, column=0, sticky="nsew")
         self.ml_canvas.bind("<Configure>", self._schedule_ml_canvas_redraw)
 
-        columns = ("rank", "symbol", "name", "action", "current_weight", "target_weight", "trade_shares", "holding_risk", "risk", "prob10", "exp10", "factor", "detail")
-        self.ml_tree = ttk.Treeview(ml_table_frame, columns=columns, show="headings", height=9)
+        ml_detail_frame = ttk.LabelFrame(ml_chart_frame, text="决策详情")
+        ml_detail_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        ml_detail_frame.columnconfigure(0, weight=1)
+        ml_detail_frame.rowconfigure(0, weight=1)
+        self.ml_detail_text = tk.Text(
+            ml_detail_frame,
+            wrap="word",
+            height=8,
+            background="#ffffff",
+            foreground="#14213d",
+            relief=tk.FLAT,
+            padx=8,
+            pady=8,
+        )
+        self.ml_detail_text.grid(row=0, column=0, sticky="nsew")
+        self.ml_detail_text.configure(state=tk.DISABLED)
+        ml_detail_scroll = ttk.Scrollbar(ml_detail_frame, orient=tk.VERTICAL, command=self.ml_detail_text.yview)
+        ml_detail_scroll.grid(row=0, column=1, sticky="ns")
+        self.ml_detail_text.configure(yscrollcommand=ml_detail_scroll.set)
+
+        columns = (
+            "rank",
+            "symbol",
+            "name",
+            "action",
+            "utility",
+            "current_weight",
+            "target_weight",
+            "trade_shares",
+            "holding_risk",
+            "risk",
+            "prob10",
+            "exp10",
+            "fund_flow",
+            "news_factor",
+            "institution",
+            "factor",
+            "detail",
+        )
+        frozen_columns = ("rank", "symbol", "name")
+        scroll_columns = tuple(column for column in columns if column not in frozen_columns)
+        self.ml_frozen_tree = ttk.Treeview(ml_table_frame, columns=frozen_columns, show="headings", height=9, selectmode="extended")
+        self.ml_tree = ttk.Treeview(
+            ml_table_frame,
+            columns=columns,
+            displaycolumns=scroll_columns,
+            show="headings",
+            height=9,
+            selectmode="extended",
+        )
         headings = {
             "rank": "排名",
             "symbol": "代码",
             "name": "名称",
+            "action": "建议",
+            "utility": "综合分",
+            "current_weight": "当前仓位%",
             "holding_risk": "持仓风险",
             "target_weight": "目标仓位%",
+            "trade_shares": "交易股数",
             "risk": "风险分",
             "anomaly": "异常",
             "news": "新闻风险",
             "volatility": "波动%",
             "prob10": "10日涨%",
             "exp10": "10日预期%",
+            "fund_flow": "资金流%",
+            "news_factor": "新闻",
+            "institution": "机构活跃",
             "factor": "因子分",
-            "detail": "风控说明",
+            "detail": "决策说明",
         }
-        widths = {"rank": 55, "symbol": 80, "name": 100, "action": 90, "current_weight": 90, "target_weight": 90, "trade_shares": 90, "holding_risk": 90, "risk": 75, "prob10": 80, "exp10": 95, "factor": 75, "detail": 360}
+        widths = {
+            "rank": 55,
+            "symbol": 80,
+            "name": 100,
+            "action": 90,
+            "utility": 75,
+            "current_weight": 90,
+            "target_weight": 90,
+            "trade_shares": 90,
+            "holding_risk": 90,
+            "risk": 75,
+            "prob10": 80,
+            "exp10": 95,
+            "fund_flow": 85,
+            "news_factor": 80,
+            "institution": 85,
+            "factor": 75,
+            "detail": 360,
+        }
+        self._setup_tree(self.ml_frozen_tree, headings, widths)
+        for column in frozen_columns:
+            self.ml_frozen_tree.heading(column, text=headings.get(column, column), command=lambda col=column: self._sort_ml_table(col))
+            self.ml_frozen_tree.column(column, stretch=False)
+        self.ml_frozen_tree.grid(row=0, column=0, sticky="nsew")
+        self.ml_frozen_tree.bind("<<TreeviewSelect>>", self._on_ml_frozen_rank_select)
         self._setup_tree(self.ml_tree, headings, widths)
-        self.ml_tree.grid(row=0, column=0, sticky="nsew")
+        for column in columns:
+            self.ml_tree.heading(column, text=headings.get(column, column), command=lambda col=column: self._sort_ml_table(col))
+            self.ml_tree.column(column, stretch=False)
+        self.ml_tree.grid(row=0, column=1, sticky="nsew")
         self.ml_tree.bind("<<TreeviewSelect>>", self._on_ml_rank_select)
-        ml_table_frame.columnconfigure(0, weight=1)
+        ml_table_frame.columnconfigure(0, weight=0)
+        ml_table_frame.columnconfigure(1, weight=1)
         ml_table_frame.rowconfigure(0, weight=1)
-        ml_vscroll = ttk.Scrollbar(ml_table_frame, orient=tk.VERTICAL, command=self.ml_tree.yview)
-        ml_vscroll.grid(row=0, column=1, sticky="ns")
+        ml_vscroll = ttk.Scrollbar(ml_table_frame, orient=tk.VERTICAL, command=self._ml_table_yview)
+        ml_vscroll.grid(row=0, column=2, sticky="ns")
+        ml_hscroll = ttk.Scrollbar(ml_table_frame, orient=tk.HORIZONTAL, command=self.ml_tree.xview)
+        ml_hscroll.grid(row=1, column=1, sticky="ew")
         self.ml_tree.configure(yscrollcommand=ml_vscroll.set)
+        self.ml_tree.configure(xscrollcommand=ml_hscroll.set)
+        self.ml_tree.bind("<MouseWheel>", self._on_ml_table_mousewheel)
+        self.ml_frozen_tree.bind("<MouseWheel>", self._on_ml_table_mousewheel)
         self.ml_advice_days.trace_add("write", lambda *_args: self._refresh_ml_advice_view())
 
     def _build_ml_monitor_tab(self) -> None:
@@ -1179,6 +1513,151 @@ class StrategyDesktopApp(tk.Tk):
         with tmp_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
         tmp_path.replace(ML_PORTFOLIO_SETTINGS_PATH)
+
+    def _load_ml_stock_pool(self) -> dict[str, dict[str, Any]]:
+        if not ML_STOCK_POOL_PATH.exists():
+            return {}
+        try:
+            with ML_STOCK_POOL_PATH.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception:
+            return {}
+        items = payload.get("items", payload) if isinstance(payload, dict) else {}
+        if not isinstance(items, dict):
+            return {}
+        pool: dict[str, dict[str, Any]] = {}
+        for raw_symbol, raw_item in items.items():
+            try:
+                symbol = engine.normalize_symbol(str(raw_symbol))
+            except Exception:
+                symbol = str(raw_symbol).strip()
+            if not symbol:
+                continue
+            item = raw_item if isinstance(raw_item, dict) else {}
+            pool[symbol] = {
+                "symbol": symbol,
+                "name": str(item.get("name") or ""),
+                "shares": str(item.get("shares") or ""),
+                "cost": str(item.get("cost") or ""),
+                "added_at": str(item.get("added_at") or ""),
+                "updated_at": str(item.get("updated_at") or ""),
+            }
+        return pool
+
+    def _save_ml_stock_pool(self, pool: dict[str, dict[str, Any]]) -> None:
+        engine.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"saved_at": time.strftime("%Y-%m-%d %H:%M:%S"), "items": pool}
+        tmp_path = ML_STOCK_POOL_PATH.with_suffix(".tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        tmp_path.replace(ML_STOCK_POOL_PATH)
+
+    def _resolve_stock_display_name(self, symbol: str) -> str:
+        try:
+            code = engine.normalize_symbol(symbol)
+        except Exception:
+            code = str(symbol).strip()
+        name = self._saved_stock_name(code)
+        if name:
+            return name
+        try:
+            return engine.stock_display_name(code)
+        except Exception:
+            return ""
+
+    def _ml_stock_name(self, symbol: str) -> str:
+        try:
+            code = engine.normalize_symbol(symbol)
+        except Exception:
+            code = str(symbol).strip()
+        item = self._load_ml_stock_pool().get(code, {})
+        name = str(item.get("name") or "").strip()
+        if name:
+            return name
+        resolved = self._resolve_stock_display_name(code)
+        if resolved:
+            pool = self._load_ml_stock_pool()
+            if code in pool:
+                pool[code]["name"] = resolved
+                self._save_ml_stock_pool(pool)
+        return resolved
+
+    def _ml_stock_cached_name(self, symbol: str) -> str:
+        try:
+            code = engine.normalize_symbol(symbol)
+        except Exception:
+            code = str(symbol).strip()
+        item = self._load_ml_stock_pool().get(code, {})
+        name = str(item.get("name") or "").strip()
+        if name:
+            return name
+        return self._saved_stock_name(code)
+
+    def _ml_stock_position(self, symbol: str) -> dict[str, str]:
+        try:
+            code = engine.normalize_symbol(symbol)
+        except Exception:
+            code = str(symbol).strip()
+        item = self._load_ml_stock_pool().get(code, {})
+        return {"shares": str(item.get("shares") or ""), "cost": str(item.get("cost") or "")}
+
+    def _save_ml_stock_position(self, symbol: str, shares: str, cost: str) -> None:
+        try:
+            code = engine.normalize_symbol(symbol)
+        except Exception:
+            code = str(symbol).strip()
+        if not code:
+            return
+        pool = self._load_ml_stock_pool()
+        item = pool.setdefault(
+            code,
+            {
+                "symbol": code,
+                "name": engine.stock_display_name(code),
+                "shares": "",
+                "cost": "",
+                "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "updated_at": "",
+            },
+        )
+        item["name"] = str(item.get("name") or engine.stock_display_name(code))
+        item["shares"] = shares.strip()
+        item["cost"] = cost.strip()
+        item["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._save_ml_stock_pool(pool)
+
+    def _ml_stock_pool_rows(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        pool = self._load_ml_stock_pool()
+        changed = False
+        for symbol, item in pool.items():
+            shares = str(item.get("shares") or "")
+            try:
+                shares_count = int(float(shares or 0))
+            except Exception:
+                shares_count = 0
+            name = str(item.get("name") or "").strip()
+            if not name:
+                name = self._resolve_stock_display_name(symbol)
+                if name:
+                    item["name"] = name
+                    changed = True
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": name,
+                    "shares": shares,
+                    "cost": str(item.get("cost") or ""),
+                    "added_at": str(item.get("added_at") or ""),
+                    "updated_at": str(item.get("updated_at") or ""),
+                    "shares_count": shares_count,
+                }
+            )
+        rows.sort(key=lambda row: str(row.get("added_at", "")), reverse=True)
+        rows.sort(key=lambda row: 0 if int(row.get("shares_count") or 0) > 0 else 1)
+        if changed:
+            self._save_ml_stock_pool(pool)
+        return rows
 
     def _record_strategy_type(self, record: dict[str, Any]) -> str:
         result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
@@ -1379,7 +1858,7 @@ class StrategyDesktopApp(tk.Tk):
     def _render_saved_stock_picker(self) -> None:
         tree_rows = {
             "saved_stock_tree": self._saved_stock_rows(exclude_strategy_type="ml"),
-            "ml_saved_stock_tree": self._saved_stock_rows(exclude_strategy_type="ml", selected_for_left_only=True),
+            "ml_saved_stock_tree": self._ml_stock_pool_rows(),
             "ml_monitor_saved_stock_tree": self._saved_stock_rows(strategy_filter="ml"),
         }
         for tree_name, rows in tree_rows.items():
@@ -1390,8 +1869,6 @@ class StrategyDesktopApp(tk.Tk):
             for iid in tree.get_children():
                 tree.delete(iid)
             if tree_name == "ml_saved_stock_tree":
-                rows = sorted(rows, key=lambda row: str(row.get("latest", "")), reverse=True)
-                rows = sorted(rows, key=lambda row: 0 if self._position_shares_count(str(row["symbol"])) > 0 else 1)
                 self.ml_checked_symbols.intersection_update({str(row["symbol"]) for row in rows})
             for row in rows:
                 symbol = str(row["symbol"])
@@ -1408,15 +1885,13 @@ class StrategyDesktopApp(tk.Tk):
                         self._latest_strategy_label_for_symbol(symbol),
                     )
                 elif tree_name == "ml_saved_stock_tree":
-                    position = self._stock_position(symbol)
                     values = (
                         "☑" if symbol in self.ml_checked_symbols else "☐",
                         symbol,
                         row.get("name", ""),
-                        position.get("shares", ""),
-                        position.get("cost", ""),
-                        row.get("count", 0),
-                        row.get("latest", ""),
+                        row.get("shares", ""),
+                        row.get("cost", ""),
+                        row.get("added_at", ""),
                     )
                 else:
                     values = (symbol, row.get("name", ""), row.get("count", 0), row.get("latest", ""))
@@ -1470,6 +1945,172 @@ class StrategyDesktopApp(tk.Tk):
                 symbols.append(symbol)
                 seen.add(symbol)
         return symbols
+
+    def _ml_pool_input_symbols(self) -> list[str]:
+        if not hasattr(self, "ml_pool_text"):
+            return []
+        return _parse_batch_symbols(self.ml_pool_text.get("1.0", tk.END))
+
+    def _add_ml_pool_symbols(self) -> None:
+        symbols = self._ml_pool_input_symbols()
+        if not symbols:
+            self.status_var.set("请先输入 ML 股票代码或股票名称，多个用逗号/空格/换行分隔")
+            return
+        pool = self._load_ml_stock_pool()
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        added = 0
+        for symbol in symbols:
+            try:
+                code = engine.normalize_symbol(symbol)
+            except Exception:
+                code = str(symbol).strip()
+            if not code:
+                continue
+            item = pool.setdefault(
+                code,
+                {
+                    "symbol": code,
+                    "name": "",
+                    "shares": "",
+                    "cost": "",
+                    "added_at": now,
+                    "updated_at": "",
+                },
+            )
+            if not item.get("added_at"):
+                item["added_at"] = now
+            item["name"] = str(item.get("name") or self._resolve_stock_display_name(code))
+            added += 1
+            self.ml_checked_symbols.add(code)
+        self._save_ml_stock_pool(pool)
+        self._render_saved_stock_picker()
+        if hasattr(self, "ml_pool_text"):
+            self.ml_pool_text.delete("1.0", tk.END)
+        self.status_var.set(f"已加入/更新 {added} 只 ML 股票，并自动勾选")
+
+    def _selected_ml_pool_symbols_for_menu(self) -> list[str]:
+        if not hasattr(self, "ml_saved_stock_tree"):
+            return []
+        pool_symbols = {str(row["symbol"]) for row in self._ml_stock_pool_rows()}
+        selected = [str(item) for item in self.ml_saved_stock_tree.selection() if str(item) in pool_symbols]
+        focused = str(self.ml_saved_stock_tree.focus() or "")
+        if not selected and focused in pool_symbols:
+            selected = [focused]
+        return selected
+
+    def _show_ml_stock_context_menu(self, event: tk.Event) -> str | None:
+        if not hasattr(self, "ml_saved_stock_tree"):
+            return None
+        row_id = self.ml_saved_stock_tree.identify_row(event.y)
+        if row_id:
+            if row_id not in self.ml_saved_stock_tree.selection():
+                self.ml_saved_stock_tree.selection_set(row_id)
+            self.ml_saved_stock_tree.focus(row_id)
+        symbols = self._selected_ml_pool_symbols_for_menu()
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="填写持股/成本", command=self._edit_selected_ml_position, state=tk.NORMAL if symbols else tk.DISABLED)
+        menu.add_separator()
+        menu.add_command(label="勾选选中股票", command=lambda: self._set_selected_ml_checked(True), state=tk.NORMAL if symbols else tk.DISABLED)
+        menu.add_command(label="取消勾选选中股票", command=lambda: self._set_selected_ml_checked(False), state=tk.NORMAL if symbols else tk.DISABLED)
+        menu.add_separator()
+        menu.add_command(label="删除选中股票", command=self._delete_selected_ml_pool_symbols, state=tk.NORMAL if symbols else tk.DISABLED)
+        menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _set_selected_ml_checked(self, checked: bool) -> None:
+        symbols = self._selected_ml_pool_symbols_for_menu()
+        if not symbols:
+            return
+        if checked:
+            self.ml_checked_symbols.update(symbols)
+            action = "勾选"
+        else:
+            self.ml_checked_symbols.difference_update(symbols)
+            action = "取消勾选"
+        self._render_saved_stock_picker()
+        for symbol in symbols:
+            if self.ml_saved_stock_tree.exists(symbol):
+                self.ml_saved_stock_tree.selection_add(symbol)
+        self.status_var.set(f"已{action} {len(symbols)} 只 ML 股票")
+
+    def _edit_selected_ml_position(self) -> None:
+        symbols = self._selected_ml_pool_symbols_for_menu()
+        if not symbols:
+            self.status_var.set("请先选择一只 ML 股票")
+            return
+        self._edit_ml_position_popup(symbols[0])
+
+    def _edit_ml_position_popup(self, symbol: str) -> None:
+        position = self._ml_stock_position(symbol)
+        name = self._ml_stock_name(symbol)
+        popup = tk.Toplevel(self)
+        popup.title(f"填写持股信息 - {symbol} {name}")
+        popup.transient(self)
+        popup.grab_set()
+        popup.columnconfigure(1, weight=1)
+
+        shares_var = tk.StringVar(value=str(position.get("shares", "")))
+        cost_var = tk.StringVar(value=str(position.get("cost", "")))
+
+        ttk.Label(popup, text=f"{symbol} {name}").grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(12, 8))
+        ttk.Label(popup, text="持股数").grid(row=1, column=0, sticky="w", padx=(14, 8), pady=6)
+        shares_entry = ttk.Entry(popup, textvariable=shares_var, width=18)
+        shares_entry.grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=6)
+        ttk.Label(popup, text="成本价").grid(row=2, column=0, sticky="w", padx=(14, 8), pady=6)
+        cost_entry = ttk.Entry(popup, textvariable=cost_var, width=18)
+        cost_entry.grid(row=2, column=1, sticky="ew", padx=(0, 14), pady=6)
+
+        def is_number_or_blank(value: str) -> bool:
+            if not value:
+                return True
+            try:
+                float(value)
+                return True
+            except ValueError:
+                return False
+
+        def save() -> None:
+            shares = shares_var.get().strip()
+            cost = cost_var.get().strip()
+            if not is_number_or_blank(shares):
+                messagebox.showwarning("持仓格式不对", "持股数只能填数字，或留空。", parent=popup)
+                return
+            if not is_number_or_blank(cost):
+                messagebox.showwarning("成本格式不对", "成本价只能填数字，或留空。", parent=popup)
+                return
+            self._save_ml_stock_position(symbol, shares, cost)
+            self._render_saved_stock_picker()
+            if self.ml_saved_stock_tree.exists(symbol):
+                self.ml_saved_stock_tree.selection_set(symbol)
+                self.ml_saved_stock_tree.focus(symbol)
+            self.status_var.set(f"{symbol} {name} 的 ML 持股/成本已保存")
+            popup.destroy()
+
+        buttons = ttk.Frame(popup)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="ew", padx=14, pady=(8, 14))
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
+        ttk.Button(buttons, text="保存", command=save, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(buttons, text="取消", command=popup.destroy).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        shares_entry.focus_set()
+        shares_entry.select_range(0, "end")
+        popup.bind("<Return>", lambda _event: save())
+        popup.bind("<Escape>", lambda _event: popup.destroy())
+
+    def _delete_selected_ml_pool_symbols(self) -> None:
+        symbols = self._selected_ml_pool_symbols_for_menu()
+        if not symbols:
+            self.status_var.set("请先选择要删除的 ML 股票")
+            return
+        if not messagebox.askyesno("删除ML股票", f"确定从 ML 股票池删除 {len(symbols)} 只股票吗？"):
+            return
+        pool = self._load_ml_stock_pool()
+        for symbol in symbols:
+            pool.pop(symbol, None)
+            self.ml_checked_symbols.discard(symbol)
+        self._save_ml_stock_pool(pool)
+        self._render_saved_stock_picker()
+        self.status_var.set(f"已从 ML 股票池删除 {len(symbols)} 只股票")
 
     def _use_selected_saved_monitor_symbols(self) -> None:
         symbols = self._selected_or_all_saved_symbols()
@@ -1739,7 +2380,7 @@ class StrategyDesktopApp(tk.Tk):
         self._save_ml_portfolio_settings()
         if symbol:
             selected = list(self.ml_saved_stock_tree.selection()) if hasattr(self, "ml_saved_stock_tree") else []
-            self._save_stock_position(symbol, shares=shares, cost=cost)
+            self._save_ml_stock_position(symbol, shares, cost)
             self._render_saved_stock_picker()
             if self.ml_saved_stock_tree.exists(symbol):
                 keep_selected = [item for item in selected if self.ml_saved_stock_tree.exists(item)]
@@ -1750,7 +2391,34 @@ class StrategyDesktopApp(tk.Tk):
                 self.ml_saved_stock_tree.focus(symbol)
             self.status_var.set(f"{symbol} 仓位和组合资金已保存；下次 ML 组合评估会使用这些真实仓位")
         else:
-            self.status_var.set("总资金和目标总仓位已保存；选择左侧股票后可保存单股持仓")
+            self.status_var.set("总资金和目标总仓位已保存；右键左侧股票可填写单股持仓")
+
+    def _validate_and_save_ml_account_settings(self) -> bool:
+        cash = self.ml_cash.get().strip()
+        target_position = self.ml_target_position.get().strip()
+
+        def is_number_or_blank(value: str) -> bool:
+            if not value:
+                return True
+            try:
+                float(value)
+                return True
+            except ValueError:
+                return False
+
+        if not is_number_or_blank(cash) or (cash and float(cash) <= 0):
+            messagebox.showwarning("总资金格式不对", "总资金只能填大于 0 的数字。")
+            return False
+        if not is_number_or_blank(target_position):
+            messagebox.showwarning("总仓位格式不对", "目标总仓位只能填 0-100 的数字。")
+            return False
+        if target_position:
+            target = float(target_position)
+            if target < 0 or target > 100:
+                messagebox.showwarning("总仓位格式不对", "目标总仓位只能填 0-100。")
+                return False
+        self._save_ml_portfolio_settings()
+        return True
 
     def _load_monitor_snapshot(self) -> None:
         if not MONITOR_SNAPSHOT_PATH.exists():
@@ -1868,12 +2536,12 @@ class StrategyDesktopApp(tk.Tk):
             return
         symbol = selection[0]
         self.ml_symbol.set(symbol)
-        name = self._saved_stock_name(symbol) or engine.stock_display_name(symbol)
-        position = self._stock_position(symbol)
+        name = self._ml_stock_name(symbol)
+        position = self._ml_stock_position(symbol)
         self.ml_position_symbol.set(f"{symbol} {name}".strip())
         self.ml_shares.set(str(position.get("shares", "")))
         self.ml_buy_price.set(str(position.get("cost", "")))
-        self.status_var.set(f"ML 板块已选择股票：{symbol} {name}；右侧仓位仅用于编辑，点保存后才会修改")
+        self.status_var.set(f"ML 板块已选择股票：{symbol} {name}；右键可填写持股/成本或删除")
 
     def _on_ml_saved_stock_click(self, event: tk.Event) -> str | None:
         row_id = self.ml_saved_stock_tree.identify_row(event.y)
@@ -2600,48 +3268,73 @@ class StrategyDesktopApp(tk.Tk):
 
     def run_ml_backtest(self) -> None:
         if self.backtest_worker and self.backtest_worker.is_alive():
-            self.status_var.set("ML风控评估仍在运行，请稍等")
+            self.status_var.set("ML持仓决策仍在运行，请稍等")
             return
         form = self._ml_backtest_form()
         self.backtest_stop_event.clear()
         self.backtest_target = "ml"
         self.pending_backtest_form = form
         self._set_backtest_running(True)
-        self.ml_summary_var.set("ML风控评估中：正在计算持仓风险、异常和仓位建议，必要时可点终止")
-        self.status_var.set("ML风控评估运行中，请稍等")
+        self.ml_summary_var.set("ML持仓决策中：正在计算次日概率、风险和仓位建议，必要时可点终止")
+        self.status_var.set("ML持仓决策运行中，请稍等")
         self.backtest_worker = threading.Thread(target=self._backtest_worker, daemon=True)
         self.backtest_worker.start()
 
     def _start_saved_stock_ml_backtests(self, symbols: list[str], source_label: str) -> None:
+        _ui_debug(f"ml_start_enter source={source_label} count={len(symbols)}")
         if self.backtest_worker and self.backtest_worker.is_alive():
-            self.status_var.set("ML风控评估仍在运行，请稍等")
+            _ui_debug("ml_start_blocked_existing_worker")
+            self.status_var.set("ML持仓决策仍在运行，请稍等")
             return
         if not symbols:
+            _ui_debug("ml_start_no_symbols")
             self.status_var.set("没有可评估的 ML 股票")
+            return
+        if not self._validate_and_save_ml_account_settings():
+            _ui_debug("ml_start_validate_failed")
             return
         self.backtest_stop_event.clear()
         self.backtest_target = "ml"
-        self.pending_backtest_form = self._ml_backtest_form()
+        _ui_debug("ml_start_build_form")
+        form = self._ml_backtest_form()
+        form["batch_symbols"] = " ".join(symbols)
+        _ui_debug("ml_start_build_positions")
+        form["positions"] = self._ml_positions_for_symbols(symbols)
+        self.pending_backtest_form = form
         self._set_backtest_running(True)
-        self.ml_summary_var.set(f"{source_label}：准备评估 {len(symbols)} 只股票...")
-        self.status_var.set("ML组合风控运行中，请稍等")
+        external_mode = "刷新外部数据" if form.get("refresh_external_data") == "1" else "复用外部数据缓存"
+        self.ml_summary_var.set(f"{source_label}：准备评估 {len(symbols)} 只股票，{external_mode}...")
+        self.status_var.set("ML持仓决策运行中，请稍等")
+        _ui_debug("ml_start_schedule_worker")
+        self.after(50, lambda stock_symbols=list(symbols): self._launch_ml_batch_worker(stock_symbols))
+
+    def _launch_ml_batch_worker(self, symbols: list[str]) -> None:
+        _ui_debug(f"ml_launch_worker count={len(symbols)}")
+        if self.backtest_worker and self.backtest_worker.is_alive():
+            _ui_debug("ml_launch_worker_already_running")
+            return
         self.backtest_worker = threading.Thread(target=self._backtest_batch_worker, args=(symbols,), daemon=True)
         self.backtest_worker.start()
+        _ui_debug("ml_launch_worker_started")
 
     def run_saved_stock_ml_backtests(self) -> None:
         self.run_selected_saved_stock_ml_backtests()
 
     def run_selected_saved_stock_ml_backtests(self) -> None:
+        _ui_debug("ml_run_selected_enter")
         symbols = self._selected_ml_saved_symbols()
+        _ui_debug(f"ml_run_selected_symbols count={len(symbols)}")
         if not symbols:
             self.status_var.set("请先在 ML 股票池的“选择”列勾选要评估的股票")
             return
         self._start_saved_stock_ml_backtests(symbols, "ML勾选股票评估")
 
     def run_all_saved_stock_ml_backtests(self) -> None:
-        symbols = self._all_ml_saved_symbols()
+        _ui_debug("ml_run_all_enter")
+        symbols = self._all_ml_saved_symbols_fast()
+        _ui_debug(f"ml_run_all_symbols count={len(symbols)}")
         if not symbols:
-            self.status_var.set("还没有传统回测左侧已选策略股票，先保存至少一只股票")
+            self.status_var.set("ML 股票池还没有股票，先在左侧批量加入代码")
             return
         self._start_saved_stock_ml_backtests(symbols, "ML全部股票池评估")
 
@@ -2660,16 +3353,45 @@ class StrategyDesktopApp(tk.Tk):
             "buy_price": self.ml_buy_price.get().strip(),
             "buy_date": self.ml_buy_date.get().strip(),
             "batch_symbols": "",
+            "target_position": self.ml_target_position.get().strip() or "80",
+            "positions": {},
+            "refresh_external_data": "1" if self.ml_refresh_external_data.get() else "0",
         }
 
+    def _ml_positions_for_symbols(self, symbols: list[str]) -> dict[str, dict[str, str]]:
+        positions: dict[str, dict[str, str]] = {}
+        for symbol in symbols:
+            position = self._ml_stock_position(symbol)
+            positions[symbol] = {
+                "shares": str(position.get("shares", "")),
+                "cost": str(position.get("cost", "")),
+                "name": self._ml_stock_cached_name(symbol),
+            }
+        return positions
+
     def _selected_ml_saved_symbols(self) -> list[str]:
-        all_symbols = set(self._all_ml_saved_symbols())
-        return [symbol for symbol in self._all_ml_saved_symbols() if symbol in all_symbols and symbol in self.ml_checked_symbols]
+        return [symbol for symbol in self._all_ml_saved_symbols_fast() if symbol in self.ml_checked_symbols]
 
     def _all_ml_saved_symbols(self) -> list[str]:
-        rows = self._saved_stock_rows(exclude_strategy_type="ml", selected_for_left_only=True)
-        rows = sorted(rows, key=lambda row: str(row.get("latest", "")), reverse=True)
-        rows = sorted(rows, key=lambda row: 0 if self._position_shares_count(str(row["symbol"])) > 0 else 1)
+        rows = self._ml_stock_pool_rows()
+        return [str(row["symbol"]) for row in rows]
+
+    def _all_ml_saved_symbols_fast(self) -> list[str]:
+        rows: list[dict[str, Any]] = []
+        for symbol, item in self._load_ml_stock_pool().items():
+            try:
+                code = engine.normalize_symbol(symbol)
+            except Exception:
+                code = str(symbol).strip()
+            if not code:
+                continue
+            try:
+                shares_count = int(float(str(item.get("shares") or "") or 0))
+            except Exception:
+                shares_count = 0
+            rows.append({"symbol": code, "shares_count": shares_count, "added_at": str(item.get("added_at") or "")})
+        rows.sort(key=lambda row: str(row.get("added_at", "")), reverse=True)
+        rows.sort(key=lambda row: 0 if int(row.get("shares_count") or 0) > 0 else 1)
         return [str(row["symbol"]) for row in rows]
 
     def _held_saved_symbols(self) -> list[str]:
@@ -2721,39 +3443,62 @@ class StrategyDesktopApp(tk.Tk):
             self.queue.put(WorkerMessage("backtest_error", error=_short_error_text(exc)))
 
     def _backtest_batch_worker(self, symbols: list[str]) -> None:
+        _ui_debug(f"batch_worker_enter target={self.backtest_target} count={len(symbols)}")
         results: list[dict[str, Any]] = []
         errors: list[str] = []
-        base_form = self._backtest_form()
+        # Tk variables must only be read on the UI thread. Batch starters set
+        # pending_backtest_form before this worker starts; avoid touching widgets
+        # from this background thread because it can freeze the whole window.
         if self.pending_backtest_form is not None:
             base_form = self.pending_backtest_form.copy()
+        else:
+            base_form = self._backtest_form()
         target = self.backtest_target
         cancelled = False
         for idx, symbol in enumerate(symbols, start=1):
+            _ui_debug(f"batch_worker_loop idx={idx} symbol={symbol}")
             if self.backtest_stop_event.is_set():
                 cancelled = True
                 break
             try:
+                task_name = "ML持仓决策" if target == "ml" else "批量回测"
+                self.queue.put(WorkerMessage("status", payload=f"{task_name}进度 {idx}/{len(symbols)}：正在评估 {symbol}"))
                 form = base_form.copy()
                 form["symbol"] = symbol
+                if target == "ml":
+                    form["batch_symbols"] = symbol
+                    form["_timeout_seconds"] = "120"
+                    positions = base_form.get("positions", {})
+                    if isinstance(positions, dict):
+                        form["positions"] = {symbol: positions.get(symbol, {})}
+                _ui_debug(f"batch_worker_run_process symbol={symbol}")
                 results.append(self._run_backtest_process(form))
-            except BacktestCancelled:
-                cancelled = True
-                break
-            except Exception as exc:
+                _ui_debug(f"batch_worker_process_done symbol={symbol}")
+            except BacktestCancelled as exc:
+                if target == "ml" and not self.backtest_stop_event.is_set():
+                    errors.append(f"{symbol}: {_short_error_text(exc)}")
+                else:
+                    cancelled = True
+                    break
+            except BaseException as exc:
+                if target != "ml" and isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
                 errors.append(f"{symbol}: {_short_error_text(exc)}")
-            task_name = "ML组合风控" if target == "ml" else "批量回测"
+            task_name = "ML持仓决策" if target == "ml" else "批量回测"
             self.queue.put(WorkerMessage("status", payload=f"{task_name}进度 {idx}/{len(symbols)}"))
+        _ui_debug(f"batch_worker_done results={len(results)} errors={len(errors)} cancelled={cancelled}")
         self.queue.put(WorkerMessage("backtest_batch", payload={"target": target, "results": results, "errors": errors, "total": len(symbols), "cancelled": cancelled}))
 
     def _run_backtest_process(self, form: dict[str, str]) -> dict[str, Any]:
-        timeout_seconds = 240 if form.get("_job") == "ml_predict" else 180
+        timeout_seconds = int(float(form.get("_timeout_seconds") or (240 if form.get("_job") == "ml_predict" else 180)))
         worker_path = engine.ROOT / "desktop_worker.py"
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
         with tempfile.TemporaryDirectory(prefix="strategy_worker_") as tmp_dir:
             input_path = Path(tmp_dir) / "input.json"
             output_path = Path(tmp_dir) / "output.pkl"
             with input_path.open("w", encoding="utf-8") as handle:
                 json.dump(form, handle, ensure_ascii=False)
+            _ui_debug(f"run_process_popen symbol={form.get('symbol', '')} timeout={timeout_seconds}")
             process = subprocess.Popen(
                 [sys.executable, str(worker_path), str(input_path), str(output_path)],
                 cwd=str(engine.ROOT),
@@ -2762,6 +3507,7 @@ class StrategyDesktopApp(tk.Tk):
                 stderr=subprocess.DEVNULL,
                 creationflags=creationflags,
             )
+            _ui_debug(f"run_process_started pid={process.pid} symbol={form.get('symbol', '')}")
             self.backtest_process = process
             started_at = time.monotonic()
             try:
@@ -2920,21 +3666,26 @@ class StrategyDesktopApp(tk.Tk):
                         target = str(message.payload.get("target", "traditional"))
                         result = message.payload["result"]
                     if target == "ml":
-                        self._apply_ml_backtest_result(result)
+                        if isinstance(result, dict) and "results" in result:
+                            self._apply_ml_backtest_batch_result(result)
+                        else:
+                            self._apply_ml_backtest_result(result)
                     else:
                         self._apply_backtest_result(result)
                 elif message.kind == "backtest_batch":
+                    _ui_debug(f"poll_backtest_batch_enter target={message.payload.get('target') if isinstance(message.payload, dict) else ''}")
                     self._set_backtest_running(False)
                     if isinstance(message.payload, dict) and message.payload.get("target") == "ml":
                         self._apply_ml_backtest_batch_result(message.payload)
                     else:
                         self._apply_backtest_batch_result(message.payload)
+                    _ui_debug("poll_backtest_batch_done")
                 elif message.kind == "backtest_error":
                     self._set_backtest_running(False)
                     if self.backtest_target == "ml" and hasattr(self, "ml_summary_var"):
-                        self.ml_summary_var.set("ML风控评估失败")
-                        self.status_var.set("ML风控评估失败，详情已弹出")
-                        messagebox.showerror("ML风控评估失败", message.error or "")
+                        self.ml_summary_var.set("ML持仓决策失败")
+                        self.status_var.set("ML持仓决策失败，详情已弹出")
+                        messagebox.showerror("ML持仓决策失败", message.error or "")
                     else:
                         self.summary_var.set("回测失败")
                         self.status_var.set("回测失败，详情已弹出")
@@ -2942,8 +3693,8 @@ class StrategyDesktopApp(tk.Tk):
                 elif message.kind == "backtest_cancelled":
                     self._set_backtest_running(False)
                     if self.backtest_target == "ml" and hasattr(self, "ml_summary_var"):
-                        self.ml_summary_var.set("ML风控评估已终止")
-                        self.status_var.set("ML风控评估已终止，子进程已停止")
+                        self.ml_summary_var.set("ML持仓决策已终止")
+                        self.status_var.set("ML持仓决策已终止，子进程已停止")
                     else:
                         self.summary_var.set("回测已终止")
                         self.status_var.set("回测已终止，子进程已停止")
@@ -3149,37 +3900,44 @@ class StrategyDesktopApp(tk.Tk):
         return " | " + " | ".join(parts)
 
     def _apply_ml_backtest_result(self, result: dict[str, Any]) -> None:
+        _ui_debug("apply_ml_single_enter")
         self.ml_backtest_result = result
         self.ml_prediction_results = {str(result["symbol"]): result}
         self._render_ml_prediction_table([result])
-        self._select_ml_prediction(str(result["symbol"]))
-        self._render_strategy_cache_list()
-        self.status_var.set(f"ML风控评估完成：{time.strftime('%H:%M:%S')}")
+        self._select_ml_prediction(str(result["symbol"]), force=True)
+        self.status_var.set(f"ML持仓决策完成：{time.strftime('%H:%M:%S')}")
+        _ui_debug("apply_ml_single_done")
 
     def _apply_ml_backtest_batch_result(self, payload: dict[str, Any]) -> None:
+        _ui_debug("apply_ml_batch_enter")
         results: list[dict[str, Any]] = list(payload.get("results") or [])
         errors: list[str] = list(payload.get("errors") or [])
         total = int(payload.get("total") or (len(results) + len(errors)))
         cancelled = bool(payload.get("cancelled"))
         if results:
-            weighted = self._apply_portfolio_weights(results)
+            _ui_debug(f"apply_ml_batch_weight results={len(results)}")
+            weighted = results if any(isinstance(item, dict) and "decision_row" in item for item in results) else self._apply_portfolio_weights(results)
             self.ml_backtest_result = weighted[0]
+            _ui_debug("apply_ml_batch_render_table")
             self._render_ml_prediction_table(weighted)
             first_symbol = self.ml_tree.get_children()[0] if self.ml_tree.get_children() else str(weighted[0]["symbol"])
-            self._select_ml_prediction(str(first_symbol))
-            prefix = "ML组合风控已终止" if cancelled else "ML组合风控完成"
-            cash = weighted[0].get("cash_reserve", 0) if weighted else 0
-            self.ml_summary_var.set(f"{prefix}：成功 {len(results)}/{total}，已按目标仓位排序，建议现金/缓冲 {self._fmt_number(cash)}%")
+            _ui_debug(f"apply_ml_batch_select {first_symbol}")
+            self._select_ml_prediction(str(first_symbol), force=True)
+            prefix = "ML持仓决策已终止" if cancelled else "ML持仓决策完成"
+            error_hint = f"，失败 {len(errors)} 只，失败明细见状态栏" if errors else ""
+            self.ml_summary_var.set(f"{prefix}：成功 {len(results)}/{total}{error_hint}，已按推荐动作和目标仓位排序")
             self.status_var.set(f"{prefix}：成功 {len(results)} 只，失败 {len(errors)} 只")
         elif cancelled:
-            self.ml_summary_var.set("ML组合风控已终止")
-            self.status_var.set("ML组合风控已终止，未产生新结果")
+            self.ml_summary_var.set("ML持仓决策已终止")
+            self.status_var.set("ML持仓决策已终止，未产生新结果")
         else:
-            self.ml_summary_var.set("ML组合风控失败")
-            self.status_var.set("ML组合风控没有成功结果")
-        self._render_strategy_cache_list()
-        if errors:
-            messagebox.showwarning("部分 ML 风控失败", "\n".join(errors[:8]))
+            self.ml_summary_var.set("ML持仓决策失败")
+            self.status_var.set("ML持仓决策没有成功结果")
+        if errors and not results:
+            messagebox.showwarning("部分 ML 持仓决策失败", "\n".join(errors[:8]))
+        elif errors:
+            self.status_var.set(f"ML持仓决策完成：成功 {len(results)} 只，跳过 {len(errors)} 只；例如 {errors[0]}")
+        _ui_debug("apply_ml_batch_done")
 
     def _fmt_number(self, value: Any, digits: int = 1) -> str:
         try:
@@ -3189,6 +3947,26 @@ class StrategyDesktopApp(tk.Tk):
         if not np.isfinite(number):
             return "-"
         return f"{number:.{digits}f}"
+
+    def _ml_external_source_summary(self, result: dict[str, Any]) -> str:
+        prediction = result.get("prediction", {}) if isinstance(result.get("prediction"), dict) else {}
+        notes = prediction.get("source_notes", []) if isinstance(prediction.get("source_notes"), list) else []
+        status_map = {"cache": "缓存", "stale_cache": "旧缓存", "ok": "今日拉取", "failed": "拉取失败"}
+        buckets = {"资金流": "-", "新闻": "-", "机构活跃": "-"}
+        for note in notes:
+            if not isinstance(note, dict):
+                continue
+            source = str(note.get("source") or "")
+            status = status_map.get(str(note.get("status") or ""), str(note.get("status") or "-"))
+            if "fund" in source or "资金" in source:
+                buckets["资金流"] = status
+            elif "news" in source or "notice" in source or "新闻" in source:
+                buckets["新闻"] = status
+            elif "institution" in source or "lhb" in source or "institute" in source or "机构" in source:
+                current = buckets["机构活跃"]
+                if current in {"-", "拉取失败"} or status == "今日拉取":
+                    buckets["机构活跃"] = status
+        return "；".join(f"{key}={value}" for key, value in buckets.items())
 
     def _apply_portfolio_weights(self, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not results:
@@ -3202,63 +3980,38 @@ class StrategyDesktopApp(tk.Tk):
         except Exception:
             target_total_position = 0.80
         target_total_position = float(np.clip(target_total_position, 0.0, 1.0))
+        advice_days = self._ml_selected_advice_days()
         raw_scores: list[float] = []
-        risk_scores: list[float] = []
         for result in results:
             symbol = str(result.get("symbol", ""))
             prediction = result.get("prediction", {})
-            factor = prediction.get("factor", {}) if isinstance(prediction.get("factor"), dict) else {}
-            anomaly = prediction.get("anomaly", {}) if isinstance(prediction.get("anomaly"), dict) else {}
-            news = prediction.get("news_sentiment", {}) if isinstance(prediction.get("news_sentiment"), dict) else {}
-            holding = prediction.get("holding_risk", {}) if isinstance(prediction.get("holding_risk"), dict) else {}
-            saved_rows = [
-                item
-                for item in self._saved_records_for_symbol(symbol, exclude_strategy_type="ml")
-                if bool(item[1].get("selected_for_left"))
-            ]
-            saved_result = saved_rows[0][1].get("result", {}) if saved_rows and isinstance(saved_rows[0][1].get("result"), dict) else {}
-            saved_signal = saved_result.get("daily_signal", {}) if isinstance(saved_result.get("daily_signal"), dict) else {}
-            risk_score = float(prediction.get("risk_score", 50) or 50)
-            risk_scores.append(risk_score)
-            atr_pct = max(float(factor.get("atr_pct", 3.0) or 3.0), 0.4)
-            prob10 = 50.0
-            for item in prediction.get("horizons", []) or []:
-                if int(item.get("days", 0)) == 10:
-                    prob10 = float(item.get("up_prob", 0.5) or 0.5) * 100
-                    break
-            anomaly_level = str(anomaly.get("level", "unknown"))
-            news_level = str(news.get("level", "unknown"))
-            holding_level = str(holding.get("level", "观察"))
-            penalty = {"normal": 1.0, "watch": 0.72, "high": 0.35, "severe": 0.0, "unknown": 0.55}.get(anomaly_level, 0.55)
-            penalty *= {"normal": 1.0, "watch": 0.75, "high": 0.45, "severe": 0.0, "unknown": 0.9}.get(news_level, 0.9)
-            if holding_level == "高风险":
-                penalty *= 0.2
-            elif holding_level == "风险升高":
-                penalty *= 0.5
-            elif holding_level == "观察":
-                penalty *= 0.8
-            if bool(saved_signal.get("exit_today")):
-                penalty *= 0.05
-            elif bool(saved_signal.get("entry_today")):
-                penalty *= 1.25
-            elif bool(saved_signal.get("in_trend")):
-                penalty *= 1.08
-            edge = max(prob10 - 42.0, 1.0)
-            raw_scores.append(max(risk_score, 1.0) * edge * penalty / atr_pct)
+            projection = self._ml_period_projection(result, advice_days)
+            advice = self._ml_period_advice(result, advice_days)
+            try:
+                current_shares = int(float(self._ml_stock_position(symbol).get("shares", "") or 0))
+            except Exception:
+                current_shares = 0
+            prob_pct = float(projection.get("prob_pct", np.nan))
+            exp_pct = float(projection.get("expected_return_pct", np.nan))
+            if not np.isfinite(prob_pct):
+                prob_pct = 50.0
+            action = str(advice.get("action", ""))
+            if "暂不买入" in action and current_shares <= 0:
+                raw_scores.append(0.0)
+                continue
+            if "卖出" in action:
+                raw_scores.append(0.0)
+                continue
+            threshold = 45.0 if current_shares > 0 else 50.0
+            edge = max(prob_pct - threshold, 0.0)
+            if np.isfinite(exp_pct) and exp_pct <= -0.8:
+                edge = 0.0
+            elif np.isfinite(exp_pct) and exp_pct > 0:
+                edge *= 1.0 + min(exp_pct, 6.0) / 20.0
+            probability_score = edge ** 1.25 if edge > 0 else 0.0
+            raw_scores.append(probability_score)
 
-        avg_risk = float(np.nanmean(risk_scores)) if risk_scores else 50.0
-        severe_count = sum(1 for result in results if str(result.get("prediction", {}).get("holding_risk", {}).get("level", "")) == "高风险")
-        high_news_count = sum(1 for result in results if str(result.get("prediction", {}).get("news_sentiment", {}).get("level", "")) in {"high", "severe"})
-        risk_cash_reserve = 0.10
-        if avg_risk < 45:
-            risk_cash_reserve = 0.45
-        elif avg_risk < 58:
-            risk_cash_reserve = 0.28
-        if severe_count:
-            risk_cash_reserve = min(0.70, risk_cash_reserve + 0.12 * severe_count)
-        if high_news_count:
-            risk_cash_reserve = min(0.75, risk_cash_reserve + 0.08 * high_news_count)
-        invest_weight = min(target_total_position, max(0.0, 1.0 - risk_cash_reserve))
+        invest_weight = target_total_position
         cash_reserve = max(0.0, 1.0 - invest_weight)
         total_raw = float(np.nansum(raw_scores))
         weighted: list[dict[str, Any]] = []
@@ -3267,7 +4020,7 @@ class StrategyDesktopApp(tk.Tk):
             symbol = str(item.get("symbol", ""))
             prediction = item.get("prediction", {}) if isinstance(item.get("prediction"), dict) else {}
             latest_price = float(prediction.get("latest_close", 0) or 0)
-            position = self._stock_position(symbol)
+            position = self._ml_stock_position(symbol)
             try:
                 current_shares = int(float(position.get("shares", "") or 0))
             except Exception:
@@ -3296,7 +4049,7 @@ class StrategyDesktopApp(tk.Tk):
             item["rebalance_action"] = action
             item["cash_reserve"] = round(cash_reserve * 100, 1)
             item["target_total_position"] = round(target_total_position * 100, 1)
-            item["risk_cash_reserve"] = round(risk_cash_reserve * 100, 1)
+            item["risk_cash_reserve"] = round(cash_reserve * 100, 1)
             item["row"] = _ml_prediction_row(item)
             weighted.append(item)
         return sorted(weighted, key=lambda item: float(item.get("target_weight", 0)), reverse=True)
@@ -3311,16 +4064,17 @@ class StrategyDesktopApp(tk.Tk):
     def _ml_period_projection(self, result: dict[str, Any], days: int) -> dict[str, Any]:
         prediction = result.get("prediction", {}) if isinstance(result.get("prediction"), dict) else {}
         horizons = {int(item.get("days", 0)): item for item in prediction.get("horizons", []) or [] if isinstance(item, dict)}
-        factor = prediction.get("factor", {}) if isinstance(prediction.get("factor"), dict) else {}
-        anomaly = prediction.get("anomaly", {}) if isinstance(prediction.get("anomaly"), dict) else {}
-        risk_score = float(prediction.get("risk_score", 50) or 50)
-        if days == 1:
-            factor_score = float(factor.get("score", 50) or 50)
-            ret5 = float(factor.get("ret5_pct", 0) or 0)
-            anomaly_penalty = {"normal": 0, "watch": 5, "high": 14, "severe": 25, "unknown": 5}.get(str(anomaly.get("level", "unknown")), 5)
-            strength = float(np.clip(45 + (factor_score - 50) * 0.38 + (risk_score - 50) * 0.18 - anomaly_penalty, 5, 95))
-            return {"prob_pct": strength, "expected_return_pct": ret5 / 5.0, "label": "1日强度", "detail": "1日建议用最新因子、异常和风险即时估算。"}
         horizon = horizons.get(days) or {}
+        decision_row = result.get("decision_row")
+        if not horizon and isinstance(decision_row, dict):
+            horizon = _ml_decision_horizon(decision_row, days)
+        if not horizon and days == 1:
+            return {
+                "prob_pct": np.nan,
+                "expected_return_pct": np.nan,
+                "label": "1日上涨",
+                "detail": "旧缓存没有1日ML概率，请重新评估后再看第二天建议。",
+            }
         return {
             "prob_pct": float(horizon.get("up_prob", np.nan)) * 100,
             "expected_return_pct": float(horizon.get("expected_return_pct", np.nan)),
@@ -3328,37 +4082,55 @@ class StrategyDesktopApp(tk.Tk):
             "detail": str(horizon.get("detail", "")),
         }
 
+    def _ml_position_shares_for_result(self, result: dict[str, Any]) -> int:
+        symbol = str(result.get("symbol", ""))
+        try:
+            return int(float(self._ml_stock_position(symbol).get("shares", "") or result.get("current_shares", 0) or 0))
+        except Exception:
+            return int(result.get("current_shares", 0) or 0)
+
+    def _display_ml_action(self, action: Any, shares: int) -> str:
+        raw = str(action or "-").strip()
+        if raw in {"HOLD", "持有"}:
+            return "持有/观察" if shares > 0 else "暂不买入"
+        if raw in {"ADD_25", "ADD_50", "加仓25%", "加仓50%"}:
+            return "买入/试仓" if shares <= 0 else "买入/加仓"
+        if raw in {"SELL_ALL", "清仓"}:
+            return "卖出/清仓" if shares > 0 else "暂不买入"
+        if raw in {"REDUCE_50", "REDUCE_25", "减仓50%", "减仓25%"}:
+            return "卖出/减仓" if shares > 0 else "暂不买入"
+        return raw
+
     def _ml_period_advice(self, result: dict[str, Any], days: int | None = None) -> dict[str, Any]:
         days = self._ml_selected_advice_days() if days is None else days
+        decision_row = result.get("decision_row")
+        if isinstance(decision_row, dict) and days == 1:
+            shares = self._ml_position_shares_for_result(result)
+            return {
+                "action": self._display_ml_action(decision_row.get("recommended_action", "-"), shares),
+                "prob_pct": float(decision_row.get("probability_up", np.nan)) * 100,
+                "expected_return_pct": float(decision_row.get("expected_open_to_open_return", np.nan)) * 100,
+                "detail": str(decision_row.get("reason", "")),
+            }
         projection = self._ml_period_projection(result, days)
-        prediction = result.get("prediction", {}) if isinstance(result.get("prediction"), dict) else {}
-        anomaly = prediction.get("anomaly", {}) if isinstance(prediction.get("anomaly"), dict) else {}
-        holding = prediction.get("holding_risk", {}) if isinstance(prediction.get("holding_risk"), dict) else {}
-        shares = self._position_shares_count(str(result.get("symbol", "")))
+        shares = self._ml_position_shares_for_result(result)
         prob = float(projection.get("prob_pct", np.nan))
         exp = float(projection.get("expected_return_pct", np.nan))
-        risk_score = float(prediction.get("risk_score", 50) or 50)
-        anomaly_level = str(anomaly.get("level", "unknown"))
-        holding_level = str(holding.get("level", "观察"))
         reasons: list[str] = []
-        if anomaly_level in {"high", "severe"}:
-            reasons.append(f"异常等级 {anomaly_level}")
-        if holding_level in {"高风险", "风险升高"}:
-            reasons.append(f"持仓风险 {holding_level}")
         if np.isfinite(prob):
             reasons.append(f"{projection.get('label')} {prob:.1f}%")
         if np.isfinite(exp):
             reasons.append(f"{days}日预期 {exp:.1f}%")
 
-        if anomaly_level == "severe" or holding_level == "高风险" or risk_score < 30:
-            action = "卖出/减仓" if shares > 0 else "暂不买入"
-        elif anomaly_level == "high" or holding_level == "风险升高":
-            action = "减仓/观察" if shares > 0 else "暂不买入"
+        if not np.isfinite(prob):
+            action = "持有/观察" if shares > 0 else "暂不买入"
         elif np.isfinite(exp) and exp <= -0.8:
             action = "卖出/减仓" if shares > 0 else "暂不买入"
-        elif np.isfinite(prob) and prob < 43:
+        elif prob < 45:
+            action = "卖出/减仓" if shares > 0 else "暂不买入"
+        elif prob < 50:
             action = "减仓/观察" if shares > 0 else "暂不买入"
-        elif np.isfinite(prob) and prob >= 58 and (not np.isfinite(exp) or exp >= 0.4) and risk_score >= 55:
+        elif prob >= 58 and (not np.isfinite(exp) or exp >= 0.2):
             action = "持有/加仓" if shares > 0 else "买入观察"
         elif shares > 0:
             action = "持有/观察"
@@ -3377,28 +4149,109 @@ class StrategyDesktopApp(tk.Tk):
         current = str(self.ml_tree.selection()[0]) if self.ml_tree.selection() else next(iter(self.ml_prediction_results), "")
         self._render_ml_prediction_table(list(self.ml_prediction_results.values()))
         if current and current in self.ml_prediction_results:
-            self._select_ml_prediction(current)
+            self._select_ml_prediction(current, force=True)
+
+    def _ml_action_priority(self, action: str) -> int:
+        text = str(action or "")
+        if any(key in text for key in ("买入", "加仓")):
+            return 0
+        if any(key in text for key in ("卖出", "减仓", "清仓")):
+            return 1
+        if "持有" in text:
+            return 2
+        if "暂不买入" in text:
+            return 3
+        return 4
+
+    def _ml_sort_value(self, result: dict[str, Any], column: str, rank: int = 0) -> Any:
+        row = result.get("row") or _ml_prediction_row(result)
+        advice = self._ml_period_advice(result, self._ml_selected_advice_days())
+        action = self._display_ml_action(row.get("rebalance_action") or advice.get("action", "-"), self._ml_position_shares_for_result(result))
+        numeric_map = {
+            "rank": rank,
+            "utility": row.get("utility"),
+            "current_weight": row.get("current_weight"),
+            "target_weight": row.get("target_weight"),
+            "trade_shares": row.get("trade_shares"),
+            "risk": row.get("risk"),
+            "prob10": advice.get("prob_pct"),
+            "exp10": advice.get("expected_return_pct"),
+            "fund_flow": row.get("fund_flow"),
+            "news_factor": row.get("news_factor"),
+            "institution": row.get("institution"),
+            "factor": row.get("factor"),
+        }
+        if column in numeric_map:
+            try:
+                value = float(numeric_map[column])
+                return value if np.isfinite(value) else -np.inf
+            except Exception:
+                return -np.inf
+        if column == "action":
+            return (self._ml_action_priority(action), action)
+        if column == "symbol":
+            return str(row.get("symbol") or result.get("symbol") or "")
+        if column == "name":
+            return str(row.get("name") or result.get("name") or "")
+        if column == "holding_risk":
+            return {"high": 0, "medium": 1, "low": 2, "severe": -1}.get(str(row.get("holding_risk", "")).lower(), 9)
+        if column == "detail":
+            return str(advice.get("detail") or row.get("risk_detail", ""))
+        return str(row.get(column, ""))
+
+    def _sort_ml_table(self, column: str) -> None:
+        if not self.ml_prediction_results:
+            return
+        if self.ml_sort_column == column:
+            self.ml_sort_reverse = not self.ml_sort_reverse
+        else:
+            self.ml_sort_column = column
+            self.ml_sort_reverse = column not in {"rank", "symbol", "name", "action", "holding_risk", "detail"}
+        self._render_ml_prediction_table(list(self.ml_prediction_results.values()))
 
     def _render_ml_prediction_table(self, results: list[dict[str, Any]]) -> None:
+        if hasattr(self, "ml_frozen_tree"):
+            for iid in self.ml_frozen_tree.get_children():
+                self.ml_frozen_tree.delete(iid)
         for iid in self.ml_tree.get_children():
             self.ml_tree.delete(iid)
-        ranked = list(results)
-        if not all("target_weight" in item for item in ranked):
-            ranked = self._apply_portfolio_weights(ranked)
+        ranked = list(results) if any(isinstance(item, dict) and "decision_row" in item for item in results) else self._apply_portfolio_weights(list(results))
+        if self.ml_sort_column:
+            indexed = list(enumerate(ranked, start=1))
+            indexed.sort(key=lambda item: self._ml_sort_value(item[1], self.ml_sort_column or "", item[0]), reverse=self.ml_sort_reverse)
+            ranked = [item for _rank, item in indexed]
+        else:
+            indexed = list(enumerate(ranked, start=1))
+            indexed.sort(
+                key=lambda item: (
+                    self._ml_action_priority(
+                        self._display_ml_action(
+                            (item[1].get("row") or _ml_prediction_row(item[1])).get("rebalance_action")
+                            or self._ml_period_advice(item[1], self._ml_selected_advice_days()).get("action", "-"),
+                            self._ml_position_shares_for_result(item[1]),
+                        )
+                    ),
+                    -float((item[1].get("row") or _ml_prediction_row(item[1])).get("utility") or -999),
+                    item[0],
+                )
+            )
+            ranked = [item for _rank, item in indexed]
         self.ml_prediction_results = {str(item["symbol"]): item for item in ranked}
         days = self._ml_selected_advice_days()
-        self.ml_tree.heading("action", text=f"{days}日建议")
-        self.ml_tree.heading("prob10", text=("1日强度%" if days == 1 else f"{days}日涨%"))
-        self.ml_tree.heading("exp10", text=f"{days}日预期%")
+        self.ml_tree.heading("action", text=f"{days}日建议", command=lambda: self._sort_ml_table("action"))
+        self.ml_tree.heading("prob10", text=f"{days}日涨%", command=lambda: self._sort_ml_table("prob10"))
+        self.ml_tree.heading("exp10", text=f"{days}日预期%", command=lambda: self._sort_ml_table("exp10"))
         for rank, result in enumerate(ranked, start=1):
             row = result.get("row") or _ml_prediction_row(result)
             advice = self._ml_period_advice(result, days)
             symbol = str(row["symbol"])
+            display_name = str(row.get("name") or result.get("name") or self._saved_stock_name(symbol) or "")
             values = (
                 rank,
                 symbol,
-                row.get("name", ""),
-                advice.get("action", "-"),
+            display_name,
+                self._display_ml_action(row.get("rebalance_action") or advice.get("action", "-"), self._ml_position_shares_for_result(result)),
+                self._fmt_number(row.get("utility"), digits=4),
                 self._fmt_number(row.get("current_weight")),
                 self._fmt_number(row.get("target_weight")),
                 int(row.get("trade_shares", 0) or 0),
@@ -3406,18 +4259,38 @@ class StrategyDesktopApp(tk.Tk):
                 self._fmt_number(row.get("risk")),
                 self._fmt_number(advice.get("prob_pct")),
                 self._fmt_number(advice.get("expected_return_pct")),
+                self._fmt_number(row.get("fund_flow")),
+                self._fmt_number(row.get("news_factor")),
+                self._fmt_number(row.get("institution")),
                 self._fmt_number(row.get("factor")),
                 advice.get("detail") or row.get("risk_detail", "-"),
             )
+            if hasattr(self, "ml_frozen_tree"):
+                self.ml_frozen_tree.insert("", "end", iid=symbol, values=(rank, symbol, display_name))
             self.ml_tree.insert("", "end", iid=symbol, values=values)
 
-    def _select_ml_prediction(self, symbol: str) -> None:
-        if symbol in self.ml_tree.get_children():
-            current_selection = tuple(self.ml_tree.selection())
-            if current_selection != (symbol,):
-                self.ml_tree.selection_set(symbol)
-            if self.ml_tree.focus() != symbol:
-                self.ml_tree.focus(symbol)
+    def _select_ml_prediction(self, symbol: str, force: bool = False) -> None:
+        _ui_debug(f"select_ml_prediction_enter {symbol}")
+        if not force and symbol == self.selected_ml_prediction_symbol:
+            _ui_debug(f"select_ml_prediction_skip_same {symbol}")
+            return
+        self.selected_ml_prediction_symbol = symbol
+        self._syncing_ml_table_selection = True
+        try:
+            if hasattr(self, "ml_frozen_tree") and symbol in self.ml_frozen_tree.get_children():
+                current_frozen_selection = tuple(self.ml_frozen_tree.selection())
+                if current_frozen_selection != (symbol,):
+                    self.ml_frozen_tree.selection_set(symbol)
+                if self.ml_frozen_tree.focus() != symbol:
+                    self.ml_frozen_tree.focus(symbol)
+            if symbol in self.ml_tree.get_children():
+                current_selection = tuple(self.ml_tree.selection())
+                if current_selection != (symbol,):
+                    self.ml_tree.selection_set(symbol)
+                if self.ml_tree.focus() != symbol:
+                    self.ml_tree.focus(symbol)
+        finally:
+            self._syncing_ml_table_selection = False
         result = self.ml_prediction_results.get(symbol)
         if not result:
             return
@@ -3427,15 +4300,16 @@ class StrategyDesktopApp(tk.Tk):
         advice = self._ml_period_advice(result, days)
         self.ml_summary_var.set(
             f"{row['symbol']} {row['name']} | 持仓风险 {row.get('holding_risk', '-')} | "
-            f"{days}日建议 {advice.get('action', '-')} | "
-            f"{'1日强度' if days == 1 else str(days) + '日上涨'} {self._fmt_number(advice.get('prob_pct'))}% | "
+            f"{days}日建议 {self._display_ml_action(row.get('rebalance_action') or advice.get('action', '-'), self._ml_position_shares_for_result(result))} | "
+            f"{days}日上涨 {self._fmt_number(advice.get('prob_pct'))}% | "
             f"{days}日预期 {self._fmt_number(advice.get('expected_return_pct'))}% | "
             f"目标仓位 {self._fmt_number(row.get('target_weight'))}% | 缓冲/现金 {self._fmt_number(result.get('cash_reserve', 0))}%"
         )
         try:
-            self._draw_ml_prediction_chart(result)
+            self._draw_ml_prediction_chart(result, update_detail=True)
         except Exception as exc:
             self.status_var.set(f"ML预测图绘制失败：{exc}")
+        _ui_debug(f"select_ml_prediction_done {symbol}")
 
     def _render_backtest_table(self, scan: pd.DataFrame) -> None:
         self._render_result_table(self.bt_tree, scan)
@@ -3664,11 +4538,49 @@ class StrategyDesktopApp(tk.Tk):
             return
         self._start_saved_strategy_preview(key_text)
 
+    def _ml_table_yview(self, *args: object) -> None:
+        if hasattr(self, "ml_frozen_tree"):
+            self.ml_frozen_tree.yview(*args)
+        if hasattr(self, "ml_tree"):
+            self.ml_tree.yview(*args)
+
+    def _on_ml_table_mousewheel(self, event: tk.Event) -> str:
+        step = -1 if getattr(event, "delta", 0) > 0 else 1
+        if hasattr(self, "ml_frozen_tree"):
+            self.ml_frozen_tree.yview_scroll(step, "units")
+        if hasattr(self, "ml_tree"):
+            self.ml_tree.yview_scroll(step, "units")
+        return "break"
+
+    def _on_ml_frozen_rank_select(self, _event: object | None = None) -> None:
+        _ui_debug("ml_frozen_rank_select_enter")
+        if getattr(self, "_syncing_ml_table_selection", False):
+            _ui_debug("ml_frozen_rank_select_skip_sync")
+            return
+        selection = self.ml_frozen_tree.selection()
+        if not selection:
+            return
+        symbol = selection[0]
+        if symbol == self.selected_ml_prediction_symbol:
+            _ui_debug(f"ml_frozen_rank_select_skip_same {symbol}")
+            return
+        self._select_ml_prediction(symbol)
+        _ui_debug(f"ml_frozen_rank_select_done {symbol}")
+
     def _on_ml_rank_select(self, _event: object | None = None) -> None:
+        _ui_debug("ml_rank_select_enter")
+        if getattr(self, "_syncing_ml_table_selection", False):
+            _ui_debug("ml_rank_select_skip_sync")
+            return
         selection = self.ml_tree.selection()
         if not selection:
             return
-        self._select_ml_prediction(selection[0])
+        symbol = selection[0]
+        if symbol == self.selected_ml_prediction_symbol:
+            _ui_debug(f"ml_rank_select_skip_same {symbol}")
+            return
+        self._select_ml_prediction(symbol)
+        _ui_debug(f"ml_rank_select_done {symbol}")
 
     def _delete_selected_cache(self) -> None:
         selection = self.cache_tree.selection()
@@ -3953,7 +4865,8 @@ class StrategyDesktopApp(tk.Tk):
     def _redraw_ml_canvas_after_resize(self) -> None:
         self.ml_resize_job = None
         if self.ml_backtest_result:
-            self._draw_ml_prediction_chart(self.ml_backtest_result)
+            _ui_debug("redraw_ml_canvas_after_resize")
+            self._draw_ml_prediction_chart(self.ml_backtest_result, update_detail=False)
 
     def _schedule_ml_monitor_canvas_redraw(self, _event: tk.Event | None = None) -> None:
         if not self.selected_ml_monitor_symbol or self.selected_ml_monitor_symbol not in self.ml_monitor_items:
@@ -4213,14 +5126,24 @@ class StrategyDesktopApp(tk.Tk):
         item = self.ml_monitor_items.get(symbol, {})
         webbrowser.open(str(item.get("xueqiu_url") or engine.xueqiu_url(symbol)))
 
-    def _draw_ml_prediction_chart(self, result: dict[str, Any]) -> None:
+    def _write_ml_detail(self, lines: list[str] | tuple[str, ...] | str) -> None:
+        if not hasattr(self, "ml_detail_text"):
+            return
+        text = "\n".join(str(line) for line in lines) if isinstance(lines, (list, tuple)) else str(lines)
+        self.ml_detail_text.configure(state=tk.NORMAL)
+        self.ml_detail_text.delete("1.0", tk.END)
+        self.ml_detail_text.insert("1.0", text)
+        self.ml_detail_text.configure(state=tk.DISABLED)
+
+    def _draw_ml_prediction_chart(self, result: dict[str, Any], update_detail: bool = True) -> None:
+        _ui_debug(f"draw_ml_chart_enter update_detail={int(update_detail)} symbol={result.get('symbol', '')}")
         canvas = self.ml_canvas
         canvas.delete("all")
         data: pd.DataFrame = result["data"]
         prediction: dict[str, Any] = result["prediction"]
         width = canvas.winfo_width() if canvas.winfo_width() > 180 else 720
         height = canvas.winfo_height() if canvas.winfo_height() > 180 else 420
-        pad_left, pad_right, pad_top, pad_bottom = 62, 260, 46, 44
+        pad_left, pad_right, pad_top, pad_bottom = 62, 36, 46, 44
         close = data["Close"].tail(180)
         ma20 = data["Close"].rolling(20).mean().reindex(close.index)
         ma60 = data["Close"].rolling(60).mean().reindex(close.index)
@@ -4246,13 +5169,11 @@ class StrategyDesktopApp(tk.Tk):
         self._draw_series(canvas, points, "ma60", x_at, y_at, "#10b981", 2)
         self._draw_series(canvas, points, "ma20", x_at, y_at, "#f97316", 2)
         self._draw_series(canvas, points, "price", x_at, y_at, "#1464f4", 3)
-        canvas.create_text(pad_left, pad_top - 20, text=f"{result['symbol']} {result['name']} ML风控/组合", fill="#14213d", anchor="w", font=("Microsoft YaHei", 12, "bold"))
+        canvas.create_text(pad_left, pad_top - 20, text=f"{result['symbol']} {result['name']} ML持仓决策", fill="#14213d", anchor="w", font=("Microsoft YaHei", 12, "bold"))
         canvas.create_text(width - pad_right, pad_top - 20, text="蓝=收盘  橙=20日线  绿=60日线", fill="#607086", anchor="e")
         canvas.create_text(pad_left, height - 18, text=points[0]["time"], fill="#607086", anchor="w")
         canvas.create_text(width - pad_right, height - 18, text=points[-1]["time"], fill="#607086", anchor="e")
 
-        panel_x = width - pad_right + 20
-        panel_y = pad_top
         factor = prediction.get("factor", {}) if isinstance(prediction.get("factor"), dict) else {}
         anomaly = prediction.get("anomaly", {}) if isinstance(prediction.get("anomaly"), dict) else {}
         mc = prediction.get("monte_carlo", {}) if isinstance(prediction.get("monte_carlo"), dict) else {}
@@ -4261,26 +5182,28 @@ class StrategyDesktopApp(tk.Tk):
         days = self._ml_selected_advice_days()
         advice = self._ml_period_advice(result, days)
         lines = [
+            f"模型后端：{prediction.get('backend', '-')}",
+            f"外部数据：{self._ml_external_source_summary(result)}",
             f"持仓风险：{holding.get('level', '-')}",
-            f"{days}日建议：{advice.get('action', '-')}",
+            f"{days}日建议：{self._display_ml_action(result.get('rebalance_action') or advice.get('action', '-'), self._ml_position_shares_for_result(result))}",
             f"目标仓位：{self._fmt_number(result.get('target_weight'))}%",
             f"现金/缓冲：{self._fmt_number(result.get('cash_reserve', 0))}%",
             f"风险分：{self._fmt_number(prediction.get('risk_score'))}",
             f"异常：{anomaly.get('level', '-')}",
             f"新闻风险：{news.get('level', '-')}",
             f"波动：{self._fmt_number(factor.get('atr_pct'))}%",
-            f"{'1日强度' if days == 1 else str(days) + '日上涨'}：{self._fmt_number(advice.get('prob_pct'))}%",
+            f"{days}日上涨：{self._fmt_number(advice.get('prob_pct'))}%",
             f"{days}日预期：{self._fmt_number(advice.get('expected_return_pct'))}%",
             f"因子分：{self._fmt_number(factor.get('score'))}",
-            f"蒙特卡洛10日上涨：{self._fmt_number(float(mc.get('up_prob', np.nan)) * 100)}%",
-            f"VaR 95%：{self._fmt_number(mc.get('var_95_pct'))}%",
+            f"展示-模拟10日上涨：{self._fmt_number(float(mc.get('up_prob', np.nan)) * 100)}%",
+            f"展示-VaR 95%：{self._fmt_number(mc.get('var_95_pct'))}%",
             f"周期说明：{advice.get('detail', '-')}",
-            f"风控说明：{holding.get('detail', '-')}",
+            f"决策说明：{holding.get('detail', '-')}",
             f"新闻/公告：{news.get('detail', '-')}",
         ]
-        canvas.create_rectangle(panel_x - 8, panel_y - 12, width - 16, height - 36, outline="#d8e0ea", fill="#ffffff")
-        for i, line in enumerate(lines):
-            canvas.create_text(panel_x, panel_y + i * 27, text=line, fill="#14213d", anchor="w", font=("Microsoft YaHei", 10))
+        if update_detail:
+            self._write_ml_detail(lines)
+        _ui_debug(f"draw_ml_chart_done update_detail={int(update_detail)} symbol={result.get('symbol', '')}")
 
     def _draw_intraday_chart(self, item: dict[str, Any]) -> None:
         points = item.get("chart_points") or []

@@ -1145,7 +1145,7 @@ def predict_ml_horizon(data: pd.DataFrame, days: int, fast: int = 6, slow: int =
     features = ml_feature_frame(data, fast, slow)
     future_ret = close.shift(-days) / close - 1
     atr_pct = atr(data, 14) / close
-    base_target = {3: 0.008, 5: 0.012, 10: 0.020}.get(days, 0.012)
+    base_target = {1: 0.004, 3: 0.008, 5: 0.012, 10: 0.020}.get(days, 0.012)
     dynamic_target = pd.concat(
         [pd.Series(base_target, index=close.index), atr_pct * math.sqrt(days) * 0.32],
         axis=1,
@@ -1328,7 +1328,7 @@ def build_ml_prediction_snapshot(data: pd.DataFrame, symbol: str = "", fast: int
         raise ValueError("历史数据太少，ML预测至少需要约260个交易日")
     close = data["Close"]
     latest_close = float(close.iloc[-1])
-    horizons = [predict_ml_horizon(data, days, fast, slow) for days in (3, 5, 10)]
+    horizons = [predict_ml_horizon(data, days, fast, slow) for days in (1, 3, 5, 10)]
     factor = factor_score_snapshot(data)
     anomaly = detect_latest_anomaly(data, fast, slow)
     mc = monte_carlo_risk(data, stop_line=None, days=10, simulations=1500)
@@ -1339,9 +1339,9 @@ def build_ml_prediction_snapshot(data: pd.DataFrame, symbol: str = "", fast: int
         "detail": "未提供股票代码，无法拉取新闻/公告",
     }
 
-    prob3 = float(horizons[0].get("up_prob", np.nan))
-    prob5 = float(horizons[1].get("up_prob", np.nan))
-    prob10 = float(horizons[2].get("up_prob", np.nan))
+    prob3 = float(horizons[1].get("up_prob", np.nan))
+    prob5 = float(horizons[2].get("up_prob", np.nan))
+    prob10 = float(horizons[3].get("up_prob", np.nan))
     prob_score = np.nanmean([prob3 * 100, prob5 * 100, prob10 * 100])
     if not np.isfinite(prob_score):
         prob_score = 50.0
@@ -1367,7 +1367,7 @@ def build_ml_prediction_snapshot(data: pd.DataFrame, symbol: str = "", fast: int
         risk_reasons.append(f"异常等级 {anomaly_level}")
     if news_level in {"watch", "high", "severe"}:
         risk_reasons.append(f"新闻公告风险 {news_level}")
-    if float(horizons[2].get("expected_return_pct", 0) or 0) < -1.0:
+    if float(horizons[3].get("expected_return_pct", 0) or 0) < -1.0:
         risk_reasons.append("10日预期收益偏弱")
     if float(factor.get("atr_pct", 0) or 0) >= 4.0:
         risk_reasons.append("波动率偏高")
