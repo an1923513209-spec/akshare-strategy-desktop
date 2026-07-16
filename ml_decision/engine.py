@@ -124,8 +124,10 @@ def _output_row(
     scores: dict[str, Any],
 ) -> dict[str, Any]:
     unrealized = holding.current_price / holding.average_cost - 1 if holding.average_cost > 0 else np.nan
+    action_label = _action_cn(selected.action, holding.shares)
+    holding_risk = _holding_risk_level(holding, prediction)
     reason = (
-        f"建议{_action_cn(selected.action)}。开盘至再下一开盘预期收益 {prediction.expected_open_to_open_return * 100:.2f}%，"
+        f"建议{action_label}。开盘至再下一开盘预期收益 {prediction.expected_open_to_open_return * 100:.2f}%，"
         f"上涨概率 {prediction.probability_up * 100:.1f}%，超成本概率 {prediction.probability_profitable * 100:.1f}%，"
         f"下跌2%概率 {prediction.probability_down_2pct * 100:.1f}%，q10 {prediction.return_q10 * 100:.2f}%。"
         f"验证权重：概率 {prediction.score_weights.get('probability', 0):.2f}，"
@@ -161,7 +163,9 @@ def _output_row(
         "expected_net_pnl": selected.expected_net_pnl,
         "downside_risk": selected.downside_risk,
         "utility_score": selected.utility_score,
+        "display_score": _display_score(prediction),
         "confidence_level": prediction.confidence_level,
+        "holding_risk_level": holding_risk,
         "score_weight_probability": prediction.score_weights.get("probability", np.nan),
         "score_weight_expected": prediction.score_weights.get("expected", np.nan),
         "score_weight_risk": prediction.score_weights.get("risk", np.nan),
@@ -191,15 +195,48 @@ def _score(scores: dict[str, Any], action: str) -> float:
     return float(score.utility_score) if score is not None else np.nan
 
 
-def _action_cn(action: str) -> str:
-    return {
+def _action_cn(action: str, shares: int = 0) -> str:
+    if action == "HOLD" and shares <= 0:
+        return "暂不买入/观察"
+    if action in {"SELL_ALL", "REDUCE_50", "REDUCE_25"} and shares <= 0:
+        return "暂不买入/观察"
+    labels = {
         "SELL_ALL": "清仓",
         "REDUCE_50": "减仓50%",
         "REDUCE_25": "减仓25%",
         "HOLD": "持有",
         "ADD_25": "加仓25%",
         "ADD_50": "加仓50%",
-    }.get(action, action)
+    }
+    return labels.get(action, action)
+
+
+def _display_score(prediction: PredictionPack) -> float:
+    weights = prediction.score_weights or {"probability": 0.45, "expected": 0.35, "risk": 0.20}
+    prob_component = (float(prediction.probability_up) - 0.5) * 2.0
+    expected_component = float(np.tanh(float(prediction.expected_open_to_open_return) / 0.03))
+    q10_risk = float(np.clip(-float(prediction.return_q10), 0.0, 0.08) / 0.08)
+    risk_component = (float(prediction.probability_down_2pct) + q10_risk) / 2.0
+    edge = (
+        float(weights.get("probability", 0.45)) * prob_component
+        + float(weights.get("expected", 0.35)) * expected_component
+        - float(weights.get("risk", 0.20)) * risk_component
+    )
+    return float(np.clip((edge + 1.0) * 50.0, 0.0, 100.0))
+
+
+def _holding_risk_level(holding: Holding, prediction: PredictionPack) -> str:
+    if holding.shares <= 0:
+        return "未持仓"
+    q10_risk = max(-float(prediction.return_q10), 0.0)
+    down_prob = float(prediction.probability_down_2pct)
+    if down_prob >= 0.45 or q10_risk >= 0.06:
+        return "高风险"
+    if down_prob >= 0.30 or q10_risk >= 0.04:
+        return "风险升高"
+    if down_prob >= 0.18 or q10_risk >= 0.025:
+        return "中等"
+    return "低"
 
 
 def result_to_jsonable(result: DecisionResult) -> dict[str, Any]:

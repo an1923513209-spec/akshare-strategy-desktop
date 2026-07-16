@@ -138,10 +138,12 @@ def score_actions(
             trade_shares = 0
 
         trade_value = abs(trade_shares) * holding.current_price
-        if 0 < trade_value < account.minimum_trade_amount:
+        if trade_shares == 0:
+            action_effective: ActionName = "HOLD"
+        elif 0 < trade_value < account.minimum_trade_amount:
             trade_shares = 0
             trade_value = 0.0
-            action_effective: ActionName = "HOLD"
+            action_effective = "HOLD"
         else:
             action_effective = action
 

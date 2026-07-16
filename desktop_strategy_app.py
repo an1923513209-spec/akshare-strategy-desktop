@@ -357,7 +357,7 @@ def _ml_prediction_row(result: dict[str, Any]) -> dict[str, Any]:
         "target_shares": float(result.get("target_shares", np.nan)),
         "trade_shares": float(result.get("trade_shares", np.nan)),
         "rebalance_action": result.get("rebalance_action", "-"),
-        "utility": float(decision_row.get("utility_score", np.nan)),
+        "utility": float(decision_row.get("display_score", np.nan)),
         "prob3": float(h3.get("up_prob", np.nan)) * 100,
         "prob5": float(h5.get("up_prob", np.nan)) * 100,
         "prob10": float(h10.get("up_prob", np.nan)) * 100,
@@ -514,6 +514,22 @@ def _ml_decision_factor_score(row: dict[str, Any]) -> float:
     return _clamp_score(raw)
 
 
+def _ml_holding_risk_level(row: dict[str, Any], risk_score: float) -> str:
+    try:
+        shares = int(float(row.get("shares") or 0))
+    except Exception:
+        shares = 0
+    if shares <= 0:
+        return "未持仓"
+    if risk_score >= 70:
+        return "高风险"
+    if risk_score >= 45:
+        return "风险升高"
+    if risk_score >= 25:
+        return "中等"
+    return "低"
+
+
 def _ml_display_snapshot(data: pd.DataFrame) -> dict[str, Any]:
     try:
         atr_pct = float((engine.atr(data, 14) / data["Close"]).iloc[-1]) * 100
@@ -523,6 +539,9 @@ def _ml_display_snapshot(data: pd.DataFrame) -> dict[str, Any]:
         anomaly = engine.detect_latest_anomaly(data, 20, 60)
     except Exception as exc:
         anomaly = {"level": "unknown", "detail": f"异常检测暂不可用: {exc}"}
+    if isinstance(anomaly, dict) and str(anomaly.get("level", "")) == "unknown":
+        detail = str(anomaly.get("detail") or "")
+        anomaly["level"] = "样本不足" if "样本不足" in detail else "未判断"
     try:
         mc = engine.monte_carlo_risk(data, stop_line=None, days=10, simulations=1200)
     except Exception as exc:
@@ -574,7 +593,7 @@ def _ml_decision_result_from_row(
         "backend": str(decision_payload.get("metrics", {}).get("model_backend", "XGBoost CUDA")),
         "factor": factor_display,
         "risk_score": risk_score,
-        "holding_risk": {"level": row.get("confidence_level", "-"), "detail": row.get("reason", "")},
+        "holding_risk": {"level": row.get("holding_risk_level") or _ml_holding_risk_level(row, risk_score), "detail": row.get("reason", "")},
         "anomaly": display.get("anomaly", {"level": "-"}),
         "news_sentiment": {"level": "-"},
         "monte_carlo": display.get("monte_carlo", {}),
@@ -4194,7 +4213,7 @@ class StrategyDesktopApp(tk.Tk):
         if column == "name":
             return str(row.get("name") or result.get("name") or "")
         if column == "holding_risk":
-            return {"high": 0, "medium": 1, "low": 2, "severe": -1}.get(str(row.get("holding_risk", "")).lower(), 9)
+            return {"高风险": 0, "风险升高": 1, "中等": 2, "低": 3, "未持仓": 4}.get(str(row.get("holding_risk", "")), 9)
         if column == "detail":
             return str(advice.get("detail") or row.get("risk_detail", ""))
         return str(row.get(column, ""))
@@ -4249,9 +4268,9 @@ class StrategyDesktopApp(tk.Tk):
             values = (
                 rank,
                 symbol,
-            display_name,
+                display_name,
                 self._display_ml_action(row.get("rebalance_action") or advice.get("action", "-"), self._ml_position_shares_for_result(result)),
-                self._fmt_number(row.get("utility"), digits=4),
+                self._fmt_number(row.get("utility")),
                 self._fmt_number(row.get("current_weight")),
                 self._fmt_number(row.get("target_weight")),
                 int(row.get("trade_shares", 0) or 0),
@@ -5183,6 +5202,7 @@ class StrategyDesktopApp(tk.Tk):
         advice = self._ml_period_advice(result, days)
         lines = [
             f"模型后端：{prediction.get('backend', '-')}",
+            f"模型AUC：{self._fmt_number((prediction.get('metrics') or {}).get('auc_up'), digits=3) if isinstance(prediction.get('metrics'), dict) else '-'}",
             f"外部数据：{self._ml_external_source_summary(result)}",
             f"持仓风险：{holding.get('level', '-')}",
             f"{days}日建议：{self._display_ml_action(result.get('rebalance_action') or advice.get('action', '-'), self._ml_position_shares_for_result(result))}",
