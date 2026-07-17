@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 import json
+import math
 from pathlib import Path
 import shutil
 import subprocess
@@ -143,16 +144,88 @@ class ModelRegistry:
             raise FileNotFoundError(f"No {status} model has been registered")
         return self.load_version(version)
 
-    def promote_candidate(self, comparison: Mapping[str, Any]) -> bool:
-        """Promote only after the configured OOS regression gate has passed."""
+    @staticmethod
+    def _mean_metric(rows: list[dict[str, Any]], key: str) -> float:
+        values = []
+        for row in rows:
+            try:
+                value = float(row.get(key))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                values.append(value)
+        return sum(values) / len(values) if values else float("nan")
+
+    def _initial_promotion_settings(self) -> dict[str, float]:
+        path = self.project_root / "config" / "ml_governance.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            settings = payload.get("model_promotion", {}).get("initial_production", {})
+            return dict(settings) if isinstance(settings, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def candidate_promotion_evaluation(self, comparison: Mapping[str, Any]) -> dict[str, Any]:
+        """Evaluate bootstrap or replacement gates without changing registry pointers."""
+        registry = self._read_registry()
+        candidate = registry.get("candidate")
+        if not candidate:
+            return {"passed": False, "mode": "none", "failed_checks": ["no_candidate"]}
+
+        if not registry.get("production"):
+            package = self.load_version(candidate)
+            metrics = package.get("training_metrics", [])
+            rows = [
+                row for row in metrics
+                if isinstance(row, dict) and row.get("model_group") == "dynamic_group_ensemble"
+            ]
+            if not rows:
+                rows = [
+                    row for row in metrics
+                    if isinstance(row, dict) and row.get("model_group") == "all_factor"
+                ]
+            settings = self._initial_promotion_settings()
+            if rows and settings:
+                summary = {
+                    "oos_windows": len(rows),
+                    "auc": self._mean_metric(rows, "auc"),
+                    "rank_ic": self._mean_metric(rows, "rank_ic"),
+                    "net_return": self._mean_metric(rows, "net_return"),
+                    "max_drawdown": self._mean_metric(rows, "max_drawdown"),
+                    "brier": self._mean_metric(rows, "brier"),
+                }
+                checks = {
+                    "regression_tests": bool(comparison.get("regression_tests_passed", False)),
+                    "oos_windows": summary["oos_windows"] >= int(settings.get("minimum_oos_windows", 12)),
+                    "auc": summary["auc"] >= float(settings.get("minimum_auc", 0.52)),
+                    "rank_ic": summary["rank_ic"] > float(settings.get("minimum_rank_ic", 0.0)),
+                    "net_return": summary["net_return"] >= float(settings.get("minimum_net_return", 0.0)),
+                    "max_drawdown": summary["max_drawdown"] >= float(settings.get("minimum_max_drawdown", -0.15)),
+                    "brier": summary["brier"] <= float(settings.get("maximum_brier", 0.255)),
+                }
+                failed = [name for name, passed in checks.items() if not passed]
+                return {
+                    "passed": not failed,
+                    "mode": "initial_absolute",
+                    "failed_checks": failed,
+                    "checks": checks,
+                    "metrics": summary,
+                }
+
         required_windows = int(comparison.get("minimum_better_windows", 3))
-        passed = (
-            int(comparison.get("consecutive_better_windows", 0)) >= required_windows
-            and bool(comparison.get("net_return_not_worse", False))
-            and bool(comparison.get("drawdown_not_worse", False))
-            and bool(comparison.get("regression_tests_passed", False))
-        )
-        if not passed:
+        checks = {
+            "consecutive_better_windows": int(comparison.get("consecutive_better_windows", 0)) >= required_windows,
+            "net_return_not_worse": bool(comparison.get("net_return_not_worse", False)),
+            "drawdown_not_worse": bool(comparison.get("drawdown_not_worse", False)),
+            "regression_tests": bool(comparison.get("regression_tests_passed", False)),
+        }
+        failed = [name for name, passed in checks.items() if not passed]
+        return {"passed": not failed, "mode": "replacement_relative", "failed_checks": failed, "checks": checks}
+
+    def promote_candidate(self, comparison: Mapping[str, Any]) -> bool:
+        """Promote only after the applicable bootstrap or replacement gate passes."""
+        evaluation = self.candidate_promotion_evaluation(comparison)
+        if not evaluation["passed"]:
             return False
         registry = self._read_registry()
         candidate = registry.get("candidate")

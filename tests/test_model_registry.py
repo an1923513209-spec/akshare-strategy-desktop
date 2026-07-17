@@ -64,3 +64,30 @@ def test_production_can_roll_back_to_previous_version(tmp_path: Path):
     assert rollback_production_model(tmp_path)
     assert registry.status()["production"] == "v1"
 
+
+def test_first_production_uses_absolute_oos_gate(tmp_path: Path):
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "ml_governance.json").write_text(
+        '{"model_promotion":{"initial_production":{"minimum_oos_windows":12,"minimum_auc":0.52,'
+        '"minimum_rank_ic":0.0,"minimum_net_return":0.0,"minimum_max_drawdown":-0.15,'
+        '"maximum_brier":0.255}}}',
+        encoding="utf-8",
+    )
+    registry = ModelRegistry(tmp_path)
+    rows = [
+        {"model_group": "dynamic_group_ensemble", "auc": 0.53, "rank_ic": 0.02,
+         "net_return": 0.01, "max_drawdown": -0.08, "brier": 0.249}
+        for _ in range(12)
+    ]
+    registry.save_version(
+        "v1", {"all_factor": StoredModel()}, metadata={"config": {}}, group_weights={},
+        factor_columns={"all_factor": ["ret_5"]}, factor_status={"all_factor": "ACTIVE"},
+        training_metrics=rows,
+    )
+    comparison = {"regression_tests_passed": True, "consecutive_better_windows": 0}
+
+    evaluation = registry.candidate_promotion_evaluation(comparison)
+    assert evaluation["mode"] == "initial_absolute"
+    assert evaluation["passed"]
+    assert registry.promote_candidate(comparison)

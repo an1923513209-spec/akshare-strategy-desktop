@@ -30,6 +30,7 @@ from ml_decision.data_sources import fetch_external_factor_frame, merge_external
 from ml_decision.engine import result_to_jsonable, run_holding_decision
 from ml_decision.inference import production_result_to_jsonable, run_production_holding_decision
 from ml_decision.model_registry import (
+    evaluate_candidate_model,
     ProductionModelLoader,
     ProductionModelNotFound,
     promote_candidate_model,
@@ -1640,8 +1641,14 @@ class StrategyDesktopApp(tk.Tk):
             comparison = json.loads((engine.ROOT / "reports" / "model_comparison.json").read_text(encoding="utf-8"))
             comparison["regression_tests_passed"] = completed.returncode == 0
             comparison.setdefault("minimum_better_windows", 3)
+            evaluation = evaluate_candidate_model(engine.ROOT, comparison)
             promoted = promote_candidate_model(engine.ROOT, comparison)
-            detail = "候选模型已晋升为正式模型" if promoted else "候选模型未通过样本外门槛，正式模型保持不变"
+            if promoted:
+                mode = "首次绝对指标" if evaluation.get("mode") == "initial_absolute" else "相对改进指标"
+                detail = f"候选模型已通过{mode}并晋升为正式模型"
+            else:
+                failed = ", ".join(evaluation.get("failed_checks", [])) or "unknown"
+                detail = f"候选模型未通过验收：{failed}；正式模型保持不变"
         except Exception as exc:
             promoted = False
             detail = f"模型晋升失败：{_short_error_text(exc)}"

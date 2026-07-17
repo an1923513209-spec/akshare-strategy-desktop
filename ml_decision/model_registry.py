@@ -144,6 +144,10 @@ def promote_candidate_model(project_root: str | Path, comparison: Mapping[str, A
     return promoted
 
 
+def evaluate_candidate_model(project_root: str | Path, comparison: Mapping[str, Any]) -> dict[str, Any]:
+    return ModelRegistry(project_root).candidate_promotion_evaluation(comparison)
+
+
 def rollback_production_model(project_root: str | Path) -> bool:
     rolled_back = ModelRegistry(project_root).rollback_production()
     if rolled_back:

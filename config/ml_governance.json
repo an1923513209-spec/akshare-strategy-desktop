@@ -72,7 +72,15 @@
   "model_promotion": {
     "minimum_better_windows": 3,
     "require_net_return_improvement": true,
-    "require_no_drawdown_deterioration": true
+    "require_no_drawdown_deterioration": true,
+    "initial_production": {
+      "minimum_oos_windows": 12,
+      "minimum_auc": 0.52,
+      "minimum_rank_ic": 0.0,
+      "minimum_net_return": 0.0,
+      "minimum_max_drawdown": -0.15,
+      "maximum_brier": 0.255
+    }
   },
   "model": {
     "random_state": 42,
