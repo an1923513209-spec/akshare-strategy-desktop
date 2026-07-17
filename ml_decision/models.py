@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any
 
 import numpy as np
@@ -10,8 +11,61 @@ import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor, RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score
+from sklearn.metrics import brier_score_loss, mean_absolute_error, mean_squared_error, roc_auc_score
 from sklearn.pipeline import Pipeline
+
+try:
+    from sklearn.frozen import FrozenEstimator
+except ImportError:  # pragma: no cover - compatibility with transitional sklearn releases
+    from sklearn.calibration import FrozenEstimator
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class PurgedDateSplits:
+    """Four chronological date sets separated by label-safe embargo dates."""
+
+    train_dates: pd.DatetimeIndex
+    calibration_dates: pd.DatetimeIndex
+    validation_dates: pd.DatetimeIndex
+    test_dates: pd.DatetimeIndex
+    purge_days: int = 2
+
+    def frame(self, dataset: pd.DataFrame, part: str) -> pd.DataFrame:
+        dates = getattr(self, f"{part}_dates")
+        normalized = pd.to_datetime(dataset["date"], errors="coerce").dt.normalize()
+        return dataset.loc[normalized.isin(dates)].sort_values(["date", "code"], kind="stable")
+
+
+def make_purged_date_splits(dataset: pd.DataFrame, purge_days: int = 2) -> PurgedDateSplits:
+    """Split unique dates, never rows, and embargo every adjacent partition."""
+    dates = pd.DatetimeIndex(
+        pd.to_datetime(dataset["date"], errors="coerce").dropna().dt.normalize().drop_duplicates().sort_values()
+    )
+    purge_days = max(int(purge_days), 2)
+    usable_count = len(dates) - purge_days * 3
+    if usable_count < 32:
+        raise ValueError(f"Not enough unique trade dates for purged split: {len(dates)}")
+    train_count = max(18, int(usable_count * 0.55))
+    calibration_count = max(4, int(usable_count * 0.15))
+    validation_count = max(4, int(usable_count * 0.15))
+    test_count = usable_count - train_count - calibration_count - validation_count
+    if test_count < 4:
+        deficit = 4 - test_count
+        train_count -= deficit
+        test_count = 4
+
+    cursor = 0
+    train = dates[cursor : cursor + train_count]
+    cursor += train_count + purge_days
+    calibration = dates[cursor : cursor + calibration_count]
+    cursor += calibration_count + purge_days
+    validation = dates[cursor : cursor + validation_count]
+    cursor += validation_count + purge_days
+    test = dates[cursor : cursor + test_count]
+    return PurgedDateSplits(train, calibration, validation, test, purge_days)
 
 
 @dataclass(slots=True)
@@ -29,20 +83,23 @@ class PredictionPack:
     confidence_level: str
     top_positive_factors: list[str]
     top_negative_factors: list[str]
+    important_factors: list[str]
     score_weights: dict[str, float]
 
 
-class NextSessionModel:
+class _LegacyNextSessionModel:
     """Train several time-safe models and produce one prediction row."""
 
     MIN_USABLE_ROWS = 50
 
-    def __init__(self, calibration_method: str = "sigmoid", random_state: int = 42) -> None:
+    def __init__(self, calibration_method: str = "sigmoid", random_state: int = 42, use_shap: bool = True) -> None:
         self.calibration_method = calibration_method if calibration_method in {"sigmoid", "isotonic"} else "sigmoid"
         self.random_state = random_state
+        self.use_shap = bool(use_shap)
         self.feature_columns: list[str] = []
         self.models: dict[str, Any] = {}
         self.metrics: dict[str, float] = {}
+        self._calibration_metrics: dict[str, Any] = {}
 
     def fit(self, dataset: pd.DataFrame, features: list[str]) -> "NextSessionModel":
         """Fit all required models using chronological train/validation slices."""
@@ -129,10 +186,11 @@ class NextSessionModel:
         pipe.fit(x_train, y_train.astype(int))
         if y_valid.nunique() >= 2 and len(y_valid) >= 40:
             try:
-                calibrated = CalibratedClassifierCV(pipe, method=self.calibration_method, cv="prefit")
+                calibrated = CalibratedClassifierCV(FrozenEstimator(pipe), method=self.calibration_method)
                 calibrated.fit(x_valid, y_valid.astype(int))
                 return calibrated
             except Exception:
+                LOGGER.exception("Legacy probability calibration failed")
                 return pipe
         return pipe
 
@@ -234,7 +292,7 @@ class NextSessionModel:
             return [], []
         pairs = sorted(zip(self.feature_columns, importances), key=lambda item: float(item[1]), reverse=True)[:6]
         names = [name for name, _value in pairs]
-        return names[:3], names[3:6]
+        return [], []
 
     def _require_xgboost_cuda(self) -> None:
         try:
@@ -303,3 +361,192 @@ class NextSessionModel:
             random_state=self.random_state,
             verbosity=0,
         )
+
+
+class NextSessionModel(_LegacyNextSessionModel):
+    """Leakage-safe model implementation used by the decision engine."""
+
+    def fit(
+        self,
+        dataset: pd.DataFrame,
+        features: list[str],
+        splits: PurgedDateSplits | None = None,
+    ) -> "NextSessionModel":
+        self.feature_columns = list(features)
+        usable = dataset.dropna(subset=["next_open_to_next_open_return"]).sort_values(
+            ["date", "code"], kind="stable"
+        )
+        if len(usable) < self.MIN_USABLE_ROWS:
+            raise ValueError(f"Not enough labelled rows: {len(usable)} < {self.MIN_USABLE_ROWS}")
+        splits = splits or make_purged_date_splits(usable, purge_days=2)
+        train = splits.frame(usable, "train")
+        calibration = splits.frame(usable, "calibration")
+        validation = splits.frame(usable, "validation")
+        test = splits.frame(usable, "test")
+        if min(map(len, (train, calibration, validation, test))) == 0:
+            raise ValueError("Purged date split produced an empty model partition")
+
+        x_train = train[self.feature_columns]
+        x_calibration = calibration[self.feature_columns]
+        x_validation = validation[self.feature_columns]
+        x_test = test[self.feature_columns]
+        self._calibration_metrics = {}
+        self.models["gap"] = self._fit_regressor(x_train, train["next_gap_return"])
+        self.models["open_to_open"] = self._fit_regressor(x_train, train["next_open_to_next_open_return"])
+        self.models["up"] = self._fit_classifier(
+            "up", x_train, train["label_up"], x_calibration, calibration["label_up"]
+        )
+        self.models["profitable"] = self._fit_classifier(
+            "profitable", x_train, train["label_profitable"], x_calibration, calibration["label_profitable"]
+        )
+        self.models["down_2pct"] = self._fit_classifier(
+            "down_2pct", x_train, train["label_down_2pct"], x_calibration, calibration["label_down_2pct"]
+        )
+        self.models["q10"] = self._fit_quantile(x_train, train["next_open_to_next_open_return"], 0.10)
+        self.models["q50"] = self._fit_quantile(x_train, train["next_open_to_next_open_return"], 0.50)
+        self.models["q90"] = self._fit_quantile(x_train, train["next_open_to_next_open_return"], 0.90)
+
+        validation_prediction = pd.Series(
+            self.models["open_to_open"].predict(x_validation), index=validation.index
+        )
+        validation_weights = self._validate_score_weights(
+            validation,
+            x_validation,
+            validation_prediction,
+            validation["next_open_to_next_open_return"].fillna(0.0),
+        )
+        self.metrics = self._score_test(test, x_test)
+        self.metrics.update(validation_weights)
+        self.metrics.update(self._calibration_metrics)
+        self.metrics.update(
+            {
+                "model_backend": "XGBoost CUDA",
+                "train_rows": float(len(train)),
+                "calibration_rows": float(len(calibration)),
+                "valid_rows": float(len(validation)),
+                "test_rows": float(len(test)),
+                "purge_days": float(splits.purge_days),
+                "split_train_end": str(splits.train_dates.max().date()),
+                "split_calibration_start": str(splits.calibration_dates.min().date()),
+                "split_validation_start": str(splits.validation_dates.min().date()),
+                "split_test_start": str(splits.test_dates.min().date()),
+            }
+        )
+        return self
+
+    def _fit_classifier(
+        self,
+        name: str,
+        x_train: pd.DataFrame,
+        y_train: pd.Series,
+        x_calibration: pd.DataFrame,
+        y_calibration: pd.Series,
+    ) -> Any:
+        if y_train.nunique() < 2:
+            raise ValueError(f"Training label {name} has only one class")
+        pipe = Pipeline(
+            [("imputer", SimpleImputer(strategy="median")), ("model", self._xgb_classifier())]
+        )
+        pipe.fit(x_train, y_train.astype(int))
+        status_key = f"calibration_{name}_status"
+        if y_calibration.nunique() < 2 or len(y_calibration) < 20:
+            self._calibration_metrics[status_key] = "skipped_insufficient_classes_or_rows"
+            return pipe
+        try:
+            before = pipe.predict_proba(x_calibration)[:, 1]
+            calibrated = CalibratedClassifierCV(FrozenEstimator(pipe), method=self.calibration_method)
+            calibrated.fit(x_calibration, y_calibration.astype(int))
+            after = calibrated.predict_proba(x_calibration)[:, 1]
+            self._calibration_metrics[status_key] = "applied"
+            self._calibration_metrics[f"calibration_{name}_brier_before"] = float(
+                brier_score_loss(y_calibration.astype(int), before)
+            )
+            self._calibration_metrics[f"calibration_{name}_brier_after"] = float(
+                brier_score_loss(y_calibration.astype(int), after)
+            )
+            return calibrated
+        except Exception as exc:
+            LOGGER.exception("Probability calibration failed for %s", name)
+            self._calibration_metrics[status_key] = "failed"
+            self._calibration_metrics[f"calibration_{name}_error"] = f"{type(exc).__name__}: {exc}"
+            return pipe
+
+    def _score_test(self, test: pd.DataFrame, x_test: pd.DataFrame) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        if test.empty:
+            return metrics
+        prediction = self.models["open_to_open"].predict(x_test)
+        realized = test["next_open_to_next_open_return"].fillna(0.0)
+        metrics["test_mae"] = float(mean_absolute_error(realized, prediction))
+        metrics["test_rmse"] = float(mean_squared_error(realized, prediction) ** 0.5)
+        if test["label_up"].nunique() >= 2:
+            try:
+                metrics["auc_up"] = float(
+                    roc_auc_score(test["label_up"], self.models["up"].predict_proba(x_test)[:, 1])
+                )
+            except Exception as exc:
+                LOGGER.warning("Test AUC failed: %s", exc)
+                metrics["auc_up"] = 0.5
+        return metrics
+
+    def predict_one(self, latest_row: pd.Series) -> PredictionPack:
+        x = pd.DataFrame([latest_row[self.feature_columns].to_dict()])
+        positive, negative, important = self._factor_directions(x)
+        auc = float(self.metrics.get("auc_up", 0.5))
+        confidence = "high" if auc >= 0.57 else "medium" if auc >= 0.52 else "low"
+        if self.metrics.get("train_rows", 999) < 80 or self.metrics.get("valid_rows", 999) < 20:
+            confidence = "low"
+        return PredictionPack(
+            expected_gap_return=float(self.models["gap"].predict(x)[0]),
+            expected_open_to_open_return=float(self.models["open_to_open"].predict(x)[0]),
+            probability_up=self._predict_proba("up", x),
+            probability_profitable=self._predict_proba("profitable", x),
+            probability_down_2pct=self._predict_proba("down_2pct", x),
+            return_q10=float(self.models["q10"].predict(x)[0]),
+            return_q50=float(self.models["q50"].predict(x)[0]),
+            return_q90=float(self.models["q90"].predict(x)[0]),
+            confidence_level=confidence,
+            top_positive_factors=positive,
+            top_negative_factors=negative,
+            important_factors=important,
+            score_weights={
+                "probability": float(self.metrics.get("score_weight_probability", 0.45)),
+                "expected": float(self.metrics.get("score_weight_expected", 0.35)),
+                "risk": float(self.metrics.get("score_weight_risk", 0.20)),
+            },
+        )
+
+    def _factor_directions(self, x: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
+        if self.use_shap:
+            try:
+                contributions = self._shap_contributions(x)
+                positive = [name for name, value in sorted(contributions.items(), key=lambda item: item[1], reverse=True) if value > 0][:3]
+                negative = [name for name, value in sorted(contributions.items(), key=lambda item: item[1]) if value < 0][:3]
+                return positive, negative, []
+            except Exception as exc:
+                LOGGER.warning("Current-row SHAP unavailable; using unsigned importance: %s", exc)
+        return [], [], self._important_factors()
+
+    def _shap_contributions(self, x: pd.DataFrame) -> dict[str, float]:
+        pipeline = self.models["open_to_open"]
+        if not hasattr(pipeline, "named_steps"):
+            raise TypeError("Open-to-open model is not an explainable pipeline")
+        imputed = pipeline.named_steps["imputer"].transform(x)
+        estimator = pipeline.named_steps["model"]
+        booster = estimator.get_booster()
+        import xgboost as xgb
+
+        values = booster.predict(xgb.DMatrix(imputed, feature_names=self.feature_columns), pred_contribs=True)[0]
+        if len(values) != len(self.feature_columns) + 1:
+            raise ValueError("Unexpected TreeSHAP contribution width")
+        return {name: float(value) for name, value in zip(self.feature_columns, values[:-1])}
+
+    def _important_factors(self) -> list[str]:
+        pipeline = self.models.get("open_to_open")
+        if not hasattr(pipeline, "named_steps"):
+            return []
+        importances = getattr(pipeline.named_steps.get("model"), "feature_importances_", None)
+        if importances is None:
+            return []
+        pairs = sorted(zip(self.feature_columns, importances), key=lambda item: float(item[1]), reverse=True)
+        return [name for name, _value in pairs[:6]]

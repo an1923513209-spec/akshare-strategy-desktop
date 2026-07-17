@@ -9,11 +9,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .actions import Holding, choose_action, score_actions
+from .actions import Holding, apply_account_constraints, choose_action, score_actions
 from .config import AccountState, DecisionConfig
 from .data_sources import SourceNote
 from .features import add_labels, build_features, feature_columns, normalize_market_df
-from .models import NextSessionModel, PredictionPack
+from .models import NextSessionModel, PredictionPack, make_purged_date_splits
 
 
 LOGGER = logging.getLogger(__name__)
@@ -72,12 +72,17 @@ def run_holding_decision(
     round_trip_cost = account.commission_rate * 2 + account.stamp_duty_rate + account.slippage_rate * 2 + config.profitable_cost_buffer
     features = build_features(market, external_factor_lag=config.external_factor_lag)
     dataset = add_labels(features, round_trip_cost=round_trip_cost, down_threshold=config.down_threshold)
-    columns = feature_columns(dataset, exclude=config.feature_exclude)
     valid = dataset.dropna(subset=["next_open_to_next_open_return"])
     if len(valid) < config.train_min_rows:
         raise ValueError(f"有效训练样本不足: {len(valid)} < {config.train_min_rows}")
 
-    model = NextSessionModel(calibration_method=config.calibration_method).fit(valid, columns)
+    splits = make_purged_date_splits(valid, purge_days=2)
+    train_selection = splits.frame(valid, "train")
+    columns = feature_columns(dataset, exclude=config.feature_exclude, selection_df=train_selection)
+    model = NextSessionModel(
+        calibration_method=config.calibration_method,
+        use_shap=config.use_shap,
+    ).fit(valid, columns, splits=splits)
     latest_market = features.sort_values("date").groupby("code").tail(1)
     holdings = prepare_holdings(holdings_df, latest_market, account)
     rows: list[dict[str, Any]] = []
@@ -104,7 +109,7 @@ def run_holding_decision(
             )
             scores = score_actions(holding, latest_row, prediction, account, config)
             selected = choose_action(scores, config.minimum_action_edge)
-            score_map = {score.action: score for score in scores}
+            score_map = {score.requested_action: score for score in scores}
             rows.append(_output_row(holding, latest_row, prediction, selected, score_map))
         except Exception as exc:
             LOGGER.warning("Skip ML decision for %s: %s", code, exc)
@@ -112,6 +117,7 @@ def run_holding_decision(
 
     table = pd.DataFrame(rows)
     if not table.empty:
+        table = apply_account_constraints(table, account)
         table = table.sort_values(["recommended_action", "utility_score"], ascending=[True, False]).reset_index(drop=True)
     return DecisionResult(table=table, metrics=model.metrics, feature_columns=columns, source_notes=source_notes)
 
@@ -142,6 +148,7 @@ def _output_row(
         "average_cost": holding.average_cost,
         "current_price": holding.current_price,
         "position_weight": holding.position_weight,
+        "industry": holding.industry,
         "unrealized_return": unrealized,
         "expected_gap_return": prediction.expected_gap_return,
         "expected_open_to_open_return": prediction.expected_open_to_open_return,
@@ -157,8 +164,11 @@ def _output_row(
         "reduce_25_score": _score(scores, "REDUCE_25"),
         "add_25_score": _score(scores, "ADD_25"),
         "add_50_score": _score(scores, "ADD_50"),
-        "recommended_action": selected.action,
+        "requested_action": selected.requested_action,
+        "effective_action": selected.effective_action,
+        "recommended_action": selected.effective_action,
         "recommended_trade_shares": selected.trade_shares,
+        "recommended_target_shares": selected.target_shares,
         "recommended_target_weight": selected.target_weight,
         "expected_net_pnl": selected.expected_net_pnl,
         "downside_risk": selected.downside_risk,
@@ -178,6 +188,7 @@ def _output_row(
         "institution_net_buy_amount": _latest_numeric(latest_row, "institution_net_buy_amount"),
         "top_positive_factors": ", ".join(prediction.top_positive_factors),
         "top_negative_factors": ", ".join(prediction.top_negative_factors),
+        "important_factors": ", ".join(prediction.important_factors),
         "reason": reason,
     }
 

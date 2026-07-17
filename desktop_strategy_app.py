@@ -28,6 +28,14 @@ import app as engine
 from ml_decision import AccountState, DecisionConfig
 from ml_decision.data_sources import fetch_external_factor_frame, merge_external_factors
 from ml_decision.engine import result_to_jsonable, run_holding_decision
+from ml_decision.inference import production_result_to_jsonable, run_production_holding_decision
+from ml_decision.model_registry import (
+    ProductionModelLoader,
+    ProductionModelNotFound,
+    promote_candidate_model,
+    rollback_production_model,
+)
+from ml_decision.actions import apply_account_constraints
 
 MONITOR_SNAPSHOT_PATH = engine.CACHE_DIR / "monitor_snapshot.json"
 ML_PORTFOLIO_SETTINGS_PATH = engine.CACHE_DIR / "ml_portfolio_settings.json"
@@ -349,6 +357,12 @@ def _ml_prediction_row(result: dict[str, Any]) -> dict[str, Any]:
     factor = prediction.get("factor", {}) if isinstance(prediction.get("factor"), dict) else {}
     holding_risk = prediction.get("holding_risk", {}) if isinstance(prediction.get("holding_risk"), dict) else {}
     news = prediction.get("news_sentiment", {}) if isinstance(prediction.get("news_sentiment"), dict) else {}
+    decision_meta = prediction.get("model_metadata", {}) if isinstance(prediction.get("model_metadata"), dict) else {}
+    events = decision_row.get("event_status", {}) if isinstance(decision_row.get("event_status"), dict) else {}
+    positive = decision_row.get("top_positive_factor_details", [])
+    negative = decision_row.get("top_negative_factor_details", [])
+    driver_names = [item.get("factor_name", "") for item in positive[:2] if isinstance(item, dict)]
+    driver_names += [item.get("factor_name", "") for item in negative[:1] if isinstance(item, dict)]
     return {
         "symbol": result["symbol"],
         "name": result["name"],
@@ -377,6 +391,13 @@ def _ml_prediction_row(result: dict[str, Any]) -> dict[str, Any]:
         "weight_expected": float(decision_row.get("score_weight_expected", np.nan)),
         "weight_risk": float(decision_row.get("score_weight_risk", np.nan)),
         "score": float(prediction.get("composite_score", np.nan)),
+        "confidence": float(decision_row.get("confidence_score", np.nan)) * 100,
+        "confidence_level": str(decision_row.get("confidence_level", "-")),
+        "completeness": float(decision_row.get("data_completeness_score", np.nan)) * 100,
+        "model_version": str(decision_row.get("model_version") or prediction.get("model_version") or "-"),
+        "event_status": "/".join(str(value) for value in events.values()) if events else "-",
+        "main_driver": ", ".join(name for name in driver_names if name) or "-",
+        "training_end": str(decision_row.get("training_end") or decision_meta.get("training_end") or "-"),
     }
 
 
@@ -396,7 +417,7 @@ def _parse_batch_symbols(text: str) -> list[str]:
     return symbols
 
 
-def _compute_ml_decision_payload(form: dict[str, Any]) -> dict[str, Any]:
+def _compute_ml_decision_payload_legacy(form: dict[str, Any]) -> dict[str, Any]:
     batch_symbols = _parse_batch_symbols(str(form.get("batch_symbols", "")))
     if not batch_symbols:
         batch_symbols = [engine.resolve_stock_identifier(str(form["symbol"]))]
@@ -433,7 +454,9 @@ def _compute_ml_decision_payload(form: dict[str, Any]) -> dict[str, Any]:
         frame["amount"] = frame["volume"] * frame["close"]
         market_df = frame[["date", "code", "open", "high", "low", "close", "volume", "amount"]]
         try:
-            external_df, source_notes = fetch_external_factor_frame([symbol], force_refresh=force_external_refresh)
+            external_df, source_notes = fetch_external_factor_frame(
+                [symbol], force_refresh=force_external_refresh, market_df=market_df
+            )
         except Exception as exc:
             external_df, source_notes = pd.DataFrame(), []
             errors.append(f"{symbol}: 外部因子拉取失败，已仅用日线继续：{_short_error_text(exc)}")
@@ -477,9 +500,154 @@ def _compute_ml_decision_payload(form: dict[str, Any]) -> dict[str, Any]:
     if not results:
         detail = "；".join(errors[:6])
         raise ValueError(f"没有可展示的 ML 结果；全部股票训练失败或样本不足。{detail}")
+    if len(results) > 1:
+        constrained = apply_account_constraints(
+            pd.DataFrame([item["decision_row"] for item in results]), account
+        )
+        constrained_by_code = {
+            str(row["code"]).zfill(6): row for row in constrained.to_dict("records")
+        }
+        for item in results:
+            row = constrained_by_code.get(str(item["symbol"]).zfill(6))
+            if row is None:
+                continue
+            item["decision_row"].update(row)
+            item["prediction"]["decision_row"] = item["decision_row"]
+            item["target_weight"] = float(row.get("recommended_target_weight") or 0) * 100
+            item["target_shares"] = int(row.get("recommended_target_shares") or 0)
+            item["trade_shares"] = int(row.get("recommended_trade_shares") or 0)
+            item["rebalance_action"] = str(row.get("recommended_action", "-"))
+            item["row"] = _ml_prediction_row(item)
     if len(results) == 1 and len(batch_symbols) == 1:
         return results[0]
     return {"results": results, "errors": errors, "total": len(batch_symbols), "cancelled": False, "decision_meta": {}}
+
+
+def _compute_ml_decision_payload(form: dict[str, Any]) -> dict[str, Any]:
+    """Run one production-model inference pass for the entire requested batch."""
+    batch_symbols = _parse_batch_symbols(str(form.get("batch_symbols", "")))
+    if not batch_symbols:
+        batch_symbols = [engine.resolve_stock_identifier(str(form["symbol"]))]
+    start = str(form.get("start") or "20200101")
+    adjust = str(form.get("adjust") or "qfq")
+    positions = form.get("positions", {})
+    if not isinstance(positions, dict):
+        positions = {}
+    refresh_external = str(form.get("refresh_external_data") or "").lower() in {
+        "1", "true", "yes", "on"
+    }
+    account = AccountState(
+        cash=float(form.get("cash") or 100000),
+        total_asset=float(form.get("cash") or 100000),
+        max_total_position_weight=float(form.get("target_position") or 80) / 100.0,
+        commission_rate=float(form.get("fee") or 0.0003),
+    )
+    errors: list[str] = []
+    market_frames: list[pd.DataFrame] = []
+    holdings_rows: list[dict[str, Any]] = []
+    data_by_symbol: dict[str, pd.DataFrame] = {}
+    for symbol in batch_symbols:
+        try:
+            data = engine.cached_data(symbol, start, adjust).copy()
+        except Exception as exc:
+            errors.append(f"{symbol}: daily data failed; skipped: {_short_error_text(exc)}")
+            continue
+        if data is None or data.empty or len(data) < 55:
+            errors.append(f"{symbol}: fewer than 55 daily rows; skipped")
+            continue
+        frame = data.reset_index()
+        frame = frame.rename(
+            columns={
+                frame.columns[0]: "date",
+                "Open": "open",
+                "High": "high",
+                "Low": "low",
+                "Close": "close",
+                "Volume": "volume",
+            }
+        )
+        frame["code"] = symbol
+        frame["amount"] = frame["volume"] * frame["close"]
+        market = frame[["date", "code", "open", "high", "low", "close", "volume", "amount"]].copy()
+        market["market_data_available"] = 1.0
+        market_frames.append(market)
+        data_by_symbol[symbol] = data
+        position = positions.get(symbol, {}) if isinstance(positions.get(symbol), dict) else {}
+        latest_close = float(data["Close"].iloc[-1])
+        shares = int(float(position.get("shares") or form.get("shares") or 0))
+        cost = float(position.get("cost") or form.get("buy_price") or latest_close)
+        holdings_rows.append(
+            {
+                "code": symbol,
+                "name": str(position.get("name") or ""),
+                "shares": shares,
+                "available_shares": shares,
+                "average_cost": cost,
+                "current_price": latest_close,
+                "position_value": shares * latest_close,
+                "holding_days": 0,
+            }
+        )
+
+    if not market_frames:
+        raise ValueError("No usable daily data. " + "; ".join(errors[:6]))
+    combined_market = pd.concat(market_frames, ignore_index=True, sort=False)
+    try:
+        external, source_notes = fetch_external_factor_frame(
+            list(data_by_symbol),
+            force_refresh=refresh_external,
+            market_df=combined_market,
+        )
+    except Exception as exc:
+        external, source_notes = pd.DataFrame(), []
+        errors.append(f"External factors unavailable; using market data only: {_short_error_text(exc)}")
+    combined_market = merge_external_factors(combined_market, external)
+    try:
+        decision = run_production_holding_decision(
+            combined_market,
+            pd.DataFrame(holdings_rows),
+            engine.ROOT,
+            account=account,
+            config=DecisionConfig(start_date=start, train_min_rows=50, external_factor_lag=0),
+            source_notes=source_notes,
+        )
+    except ProductionModelNotFound as exc:
+        raise ValueError(
+            "No production ML model is registered. Run monthly training from Model Diagnostics "
+            "and promote the candidate before daily evaluation."
+        ) from exc
+    payload = production_result_to_jsonable(decision)
+    rows = {str(row["code"]).zfill(6): row for row in payload["table"]}
+    results: list[dict[str, Any]] = []
+    for symbol, data in data_by_symbol.items():
+        row = rows.get(symbol)
+        if row is None:
+            errors.append(f"{symbol}: production model returned no row; skipped")
+            continue
+        position = positions.get(symbol, {}) if isinstance(positions.get(symbol), dict) else {}
+        try:
+            results.append(
+                _ml_decision_result_from_row(
+                    symbol, row, data, payload, str(position.get("name") or "")
+                )
+            )
+        except Exception as exc:
+            errors.append(f"{symbol}: result formatting failed; skipped: {_short_error_text(exc)}")
+    if not results:
+        raise ValueError("Production inference returned no displayable rows. " + "; ".join(errors[:6]))
+    if len(results) == 1 and len(batch_symbols) == 1:
+        return results[0]
+    return {
+        "results": results,
+        "errors": errors,
+        "total": len(batch_symbols),
+        "cancelled": False,
+        "decision_meta": {
+            "model_version": payload.get("model_version"),
+            "model_metadata": payload.get("model_metadata", {}),
+            "snapshot_path": payload.get("snapshot_path"),
+        },
+    }
 
 
 def _compute_ml_prediction_payload(form: dict[str, Any]) -> dict[str, Any]:
@@ -556,7 +724,7 @@ def _ml_display_snapshot(data: pd.DataFrame) -> dict[str, Any]:
     }
 
 
-def _ml_decision_horizon(row: dict[str, Any], days: int) -> dict[str, Any]:
+def _ml_decision_horizon_legacy(row: dict[str, Any], days: int) -> dict[str, Any]:
     up_prob_1 = _safe_float(row.get("probability_up"), np.nan)
     expected_1 = _safe_float(row.get("expected_open_to_open_return"), np.nan)
     q10_1 = _safe_float(row.get("return_q10"), np.nan)
@@ -575,6 +743,31 @@ def _ml_decision_horizon(row: dict[str, Any], days: int) -> dict[str, Any]:
         "expected_return_pct": expected_pct,
         "q10_return_pct": q10_pct,
         "detail": f"{days}日为基于次日模型的保守折算；预期 {expected_text}，q10 {q10_text}。",
+    }
+
+
+def _ml_decision_horizon(row: dict[str, Any], days: int) -> dict[str, Any]:
+    """Expose the next-session model honestly; longer horizons are projections."""
+    up_prob_1 = _safe_float(row.get("probability_up"), np.nan)
+    expected_1 = _safe_float(row.get("expected_open_to_open_return"), np.nan)
+    q10_1 = _safe_float(row.get("return_q10"), np.nan)
+    shrink = 1.0 / np.sqrt(max(days, 1))
+    up_prob = 0.5 + (up_prob_1 - 0.5) * shrink if np.isfinite(up_prob_1) else np.nan
+    expected_pct = expected_1 * days * 100 if np.isfinite(expected_1) else np.nan
+    q10_pct = q10_1 * np.sqrt(max(days, 1)) * 100 if np.isfinite(q10_1) else np.nan
+    if days == 1:
+        detail = "次日独立模型预测。"
+    else:
+        expected_text = f"{expected_pct:.2f}%" if np.isfinite(expected_pct) else "-"
+        q10_text = f"{q10_pct:.2f}%" if np.isfinite(q10_pct) else "-"
+        detail = f"{days}日风险投影：由次日模型保守折算，不是独立训练结果；预期 {expected_text}，q10 {q10_text}。"
+    return {
+        "days": days,
+        "up_prob": up_prob,
+        "expected_return_pct": expected_pct,
+        "q10_return_pct": q10_pct,
+        "detail": detail,
+        "is_independent_model": days == 1,
     }
 
 
@@ -605,6 +798,17 @@ def _ml_decision_result_from_row(
         "metrics": decision_payload.get("metrics", {}),
         "feature_columns": decision_payload.get("feature_columns", []),
         "source_notes": decision_payload.get("source_notes", []),
+        "model_version": decision_payload.get("model_version") or row.get("model_version"),
+        "model_metadata": decision_payload.get("model_metadata", {}),
+        "snapshot_path": decision_payload.get("snapshot_path"),
+        "data_completeness_score": row.get("data_completeness_score"),
+        "confidence_score": row.get("confidence_score"),
+        "confidence_level": row.get("confidence_level"),
+        "event_status": row.get("event_status", {}),
+        "group_weights": row.get("group_weights", {}),
+        "group_predictions": row.get("group_predictions", {}),
+        "top_positive_factor_details": row.get("top_positive_factor_details", []),
+        "top_negative_factor_details": row.get("top_negative_factor_details", []),
     }
     result = {
         "symbol": symbol,
@@ -702,10 +906,15 @@ class StrategyDesktopApp(tk.Tk):
         self.content_resize_job: str | None = None
         self.content_last_layout_size: tuple[int, int] = (0, 0)
         self.content_pending_size: tuple[int, int] | None = None
+        self.model_training_process: subprocess.Popen | None = None
+        self.model_training_log_path = engine.CACHE_DIR / "monthly_training.log"
+        self.model_training_poll_job: str | None = None
 
         self._build_ui()
         self._load_monitor_snapshot()
         self._render_saved_stock_picker()
+        self._load_ml_prediction_snapshot_banner()
+        self.protocol("WM_DELETE_WINDOW", self._on_app_close)
         self.after(400, self._poll_queue)
         self.after(1500, self._auto_monitor_tick)
 
@@ -740,6 +949,7 @@ class StrategyDesktopApp(tk.Tk):
         self.monitor_tab = ttk.Frame(self.notebook, padding=12)
         self.backtest_tab = ttk.Frame(self.notebook, padding=12)
         self.ml_tab = ttk.Frame(self.notebook, padding=12)
+        self.model_diagnostics_tab = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(self.backtest_tab, text="传统回测")
         self.notebook.add(self.monitor_tab, text="盘中监控")
         self.notebook.add(self.ml_tab, text="ML持仓决策")
@@ -747,6 +957,8 @@ class StrategyDesktopApp(tk.Tk):
         self._build_backtest_tab()
         self._build_monitor_tab()
         self._build_ml_tab()
+        self.notebook.add(self.model_diagnostics_tab, text="模型诊断")
+        self._build_model_diagnostics_tab()
 
         bottom = ttk.Frame(self, style="Status.TFrame", padding=(16, 8, 16, 10))
         bottom.grid(row=3, column=0, sticky="ew")
@@ -1151,6 +1363,295 @@ class StrategyDesktopApp(tk.Tk):
         self.saved_bt_context_menu.add_command(label="加入左侧并设为使用策略", command=self._add_right_saved_strategy_to_left)
         self._render_strategy_cache_list()
 
+    def _build_model_diagnostics_tab(self) -> None:
+        tab = self.model_diagnostics_tab
+        tab.columnconfigure(0, weight=1)
+        tab.columnconfigure(1, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        current = ttk.LabelFrame(tab, text="当前正式模型", padding=12)
+        current.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        current.columnconfigure(1, weight=1)
+        current.columnconfigure(3, weight=1)
+        self.model_diag_vars = {
+            "version": tk.StringVar(value="未注册"),
+            "range": tk.StringVar(value="-"),
+            "target": tk.StringVar(value="-"),
+            "backend": tk.StringVar(value="-"),
+            "features": tk.StringVar(value="-"),
+            "calibration": tk.StringVar(value="-"),
+            "updated": tk.StringVar(value="-"),
+        }
+        fields = [
+            ("模型版本", "version"), ("训练范围", "range"),
+            ("标签定义", "target"), ("模型后端", "backend"),
+            ("因子数量", "features"), ("概率校准", "calibration"),
+            ("更新时间", "updated"),
+        ]
+        for index, (label, key) in enumerate(fields):
+            row, pair = divmod(index, 2)
+            ttk.Label(current, text=label).grid(row=row, column=pair * 2, sticky="w", padx=(0, 8), pady=3)
+            ttk.Label(current, textvariable=self.model_diag_vars[key]).grid(
+                row=row, column=pair * 2 + 1, sticky="ew", padx=(0, 24), pady=3
+            )
+
+        metrics_frame = ttk.LabelFrame(tab, text="最近样本外指标", padding=8)
+        metrics_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
+        metrics_frame.rowconfigure(0, weight=1)
+        metrics_frame.columnconfigure(0, weight=1)
+        self.model_metrics_tree = ttk.Treeview(metrics_frame, columns=("metric", "value"), show="headings", height=10)
+        self.model_metrics_tree.heading("metric", text="指标")
+        self.model_metrics_tree.heading("value", text="数值")
+        self.model_metrics_tree.column("metric", width=190, anchor="w")
+        self.model_metrics_tree.column("value", width=120, anchor="e")
+        self.model_metrics_tree.grid(row=0, column=0, sticky="nsew")
+
+        weights_frame = ttk.LabelFrame(tab, text="当前因子组权重", padding=8)
+        weights_frame.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
+        weights_frame.rowconfigure(0, weight=1)
+        weights_frame.columnconfigure(0, weight=1)
+        self.model_weights_tree = ttk.Treeview(
+            weights_frame, columns=("group", "weight", "status"), show="headings", height=10
+        )
+        for column, text, width in (("group", "因子组", 180), ("weight", "权重", 90), ("status", "状态", 120)):
+            self.model_weights_tree.heading(column, text=text)
+            self.model_weights_tree.column(column, width=width, anchor="center")
+        self.model_weights_tree.grid(row=0, column=0, sticky="nsew")
+
+        contribution = ttk.LabelFrame(tab, text="因子组样本外贡献（读取离线报告）", padding=8)
+        contribution.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        contribution.columnconfigure(0, weight=1)
+        self.model_contribution_tree = ttk.Treeview(
+            contribution,
+            columns=("variant", "rank_ic", "net_return", "sharpe", "positive"),
+            show="headings",
+            height=5,
+        )
+        for column, text, width in (
+            ("variant", "因子组/消融变体", 230),
+            ("rank_ic", "Rank IC增量", 120),
+            ("net_return", "净收益增量", 120),
+            ("sharpe", "夏普增量", 110),
+            ("positive", "正收益窗口占比", 140),
+        ):
+            self.model_contribution_tree.heading(column, text=text)
+            self.model_contribution_tree.column(column, width=width, anchor="center")
+        self.model_contribution_tree.grid(row=0, column=0, sticky="ew")
+
+        operations = ttk.LabelFrame(tab, text="模型操作", padding=10)
+        operations.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        operations.columnconfigure(1, weight=1)
+        ttk.Label(operations, text="训练数据").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.model_training_data_path = tk.StringVar(
+            value=str(engine.ROOT / "data" / "ml_training_panel.parquet")
+        )
+        ttk.Entry(operations, textvariable=self.model_training_data_path).grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        self.model_training_status = tk.StringVar(value="空闲")
+        ttk.Label(operations, textvariable=self.model_training_status).grid(row=0, column=2, sticky="w")
+        buttons = ttk.Frame(operations)
+        buttons.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Button(buttons, text="刷新模型状态", command=self.refresh_model_diagnostics).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(buttons, text="运行月度训练", command=self.run_monthly_model_training).pack(side=tk.LEFT, padx=6)
+        ttk.Button(buttons, text="取消训练", command=self.cancel_monthly_model_training).pack(side=tk.LEFT, padx=6)
+        ttk.Button(buttons, text="查看训练日志", command=self.open_model_training_log).pack(side=tk.LEFT, padx=6)
+        ttk.Button(buttons, text="晋升候选模型", command=self.promote_candidate_from_ui).pack(side=tk.LEFT, padx=6)
+        ttk.Button(buttons, text="回退上一正式模型", command=self.rollback_model_from_ui).pack(side=tk.LEFT, padx=6)
+        ttk.Button(buttons, text="打开模型目录", command=self.open_model_directory).pack(side=tk.LEFT, padx=6)
+        self.after(150, self.refresh_model_diagnostics)
+
+    def _load_ml_prediction_snapshot_banner(self) -> None:
+        """Show the last inference timestamp without pretending it is current data."""
+        path = engine.CACHE_DIR / "ml_prediction_snapshot.json"
+        if not path.exists() or not hasattr(self, "ml_summary_var"):
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            snapshot_time = str(payload.get("snapshot_time") or "-")
+            version = str(payload.get("model_version") or "-")
+            count = len(payload.get("results") or [])
+            self.ml_summary_var.set(
+                f"上次预测快照：{snapshot_time}，正式模型 {version}，共 {count} 只；点击评估后更新。"
+            )
+        except Exception:
+            return
+
+    def refresh_model_diagnostics(self) -> None:
+        loader = ProductionModelLoader(engine.ROOT)
+        status = loader.status()
+        version = status.get("production")
+        for tree in (self.model_metrics_tree, self.model_weights_tree, self.model_contribution_tree):
+            for item in tree.get_children():
+                tree.delete(item)
+        if not version:
+            self.model_diag_vars["version"].set("未注册，请先训练并晋升候选模型")
+            for key in ("range", "target", "backend", "features", "calibration", "updated"):
+                self.model_diag_vars[key].set("-")
+            return
+        version_path = engine.ROOT / "models" / str(version)
+        try:
+            metadata = json.loads((version_path / "model_metadata.json").read_text(encoding="utf-8"))
+            weights = json.loads((version_path / "group_weights.json").read_text(encoding="utf-8"))
+            factor_status = json.loads((version_path / "factor_status.json").read_text(encoding="utf-8"))
+            metrics_rows = json.loads((version_path / "training_metrics.json").read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.model_diag_vars["version"].set(f"{version}（文件异常：{_short_error_text(exc)}）")
+            return
+        latest = metadata.get("latest_window", {}) if isinstance(metadata.get("latest_window"), dict) else {}
+        self.model_diag_vars["version"].set(str(version))
+        self.model_diag_vars["range"].set(f"{latest.get('train_start', '-')} 至 {latest.get('train_end', '-')}")
+        self.model_diag_vars["target"].set(str(metadata.get("target_definition") or metadata.get("label_definition") or "-"))
+        self.model_diag_vars["backend"].set(str(metadata.get("model_backend", "XGBoost CUDA")))
+        self.model_diag_vars["features"].set(str(metadata.get("factor_count", "-")))
+        self.model_diag_vars["calibration"].set(str(metadata.get("calibration_status", "unknown")))
+        self.model_diag_vars["updated"].set(str(metadata.get("training_time", "-")))
+        latest_all = {}
+        if isinstance(metrics_rows, list):
+            candidates = [row for row in metrics_rows if isinstance(row, dict) and row.get("model_group") == "all_factor"]
+            latest_all = candidates[-1] if candidates else {}
+        for key in ("auc", "pr_auc", "brier", "log_loss", "rank_ic", "net_return", "sharpe", "max_drawdown", "turnover"):
+            value = latest_all.get(key, "-")
+            text = f"{value:.6f}" if isinstance(value, (int, float)) and np.isfinite(value) else str(value)
+            self.model_metrics_tree.insert("", tk.END, values=(key, text))
+        for group, weight in sorted(weights.items()):
+            self.model_weights_tree.insert(
+                "", tk.END, values=(group, f"{float(weight) * 100:.2f}%", factor_status.get(group, "-"))
+            )
+        contribution_path = engine.ROOT / "reports" / "factor_group_ablation.csv"
+        if contribution_path.exists():
+            try:
+                contribution = pd.read_csv(contribution_path)
+                for variant, frame in contribution.groupby("variant", sort=False):
+                    self.model_contribution_tree.insert(
+                        "",
+                        tk.END,
+                        values=(
+                            variant,
+                            self._fmt_number(pd.to_numeric(frame.get("rank_ic_change"), errors="coerce").mean(), digits=5),
+                            self._fmt_number(pd.to_numeric(frame.get("net_return_change"), errors="coerce").mean(), digits=5),
+                            self._fmt_number(pd.to_numeric(frame.get("sharpe_change"), errors="coerce").mean(), digits=4),
+                            self._fmt_number(pd.to_numeric(frame.get("positive_window_ratio"), errors="coerce").mean() * 100),
+                        ),
+                    )
+            except Exception as exc:
+                self.model_contribution_tree.insert("", tk.END, values=(f"报告读取失败: {_short_error_text(exc)}", "-", "-", "-", "-"))
+        else:
+            self.model_contribution_tree.insert("", tk.END, values=("尚未运行季度因子审计", "-", "-", "-", "-"))
+
+    def run_monthly_model_training(self) -> None:
+        if self.model_training_process is not None and self.model_training_process.poll() is None:
+            self.model_training_status.set("训练仍在运行")
+            return
+        data_path = Path(self.model_training_data_path.get().strip())
+        self.model_training_log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = self.model_training_log_path.open("w", encoding="utf-8")
+        command = [
+            sys.executable,
+            str(engine.ROOT / "scripts" / "monthly_train_desktop.py"),
+            "--data",
+            str(data_path),
+        ]
+        self.model_training_process = subprocess.Popen(
+            command,
+            cwd=str(engine.ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        log_handle.close()
+        self.model_training_status.set(f"训练中，PID {self.model_training_process.pid}")
+        self._poll_model_training()
+
+    def _poll_model_training(self) -> None:
+        process = self.model_training_process
+        if process is None:
+            return
+        code = process.poll()
+        if code is None:
+            try:
+                lines = self.model_training_log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                if lines:
+                    self.model_training_status.set(f"训练中：{lines[-1][-100:]}")
+            except Exception:
+                pass
+            self.model_training_poll_job = self.after(1000, self._poll_model_training)
+            return
+        self.model_training_status.set("训练完成，已生成候选模型" if code == 0 else f"训练失败，退出码 {code}")
+        self.model_training_process = None
+        self.refresh_model_diagnostics()
+
+    def cancel_monthly_model_training(self) -> None:
+        process = self.model_training_process
+        if process is None or process.poll() is not None:
+            self.model_training_status.set("当前没有训练任务")
+            return
+        process.terminate()
+        self.model_training_status.set("正在取消训练")
+
+    def _on_app_close(self) -> None:
+        self.backtest_stop_event.set()
+        processes: list[Any] = []
+        if self.model_training_process is not None:
+            processes.append(self.model_training_process)
+        if self.backtest_process is not None:
+            processes.append(self.backtest_process)
+        with self.backtest_process_lock:
+            processes.extend(self.backtest_processes)
+        for process in processes:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except Exception:
+                pass
+        self.destroy()
+
+    def open_model_training_log(self) -> None:
+        if not self.model_training_log_path.exists():
+            self.model_training_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.model_training_log_path.write_text("No training log yet.\n", encoding="utf-8")
+        os.startfile(str(self.model_training_log_path))
+
+    def open_model_directory(self) -> None:
+        path = engine.ROOT / "models"
+        path.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(path))
+
+    def promote_candidate_from_ui(self) -> None:
+        comparison_path = engine.ROOT / "reports" / "model_comparison.json"
+        if not comparison_path.exists():
+            messagebox.showerror("无法晋升", "缺少样本外模型比较报告，请先完成月度训练。")
+            return
+        self.model_training_status.set("正在运行回归测试并验收候选模型")
+        threading.Thread(target=self._promote_candidate_worker, daemon=True).start()
+
+    def _promote_candidate_worker(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, "-m", "pytest", "tests", "-q"],
+            cwd=str(engine.ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            comparison = json.loads((engine.ROOT / "reports" / "model_comparison.json").read_text(encoding="utf-8"))
+            comparison["regression_tests_passed"] = completed.returncode == 0
+            comparison.setdefault("minimum_better_windows", 3)
+            promoted = promote_candidate_model(engine.ROOT, comparison)
+            detail = "候选模型已晋升为正式模型" if promoted else "候选模型未通过样本外门槛，正式模型保持不变"
+        except Exception as exc:
+            promoted = False
+            detail = f"模型晋升失败：{_short_error_text(exc)}"
+        self.queue.put(WorkerMessage("model_action", payload={"ok": promoted, "detail": detail}))
+
+    def rollback_model_from_ui(self) -> None:
+        try:
+            changed = rollback_production_model(engine.ROOT)
+            text = "已回退到上一正式模型" if changed else "没有可回退的上一正式模型"
+            self.model_training_status.set(text)
+            self.refresh_model_diagnostics()
+        except Exception as exc:
+            messagebox.showerror("模型回退失败", _short_error_text(exc))
+
     def _build_ml_tab(self) -> None:
         self.ml_tab.columnconfigure(0, weight=1)
         self.ml_tab.rowconfigure(0, weight=1)
@@ -1310,6 +1811,10 @@ class StrategyDesktopApp(tk.Tk):
             "news_factor",
             "institution",
             "factor",
+            "confidence",
+            "completeness",
+            "event_status",
+            "main_driver",
             "detail",
         )
         frozen_columns = ("rank", "symbol", "name")
@@ -1343,6 +1848,10 @@ class StrategyDesktopApp(tk.Tk):
             "news_factor": "新闻",
             "institution": "机构活跃",
             "factor": "因子分",
+            "confidence": "模型置信度%",
+            "completeness": "数据完整度%",
+            "event_status": "事件状态",
+            "main_driver": "主要驱动",
             "detail": "决策说明",
         }
         widths = {
@@ -1362,6 +1871,10 @@ class StrategyDesktopApp(tk.Tk):
             "news_factor": 80,
             "institution": 85,
             "factor": 75,
+            "confidence": 100,
+            "completeness": 105,
+            "event_status": 190,
+            "main_driver": 220,
             "detail": 360,
         }
         self._setup_tree(self.ml_frozen_tree, headings, widths)
@@ -3514,6 +4027,32 @@ class StrategyDesktopApp(tk.Tk):
                     form["positions"] = {symbol: positions.get(symbol, {})}
             return form
 
+        if target == "ml":
+            # Daily production inference is intentionally one batch job. This
+            # lets every stock share one model load while per-stock data errors
+            # are collected inside the worker instead of aborting the batch.
+            batch_form = base_form.copy()
+            batch_form["batch_symbols"] = " ".join(symbols)
+            batch_form["_timeout_seconds"] = "240"
+            try:
+                payload = self._run_backtest_process(batch_form)
+                if isinstance(payload, dict) and "results" in payload:
+                    payload = {"target": target, **payload}
+                else:
+                    payload = {
+                        "target": target,
+                        "results": [payload],
+                        "errors": [],
+                        "total": len(symbols),
+                        "cancelled": False,
+                    }
+                self.queue.put(WorkerMessage("backtest_batch", payload=payload))
+            except BacktestCancelled:
+                self.queue.put(WorkerMessage("backtest_cancelled"))
+            except Exception as exc:
+                self.queue.put(WorkerMessage("backtest_error", error=_short_error_text(exc)))
+            return
+
         if target == "ml" and len(symbols) > 1:
             task_name = "ML持仓决策"
             try:
@@ -3817,6 +4356,13 @@ class StrategyDesktopApp(tk.Tk):
                 elif message.kind == "strategy_save_error":
                     self.status_var.set("保存策略失败，详情已弹出")
                     messagebox.showerror("保存策略失败", message.error or "")
+                elif message.kind == "model_action":
+                    payload = message.payload if isinstance(message.payload, dict) else {}
+                    detail = str(payload.get("detail") or "模型操作完成")
+                    self.model_training_status.set(detail)
+                    self.refresh_model_diagnostics()
+                    if not payload.get("ok"):
+                        messagebox.showwarning("模型验收", detail)
                 elif message.kind == "status":
                     self.status_var.set(str(message.payload))
         except queue.Empty:
@@ -4178,7 +4724,7 @@ class StrategyDesktopApp(tk.Tk):
         return {
             "prob_pct": float(horizon.get("up_prob", np.nan)) * 100,
             "expected_return_pct": float(horizon.get("expected_return_pct", np.nan)),
-            "label": f"{days}日上涨",
+            "label": "次日上涨" if days == 1 else f"{days}日风险投影上涨",
             "detail": str(horizon.get("detail", "")),
         }
 
@@ -4195,6 +4741,12 @@ class StrategyDesktopApp(tk.Tk):
             return "持有/观察" if shares > 0 else "暂不买入"
         if raw in {"ADD_25", "ADD_50", "加仓25%", "加仓50%"}:
             return "买入/试仓" if shares <= 0 else "买入/加仓"
+        if raw == "ADD_LIMITED_LOW_CONFIDENCE":
+            return "低置信度限量试仓" if shares <= 0 else "低置信度限量加仓"
+        if raw in {"NO_TRADE", "NO_TRADE_LOW_CONFIDENCE"}:
+            return "持有/观察" if shares > 0 else "暂不买入"
+        if raw == "SELL_AVAILABLE":
+            return "卖出全部可用股份"
         if raw in {"SELL_ALL", "清仓"}:
             return "卖出/清仓" if shares > 0 else "暂不买入"
         if raw in {"REDUCE_50", "REDUCE_25", "减仓50%", "减仓25%"}:
@@ -4280,6 +4832,8 @@ class StrategyDesktopApp(tk.Tk):
             "news_factor": row.get("news_factor"),
             "institution": row.get("institution"),
             "factor": row.get("factor"),
+            "confidence": row.get("confidence"),
+            "completeness": row.get("completeness"),
         }
         if column in numeric_map:
             try:
@@ -4338,9 +4892,12 @@ class StrategyDesktopApp(tk.Tk):
             ranked = [item for _rank, item in indexed]
         self.ml_prediction_results = {str(item["symbol"]): item for item in ranked}
         days = self._ml_selected_advice_days()
-        self.ml_tree.heading("action", text=f"{days}日建议", command=lambda: self._sort_ml_table("action"))
-        self.ml_tree.heading("prob10", text=f"{days}日涨%", command=lambda: self._sort_ml_table("prob10"))
-        self.ml_tree.heading("exp10", text=f"{days}日预期%", command=lambda: self._sort_ml_table("exp10"))
+        action_title = "次日建议" if days == 1 else f"{days}日风险投影建议"
+        probability_title = "次日上涨%" if days == 1 else f"{days}日风险投影涨%"
+        expected_title = "次日预期%" if days == 1 else f"{days}日风险投影预期%"
+        self.ml_tree.heading("action", text=action_title, command=lambda: self._sort_ml_table("action"))
+        self.ml_tree.heading("prob10", text=probability_title, command=lambda: self._sort_ml_table("prob10"))
+        self.ml_tree.heading("exp10", text=expected_title, command=lambda: self._sort_ml_table("exp10"))
         for rank, result in enumerate(ranked, start=1):
             row = result.get("row") or _ml_prediction_row(result)
             advice = self._ml_period_advice(result, days)
@@ -4363,6 +4920,10 @@ class StrategyDesktopApp(tk.Tk):
                 self._fmt_number(row.get("news_factor")),
                 self._fmt_number(row.get("institution")),
                 self._fmt_number(row.get("factor")),
+                self._fmt_number(row.get("confidence")),
+                self._fmt_number(row.get("completeness")),
+                row.get("event_status", "-"),
+                row.get("main_driver", "-"),
                 advice.get("detail") or row.get("risk_detail", "-"),
             )
             if hasattr(self, "ml_frozen_tree"):
@@ -5281,20 +5842,38 @@ class StrategyDesktopApp(tk.Tk):
         news = prediction.get("news_sentiment", {}) if isinstance(prediction.get("news_sentiment"), dict) else {}
         days = self._ml_selected_advice_days()
         advice = self._ml_period_advice(result, days)
+        decision_row = result.get("decision_row", {}) if isinstance(result.get("decision_row"), dict) else {}
+        metadata = prediction.get("model_metadata", {}) if isinstance(prediction.get("model_metadata"), dict) else {}
+        events = prediction.get("event_status", {}) if isinstance(prediction.get("event_status"), dict) else {}
+        group_weights = prediction.get("group_weights", {}) if isinstance(prediction.get("group_weights"), dict) else {}
+        group_predictions = prediction.get("group_predictions", {}) if isinstance(prediction.get("group_predictions"), dict) else {}
+        availability = decision_row.get("data_availability", {}) if isinstance(decision_row.get("data_availability"), dict) else {}
+        positive = prediction.get("top_positive_factor_details", [])
+        negative = prediction.get("top_negative_factor_details", [])
+        training_window = metadata.get("latest_window", {}) if isinstance(metadata.get("latest_window"), dict) else {}
+        period_label = "次日" if days == 1 else f"{days}日风险投影"
         lines = [
+            f"正式模型版本：{prediction.get('model_version', '-')}",
+            f"训练截止：{training_window.get('train_end', decision_row.get('training_end', '-'))}",
+            f"数据日期：{prediction.get('date', '-')}",
             f"模型后端：{prediction.get('backend', '-')}",
-            f"模型AUC：{self._fmt_number((prediction.get('metrics') or {}).get('auc_up'), digits=3) if isinstance(prediction.get('metrics'), dict) else '-'}",
+            f"最近样本外AUC：{self._fmt_number((prediction.get('metrics') or {}).get('auc'), digits=3) if isinstance(prediction.get('metrics'), dict) else '-'}",
+            f"模型置信度：{self._fmt_number(float(prediction.get('confidence_score') or np.nan) * 100)}% ({prediction.get('confidence_level', '-')})",
+            f"数据完整度：{self._fmt_number(float(prediction.get('data_completeness_score') or np.nan) * 100)}%",
             f"外部数据：{self._ml_external_source_summary(result)}",
             f"持仓风险：{holding.get('level', '-')}",
-            f"{days}日建议：{self._display_ml_action(result.get('rebalance_action') or advice.get('action', '-'), self._ml_position_shares_for_result(result))}",
+            f"{period_label}建议：{self._display_ml_action(result.get('rebalance_action') or advice.get('action', '-'), self._ml_position_shares_for_result(result))}",
+            f"请求动作：{decision_row.get('requested_action', '-')}；实际可执行：{decision_row.get('effective_action', '-')}",
+            f"当前仓位：{self._fmt_number(result.get('current_weight'))}%；交易股数：{int(result.get('trade_shares') or 0)}",
             f"目标仓位：{self._fmt_number(result.get('target_weight'))}%",
             f"现金/缓冲：{self._fmt_number(result.get('cash_reserve', 0))}%",
             f"风险分：{self._fmt_number(prediction.get('risk_score'))}",
             f"异常：{anomaly.get('level', '-')}",
             f"新闻风险：{news.get('level', '-')}",
             f"波动：{self._fmt_number(factor.get('atr_pct'))}%",
-            f"{days}日上涨：{self._fmt_number(advice.get('prob_pct'))}%",
-            f"{days}日预期：{self._fmt_number(advice.get('expected_return_pct'))}%",
+            f"{period_label}上涨：{self._fmt_number(advice.get('prob_pct'))}%",
+            f"{period_label}预期：{self._fmt_number(advice.get('expected_return_pct'))}%",
+            f"次日下跌2%以上概率：{self._fmt_number(float(decision_row.get('probability_down_2pct') or np.nan) * 100)}%",
             f"因子分：{self._fmt_number(factor.get('score'))}",
             f"展示-模拟10日上涨：{self._fmt_number(float(mc.get('up_prob', np.nan)) * 100)}%",
             f"展示-VaR 95%：{self._fmt_number(mc.get('var_95_pct'))}%",
@@ -5302,6 +5881,30 @@ class StrategyDesktopApp(tk.Tk):
             f"决策说明：{holding.get('detail', '-')}",
             f"新闻/公告：{news.get('detail', '-')}",
         ]
+        lines.extend(["", "数据源状态："])
+        lines.extend(f"- {key}: {'可用' if value else '缺失/失败'}" for key, value in availability.items())
+        lines.extend(["", "事件门控："])
+        lines.extend(f"- {key}: {value}" for key, value in events.items())
+        lines.extend(["", "当前因子组权重 / 预测："])
+        for group, weight in group_weights.items():
+            pack = group_predictions.get(group, {}) if isinstance(group_predictions.get(group), dict) else {}
+            probability = self._fmt_number(float(pack.get("probability_up", np.nan)) * 100)
+            expected = self._fmt_number(float(pack.get("expected_return", np.nan)) * 100)
+            lines.append(f"- {group}: 权重 {float(weight) * 100:.1f}%，上涨 {probability}%，预期 {expected}%")
+        lines.extend(["", "主要正向贡献："])
+        lines.extend(
+            f"- {item.get('factor_name')} [{item.get('factor_group')}], 值 {self._fmt_number(item.get('factor_value'))}, SHAP {self._fmt_number(item.get('shap_value'), digits=5)}"
+            for item in positive
+            if isinstance(item, dict)
+        )
+        lines.extend(["", "主要负向贡献："])
+        lines.extend(
+            f"- {item.get('factor_name')} [{item.get('factor_group')}], 值 {self._fmt_number(item.get('factor_value'))}, SHAP {self._fmt_number(item.get('shap_value'), digits=5)}"
+            for item in negative
+            if isinstance(item, dict)
+        )
+        if not positive and not negative:
+            lines.append("- 当前样本 SHAP 不可用，仅保留无方向的重要因子。")
         if update_detail:
             self._write_ml_detail(lines)
         _ui_debug(f"draw_ml_chart_done update_detail={int(update_detail)} symbol={result.get('symbol', '')}")

@@ -1,0 +1,82 @@
+{
+  "target": {
+    "preserve_existing_if_valid": true,
+    "column": "next_open_to_next_open_return",
+    "type": "next_open_to_next_open_return"
+  },
+  "rolling_training": {
+    "train_months": 36,
+    "calibration_months": 2,
+    "validation_months": 1,
+    "test_months": 1,
+    "step_months": 1,
+    "purge_trading_days": 2,
+    "embargo_trading_days": 2
+  },
+  "retraining": {
+    "daily_prediction": true,
+    "model_retrain_frequency": "monthly",
+    "factor_review_frequency": "quarterly",
+    "weight_update_frequency": "monthly"
+  },
+  "app_ml": {
+    "prediction_mode": "production_model",
+    "allow_runtime_training": false,
+    "show_model_version": true,
+    "show_factor_explanations": true,
+    "show_data_completeness": true
+  },
+  "factor_evaluation": {
+    "minimum_cross_section_samples": 20,
+    "quantile_groups": 5,
+    "permutation_repeats": 30,
+    "include_transaction_costs": true,
+    "transaction_cost": 0.0016,
+    "evaluate_market_regimes": true,
+    "minimum_group_coverage": 0.03,
+    "minimum_group_non_null": 30
+  },
+  "control_features": [
+    "index_ret_1",
+    "index_ret_5",
+    "index_volatility_20",
+    "market_breadth",
+    "industry_ret_5",
+    "industry_ret_20",
+    "amount_ratio_20",
+    "market_rank_volatility_20"
+  ],
+  "dynamic_weights": {
+    "enabled": true,
+    "lookback_months": 12,
+    "minimum_oos_windows": 6,
+    "icir_weight": 0.60,
+    "net_sharpe_weight": 0.25,
+    "positive_window_ratio_weight": 0.15,
+    "shrink_to_equal_weight": 0.50,
+    "smoothing_alpha": 0.20,
+    "max_group_weight": 0.40,
+    "max_monthly_change": 0.05,
+    "minimum_group_weight": 0.00
+  },
+  "event_gating": {
+    "news_enabled": true,
+    "lhb_enabled": true,
+    "strong_news_quantile": 0.80,
+    "lhb_recent_window_days": 5
+  },
+  "confidence": {
+    "minimum_data_completeness": 0.70,
+    "low_confidence_position_multiplier": 0.50
+  },
+  "model_promotion": {
+    "minimum_better_windows": 3,
+    "require_net_return_improvement": true,
+    "require_no_drawdown_deterioration": true
+  },
+  "model": {
+    "random_state": 42,
+    "calibration_method": "sigmoid",
+    "use_shap": true
+  }
+}
