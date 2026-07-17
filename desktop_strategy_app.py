@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing as mp
+import os
 import pickle
 import queue
 import subprocess
@@ -13,6 +14,7 @@ import time
 import traceback
 import tempfile
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +37,7 @@ RESIZE_REDRAW_DELAY_MS = 260
 CONTENT_MIN_WIDTH = 1180
 CONTENT_MIN_HEIGHT = 650
 CONTENT_RESIZE_FINAL_DELAY_MS = 90
+ML_BATCH_PARALLEL_WORKERS = max(1, int(os.environ.get("ML_BATCH_PARALLEL_WORKERS", "3") or "3"))
 
 try:
     import ttkbootstrap as tb
@@ -650,6 +653,8 @@ class StrategyDesktopApp(tk.Tk):
         self.cache_preview_key: str | None = None
         self.pending_saved_description_key: str | None = None
         self.backtest_process: Any | None = None
+        self.backtest_processes: set[Any] = set()
+        self.backtest_process_lock = threading.Lock()
         self.backtest_stop_event = threading.Event()
         self.backtest_target = "traditional"
         self.pending_backtest_form: dict[str, str] | None = None
@@ -1160,6 +1165,7 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_risk = tk.StringVar(value=self.bt_risk.get())
         self.ml_horizon = tk.StringVar(value=self.bt_horizon.get())
         self.ml_advice_days = tk.StringVar(value="3")
+        self.ml_parallel_workers = tk.StringVar(value=str(ml_settings.get("parallel_workers") or ML_BATCH_PARALLEL_WORKERS))
         self.ml_refresh_external_data = tk.BooleanVar(value=False)
         self.ml_shares = tk.StringVar(value=self.bt_shares.get())
         self.ml_buy_price = tk.StringVar(value=self.bt_buy_price.get())
@@ -1246,8 +1252,9 @@ class StrategyDesktopApp(tk.Tk):
         ttk.Entry(top, textvariable=self.ml_cash, width=11).grid(row=0, column=9, sticky="w", padx=(0, 14), pady=6)
         ttk.Label(top, text="目标仓位%").grid(row=0, column=10, sticky="w", padx=(0, 4), pady=6)
         ttk.Entry(top, textvariable=self.ml_target_position, width=8).grid(row=0, column=11, sticky="w", padx=(0, 14), pady=6)
-        ttk.Checkbutton(top, text="本次刷新外部数据", variable=self.ml_refresh_external_data).grid(row=0, column=12, sticky="w", padx=(0, 14), pady=6)
-        ttk.Label(top, text="默认复用缓存；勾选后重拉资金流/新闻/机构活跃度。", foreground="#405269").grid(row=0, column=13, columnspan=2, sticky="w", padx=(0, 8), pady=6)
+        ttk.Label(top, text="并行数").grid(row=0, column=12, sticky="w", padx=(0, 4), pady=6)
+        ttk.Entry(top, textvariable=self.ml_parallel_workers, width=5).grid(row=0, column=13, sticky="w", padx=(0, 14), pady=6)
+        ttk.Checkbutton(top, text="刷新外部数据", variable=self.ml_refresh_external_data).grid(row=0, column=14, sticky="w", padx=(0, 8), pady=6)
 
         self.ml_summary_var = tk.StringVar(value="尚未 ML 持仓决策评估")
         ttk.Label(ml_result_frame, textvariable=self.ml_summary_var, anchor="w").grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -1526,6 +1533,7 @@ class StrategyDesktopApp(tk.Tk):
         payload = {
             "cash": self.ml_cash.get().strip(),
             "target_position": self.ml_target_position.get().strip(),
+            "parallel_workers": self.ml_parallel_workers.get().strip(),
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         tmp_path = ML_PORTFOLIO_SETTINGS_PATH.with_suffix(".tmp")
@@ -2415,6 +2423,7 @@ class StrategyDesktopApp(tk.Tk):
     def _validate_and_save_ml_account_settings(self) -> bool:
         cash = self.ml_cash.get().strip()
         target_position = self.ml_target_position.get().strip()
+        parallel_workers = self.ml_parallel_workers.get().strip()
 
         def is_number_or_blank(value: str) -> bool:
             if not value:
@@ -2436,6 +2445,15 @@ class StrategyDesktopApp(tk.Tk):
             if target < 0 or target > 100:
                 messagebox.showwarning("总仓位格式不对", "目标总仓位只能填 0-100。")
                 return False
+        try:
+            workers = int(parallel_workers or ML_BATCH_PARALLEL_WORKERS)
+        except ValueError:
+            messagebox.showwarning("并行数格式不对", "并行数只能填正整数，例如 1、2、3。")
+            return False
+        if workers < 1:
+            messagebox.showwarning("并行数格式不对", "并行数至少为 1。")
+            return False
+        self.ml_parallel_workers.set(str(workers))
         self._save_ml_portfolio_settings()
         return True
 
@@ -3375,6 +3393,7 @@ class StrategyDesktopApp(tk.Tk):
             "target_position": self.ml_target_position.get().strip() or "80",
             "positions": {},
             "refresh_external_data": "1" if self.ml_refresh_external_data.get() else "0",
+            "_parallel_workers": self.ml_parallel_workers.get().strip() or str(ML_BATCH_PARALLEL_WORKERS),
         }
 
     def _ml_positions_for_symbols(self, symbols: list[str]) -> dict[str, dict[str, str]]:
@@ -3434,6 +3453,8 @@ class StrategyDesktopApp(tk.Tk):
 
     def stop_backtest(self) -> None:
         process = self.backtest_process
+        with self.backtest_process_lock:
+            processes = list(self.backtest_processes)
         worker_alive = bool(self.backtest_worker and self.backtest_worker.is_alive())
         if hasattr(process, "is_alive"):
             process_alive = bool(process and process.is_alive())
@@ -3441,13 +3462,20 @@ class StrategyDesktopApp(tk.Tk):
             process_alive = bool(process and process.poll() is None)
         else:
             process_alive = False
-        if not worker_alive and not process_alive:
+        any_parallel_alive = any(proc.poll() is None for proc in processes if hasattr(proc, "poll"))
+        if not worker_alive and not process_alive and not any_parallel_alive:
             self.status_var.set("当前没有正在运行的回测")
             self._set_backtest_running(False)
             return
         self.backtest_stop_event.set()
         if process_alive and process is not None:
             process.terminate()
+        for proc in processes:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
         self.status_var.set("正在终止回测...")
 
     def _backtest_worker(self) -> None:
@@ -3474,6 +3502,61 @@ class StrategyDesktopApp(tk.Tk):
             base_form = self._backtest_form()
         target = self.backtest_target
         cancelled = False
+
+        def build_symbol_form(symbol: str) -> dict[str, Any]:
+            form = base_form.copy()
+            form["symbol"] = symbol
+            if target == "ml":
+                form["batch_symbols"] = symbol
+                form["_timeout_seconds"] = "120"
+                positions = base_form.get("positions", {})
+                if isinstance(positions, dict):
+                    form["positions"] = {symbol: positions.get(symbol, {})}
+            return form
+
+        if target == "ml" and len(symbols) > 1:
+            task_name = "ML持仓决策"
+            try:
+                requested_workers = int(float(base_form.get("_parallel_workers") or ML_BATCH_PARALLEL_WORKERS))
+            except Exception:
+                requested_workers = ML_BATCH_PARALLEL_WORKERS
+            max_workers = min(len(symbols), max(1, requested_workers))
+            _ui_debug(f"batch_worker_parallel_start workers={max_workers} count={len(symbols)}")
+            self.queue.put(WorkerMessage("status", payload=f"{task_name}并发评估启动：{len(symbols)} 只股票，同时 {max_workers} 只"))
+            completed = 0
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ml-stock") as executor:
+                future_to_symbol = {}
+                for symbol in symbols:
+                    if self.backtest_stop_event.is_set():
+                        cancelled = True
+                        break
+                    form = build_symbol_form(symbol)
+                    future_to_symbol[executor.submit(self._run_backtest_process, form)] = symbol
+                for future in as_completed(future_to_symbol):
+                    symbol = future_to_symbol[future]
+                    completed += 1
+                    if self.backtest_stop_event.is_set():
+                        cancelled = True
+                    try:
+                        if cancelled:
+                            future.cancel()
+                            continue
+                        results.append(future.result())
+                        _ui_debug(f"batch_worker_parallel_done symbol={symbol}")
+                    except BacktestCancelled as exc:
+                        if not self.backtest_stop_event.is_set():
+                            errors.append(f"{symbol}: {_short_error_text(exc)}")
+                        else:
+                            cancelled = True
+                    except BaseException as exc:
+                        errors.append(f"{symbol}: {_short_error_text(exc)}")
+                    self.queue.put(WorkerMessage("status", payload=f"{task_name}并发进度 {completed}/{len(symbols)}：完成 {symbol}，成功 {len(results)}，失败 {len(errors)}"))
+                    if cancelled:
+                        break
+            _ui_debug(f"batch_worker_parallel_done results={len(results)} errors={len(errors)} cancelled={cancelled}")
+            self.queue.put(WorkerMessage("backtest_batch", payload={"target": target, "results": results, "errors": errors, "total": len(symbols), "cancelled": cancelled}))
+            return
+
         for idx, symbol in enumerate(symbols, start=1):
             _ui_debug(f"batch_worker_loop idx={idx} symbol={symbol}")
             if self.backtest_stop_event.is_set():
@@ -3482,14 +3565,7 @@ class StrategyDesktopApp(tk.Tk):
             try:
                 task_name = "ML持仓决策" if target == "ml" else "批量回测"
                 self.queue.put(WorkerMessage("status", payload=f"{task_name}进度 {idx}/{len(symbols)}：正在评估 {symbol}"))
-                form = base_form.copy()
-                form["symbol"] = symbol
-                if target == "ml":
-                    form["batch_symbols"] = symbol
-                    form["_timeout_seconds"] = "120"
-                    positions = base_form.get("positions", {})
-                    if isinstance(positions, dict):
-                        form["positions"] = {symbol: positions.get(symbol, {})}
+                form = build_symbol_form(symbol)
                 _ui_debug(f"batch_worker_run_process symbol={symbol}")
                 results.append(self._run_backtest_process(form))
                 _ui_debug(f"batch_worker_process_done symbol={symbol}")
@@ -3528,6 +3604,8 @@ class StrategyDesktopApp(tk.Tk):
             )
             _ui_debug(f"run_process_started pid={process.pid} symbol={form.get('symbol', '')}")
             self.backtest_process = process
+            with self.backtest_process_lock:
+                self.backtest_processes.add(process)
             started_at = time.monotonic()
             try:
                 while process.poll() is None:
@@ -3564,7 +3642,10 @@ class StrategyDesktopApp(tk.Tk):
                         process.wait(timeout=1)
                     except subprocess.TimeoutExpired:
                         process.kill()
-                self.backtest_process = None
+                with self.backtest_process_lock:
+                    self.backtest_processes.discard(process)
+                    if self.backtest_process is process:
+                        self.backtest_process = None
 
     def _backtest_form(self) -> dict[str, str]:
         return {
