@@ -24,8 +24,8 @@ from .lhb_data import load_lhb_factors_for_market
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXTERNAL_CACHE_DIR = PROJECT_ROOT / "cache" / "ml_external"
-FUND_FLOW_TTL_SECONDS = 30 * 60
-NEWS_TTL_SECONDS = 30 * 60
+FUND_FLOW_TTL_SECONDS = 6 * 60 * 60
+NEWS_TTL_SECONDS = 6 * 60 * 60
 INSTITUTION_TTL_SECONDS = 24 * 60 * 60
 
 

@@ -47,6 +47,7 @@ CONTENT_MIN_WIDTH = 1180
 CONTENT_MIN_HEIGHT = 650
 CONTENT_RESIZE_FINAL_DELAY_MS = 90
 ML_BATCH_PARALLEL_WORKERS = max(1, int(os.environ.get("ML_BATCH_PARALLEL_WORKERS", "3") or "3"))
+ML_BATCH_CHUNK_SIZE = max(1, int(os.environ.get("ML_BATCH_CHUNK_SIZE", "10") or "10"))
 
 try:
     import ttkbootstrap as tb
@@ -447,7 +448,11 @@ def _compute_ml_decision_payload_legacy(form: dict[str, Any]) -> dict[str, Any]:
             actual_rows = 0 if data is None else len(data)
             errors.append(f"{symbol}: 日线有效数据不足，仅 {actual_rows} 行，至少需要约 {min_daily_rows} 行；开始日期可能太近，已跳过")
             continue
-        frame = data.reset_index()
+        # Daily production inference only needs enough trailing history for
+        # the longest rolling feature (60 sessions). Keep a generous buffer
+        # without rebuilding six years of factors for every click.
+        inference_data = data.tail(180)
+        frame = inference_data.reset_index()
         frame = frame.rename(
             columns={frame.columns[0]: "date", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
         )
@@ -556,7 +561,11 @@ def _compute_ml_decision_payload(form: dict[str, Any]) -> dict[str, Any]:
         if data is None or data.empty or len(data) < 55:
             errors.append(f"{symbol}: fewer than 55 daily rows; skipped")
             continue
-        frame = data.reset_index()
+        # Production inference only needs enough trailing history for the
+        # longest rolling feature. Keep the full frame in data_by_symbol for
+        # charts, while avoiding a full-history feature rebuild per click.
+        inference_data = data.tail(180)
+        frame = inference_data.reset_index()
         frame = frame.rename(
             columns={
                 frame.columns[0]: "date",
@@ -4039,51 +4048,34 @@ class StrategyDesktopApp(tk.Tk):
             return form
 
         if target == "ml":
-            # Daily production inference is intentionally one batch job. This
-            # lets every stock share one model load while per-stock data errors
-            # are collected inside the worker instead of aborting the batch.
-            batch_form = base_form.copy()
-            batch_form["batch_symbols"] = " ".join(symbols)
-            batch_form["_timeout_seconds"] = "240"
-            try:
-                payload = self._run_backtest_process(batch_form)
-                if isinstance(payload, dict) and "results" in payload:
-                    payload = {"target": target, **payload}
-                else:
-                    payload = {
-                        "target": target,
-                        "results": [payload],
-                        "errors": [],
-                        "total": len(symbols),
-                        "cancelled": False,
-                    }
-                self.queue.put(WorkerMessage("backtest_batch", payload=payload))
-            except BacktestCancelled:
-                self.queue.put(WorkerMessage("backtest_cancelled"))
-            except Exception as exc:
-                self.queue.put(WorkerMessage("backtest_error", error=_short_error_text(exc)))
-            return
-
-        if target == "ml" and len(symbols) > 1:
-            task_name = "ML持仓决策"
+            chunks = [symbols[index:index + ML_BATCH_CHUNK_SIZE] for index in range(0, len(symbols), ML_BATCH_CHUNK_SIZE)]
             try:
                 requested_workers = int(float(base_form.get("_parallel_workers") or ML_BATCH_PARALLEL_WORKERS))
             except Exception:
                 requested_workers = ML_BATCH_PARALLEL_WORKERS
-            max_workers = min(len(symbols), max(1, requested_workers))
-            _ui_debug(f"batch_worker_parallel_start workers={max_workers} count={len(symbols)}")
-            self.queue.put(WorkerMessage("status", payload=f"{task_name}并发评估启动：{len(symbols)} 只股票，同时 {max_workers} 只"))
+            max_workers = min(len(chunks), max(1, requested_workers))
             completed = 0
-            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ml-stock") as executor:
-                future_to_symbol = {}
-                for symbol in symbols:
-                    if self.backtest_stop_event.is_set():
-                        cancelled = True
-                        break
-                    form = build_symbol_form(symbol)
-                    future_to_symbol[executor.submit(self._run_backtest_process, form)] = symbol
-                for future in as_completed(future_to_symbol):
-                    symbol = future_to_symbol[future]
+
+            def run_chunk(chunk: list[str]) -> dict[str, Any]:
+                chunk_form = base_form.copy()
+                chunk_form["symbol"] = chunk[0]
+                chunk_form["batch_symbols"] = " ".join(chunk)
+                chunk_form["_timeout_seconds"] = "240"
+                positions = base_form.get("positions", {})
+                if isinstance(positions, dict):
+                    chunk_form["positions"] = {symbol: positions.get(symbol, {}) for symbol in chunk}
+                payload = self._run_backtest_process(chunk_form)
+                if isinstance(payload, dict) and "results" in payload:
+                    return payload
+                return {"results": [payload], "errors": [], "total": len(chunk), "cancelled": False}
+
+            _ui_debug(
+                f"ml_chunked_start chunks={len(chunks)} chunk_size={ML_BATCH_CHUNK_SIZE} workers={max_workers}"
+            )
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ml-batch") as executor:
+                future_to_chunk = {executor.submit(run_chunk, chunk): chunk for chunk in chunks}
+                for future in as_completed(future_to_chunk):
+                    chunk = future_to_chunk[future]
                     completed += 1
                     if self.backtest_stop_event.is_set():
                         cancelled = True
@@ -4091,20 +4083,40 @@ class StrategyDesktopApp(tk.Tk):
                         if cancelled:
                             future.cancel()
                             continue
-                        results.append(future.result())
-                        _ui_debug(f"batch_worker_parallel_done symbol={symbol}")
-                    except BacktestCancelled as exc:
-                        if not self.backtest_stop_event.is_set():
-                            errors.append(f"{symbol}: {_short_error_text(exc)}")
-                        else:
-                            cancelled = True
-                    except BaseException as exc:
-                        errors.append(f"{symbol}: {_short_error_text(exc)}")
-                    self.queue.put(WorkerMessage("status", payload=f"{task_name}并发进度 {completed}/{len(symbols)}：完成 {symbol}，成功 {len(results)}，失败 {len(errors)}"))
-                    if cancelled:
-                        break
-            _ui_debug(f"batch_worker_parallel_done results={len(results)} errors={len(errors)} cancelled={cancelled}")
-            self.queue.put(WorkerMessage("backtest_batch", payload={"target": target, "results": results, "errors": errors, "total": len(symbols), "cancelled": cancelled}))
+                        payload = future.result()
+                        results.extend(payload.get("results") or [])
+                        errors.extend(str(item) for item in (payload.get("errors") or []))
+                    except BacktestCancelled:
+                        cancelled = True
+                    except Exception as exc:
+                        errors.append(f"{chunk[0]}..{chunk[-1]}: {_short_error_text(exc)}")
+                    self.queue.put(
+                        WorkerMessage(
+                            "status",
+                            payload=(
+                                f"ML分块进度 {completed}/{len(chunks)}："
+                                f"成功 {len(results)}，失败 {len(errors)}"
+                            ),
+                        )
+                    )
+            _ui_debug(
+                f"ml_chunked_done results={len(results)} errors={len(errors)} cancelled={cancelled}"
+            )
+            if cancelled and not results:
+                self.queue.put(WorkerMessage("backtest_cancelled"))
+            else:
+                self.queue.put(
+                    WorkerMessage(
+                        "backtest_batch",
+                        payload={
+                            "target": target,
+                            "results": results,
+                            "errors": errors,
+                            "total": len(symbols),
+                            "cancelled": cancelled,
+                        },
+                    )
+                )
             return
 
         for idx, symbol in enumerate(symbols, start=1):
@@ -4173,7 +4185,10 @@ class StrategyDesktopApp(tk.Tk):
                         except subprocess.TimeoutExpired:
                             process.kill()
                         symbol = form.get("symbol", "")
-                        raise RuntimeError(f"{symbol} 单只评估超过 {timeout_seconds} 秒，已自动跳过；通常是网络/代理或模型进程卡住。")
+                        raise RuntimeError(
+                            f"{symbol} 所在评估分块超过 {timeout_seconds} 秒，已跳过该分块；"
+                            "其他分块仍会继续，通常是网络/代理或模型进程卡住。"
+                        )
                     time.sleep(0.2)
                 if self.backtest_stop_event.is_set():
                     raise BacktestCancelled()

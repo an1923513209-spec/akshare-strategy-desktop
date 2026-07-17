@@ -11,8 +11,8 @@ from ml_decision.inference import ProductionDecisionResult
 from scripts import monthly_train_desktop
 
 
-def _daily_frame(offset: float) -> pd.DataFrame:
-    dates = pd.bdate_range("2025-01-02", periods=70)
+def _daily_frame(offset: float, periods: int = 70) -> pd.DataFrame:
+    dates = pd.bdate_range("2025-01-02", periods=periods)
     close = 10.0 + offset + np.linspace(0.0, 2.0, len(dates))
     return pd.DataFrame(
         {
@@ -67,7 +67,7 @@ def _decision_row(code: str, name: str, price: float) -> dict:
 
 
 def test_desktop_batch_uses_one_production_inference_call(monkeypatch, tmp_path: Path):
-    frames = {"000001": _daily_frame(0.0), "000002": _daily_frame(2.0)}
+    frames = {"000001": _daily_frame(0.0, 250), "000002": _daily_frame(2.0, 250)}
     monkeypatch.setattr(desktop.engine, "cached_data", lambda code, _start, _adjust: frames[code])
     monkeypatch.setattr(
         desktop,
@@ -105,6 +105,7 @@ def test_desktop_batch_uses_one_production_inference_call(monkeypatch, tmp_path:
     )
     assert len(calls) == 1
     assert set(calls[0][0]["code"]) == {"000001", "000002"}
+    assert calls[0][0].groupby("code").size().to_dict() == {"000001": 180, "000002": 180}
     assert len(payload["results"]) == 2
     assert payload["decision_meta"]["model_version"] == "ui-test"
 
