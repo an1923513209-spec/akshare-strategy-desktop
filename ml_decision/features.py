@@ -278,6 +278,9 @@ def build_features(
 
         # LHB data at date t is published after the close and may only predict
         # t+1. The caller uses external_factor_lag=0 for an after-close model.
+        # Consolidate the frame after adding the optional source columns so
+        # sparse LHB interactions do not emit one fragmentation warning per stock.
+        g = g.copy()
         if "lhb_net_buy_ratio" in g.columns:
             g["lhb_net_buy_momentum_interaction"] = g["lhb_net_buy_ratio"] * g["ret_5"]
             g["lhb_volume_interaction"] = g["lhb_net_buy_ratio"] * g["volume_ratio_5"]

@@ -1570,8 +1570,12 @@ class StrategyDesktopApp(tk.Tk):
         if code is None:
             try:
                 lines = self.model_training_log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                if lines:
-                    self.model_training_status.set(f"训练中：{lines[-1][-100:]}")
+                progress_prefixes = ("[market ", "[external]", "[panel]", "[training ", "[candidate]", "[skip]")
+                progress_lines = [line.strip() for line in lines if line.strip().startswith(progress_prefixes)]
+                if progress_lines:
+                    self.model_training_status.set(f"训练中：{progress_lines[-1][-120:]}")
+                elif lines:
+                    self.model_training_status.set(f"训练中，PID {process.pid}")
             except Exception:
                 pass
             self.model_training_poll_job = self.after(1000, self._poll_model_training)

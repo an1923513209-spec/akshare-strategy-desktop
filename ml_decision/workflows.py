@@ -189,7 +189,12 @@ def monthly_train(
     previous_weights: dict[str, float] | None = None
     latest_results: dict[str, WindowModelResult] = {}
     history = pd.DataFrame()
-    for window in windows:
+    for window_index, window in enumerate(windows, start=1):
+        print(
+            f"[training {window_index}/{len(windows)}] window={window.window_id} "
+            f"test={window.test_dates.min().date()}..{window.test_dates.max().date()}",
+            flush=True,
+        )
         results = train_window_model_set(dataset, groups, window, settings)
         latest_results = results
         for group, result in results.items():
