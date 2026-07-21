@@ -144,6 +144,13 @@ def promote_candidate_model(project_root: str | Path, comparison: Mapping[str, A
     return promoted
 
 
+def set_production_model_version(project_root: str | Path, version: str) -> bool:
+    changed = ModelRegistry(project_root).set_production_version(version)
+    if changed:
+        ProductionModelLoader(project_root).clear()
+    return changed
+
+
 def evaluate_candidate_model(project_root: str | Path, comparison: Mapping[str, Any]) -> dict[str, Any]:
     return ModelRegistry(project_root).candidate_promotion_evaluation(comparison)
 

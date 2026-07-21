@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import os
 from pathlib import Path
 import re
 import time
@@ -473,6 +475,7 @@ def fetch_external_factor_frame(
     codes: list[str],
     force_refresh: bool = False,
     market_df: pd.DataFrame | None = None,
+    max_workers: int | None = None,
 ) -> tuple[pd.DataFrame, list[SourceNote]]:
     """Fetch all configured free external factors for a list of A-share codes."""
     notes: list[SourceNote] = []
@@ -484,33 +487,52 @@ def fetch_external_factor_frame(
         normalized_market["code"] = normalized_market["code"].astype(str).str.zfill(6)
         market_latest = normalized_market.groupby("code")["date"].max().dropna().to_dict()
     availability_rows: list[dict[str, Any]] = []
-    for code in codes:
+
+    def fetch_one(code: str) -> tuple[list[pd.DataFrame], list[SourceNote], dict[str, Any] | None]:
         code = str(code).zfill(6)
+        local_frames: list[pd.DataFrame] = []
+        local_notes: list[SourceNote] = []
         fund, note = fetch_fund_flow_features(code, force_refresh=force_refresh)
-        notes.append(note)
+        local_notes.append(note)
         if not fund.empty:
-            frames.append(fund)
+            local_frames.append(fund)
         news, note = fetch_news_features(code, force_refresh=force_refresh)
-        notes.append(note)
+        local_notes.append(note)
         if not news.empty:
-            frames.append(news)
+            local_frames.append(news)
         latest_date = market_latest.get(code)
+        availability = None
         if latest_date is not None:
-            fund_ok = notes[-2].status in {"ok", "cache", "stale_cache"}
-            news_ok = notes[-1].status in {"ok", "cache", "stale_cache"}
+            fund_ok = local_notes[-2].status in {"ok", "cache", "stale_cache"}
+            news_ok = local_notes[-1].status in {"ok", "cache", "stale_cache"}
             has_news_today = bool(
                 not news.empty
                 and (pd.to_datetime(news["date"], errors="coerce").dt.normalize() == latest_date).any()
             )
-            availability_rows.append(
-                {
-                    "date": latest_date,
-                    "code": code,
-                    "fund_flow_data_available": float(fund_ok),
-                    "news_data_available": float(news_ok),
-                    "has_news": float(has_news_today) if news_ok else np.nan,
-                }
-            )
+            availability = {
+                "date": latest_date,
+                "code": code,
+                "fund_flow_data_available": float(fund_ok),
+                "news_data_available": float(news_ok),
+                "has_news": float(has_news_today) if news_ok else np.nan,
+            }
+        return local_frames, local_notes, availability
+
+    normalized_codes = list(dict.fromkeys(str(code).zfill(6) for code in codes))
+    workers = max_workers or int(os.environ.get("ML_EXTERNAL_FETCH_WORKERS", "6") or "6")
+    workers = min(max(int(workers), 1), max(len(normalized_codes), 1))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ml-external") as executor:
+        futures = {executor.submit(fetch_one, code): code for code in normalized_codes}
+        for future in as_completed(futures):
+            code = futures[future]
+            try:
+                local_frames, local_notes, availability = future.result()
+                frames.extend(local_frames)
+                notes.extend(local_notes)
+                if availability is not None:
+                    availability_rows.append(availability)
+            except Exception as exc:
+                notes.append(SourceNote(f"external:{code}", "failed", f"{type(exc).__name__}: {exc}"))
     institution, institution_notes = fetch_institution_features(codes, force_refresh=force_refresh)
     notes.extend(institution_notes)
     if not institution.empty:

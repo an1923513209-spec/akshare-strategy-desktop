@@ -135,6 +135,23 @@ def factor_group_counts(groups: Mapping[str, Iterable[str]]) -> dict[str, int]:
     return {group: len(list(groups.get(group, []))) for group in GROUP_ORDER}
 
 
+def source_requirements(columns: Iterable[str]) -> dict[str, bool]:
+    """Return the data sources actually required by a frozen feature schema."""
+    ordered = [str(column) for column in columns]
+    groups = {classify_factor(column) for column in ordered}
+    return {
+        "market_data_available": True,
+        "cross_section_rank_available": any(
+            column.startswith(("market_rank_", "industry_rank_")) for column in ordered
+        ),
+        "fund_flow_data_available": "fund_flow" in groups,
+        "news_data_available": "news" in groups,
+        "institution_data_available": "institution" in groups,
+        "lhb_data_available": "lhb" in groups,
+        "lhb_inst_data_available": "lhb_institution" in groups,
+    }
+
+
 def snapshot_factor_frame(frame, factor_columns: Iterable[str]):
     """Deep snapshot used by protection tests; never mutates the source frame."""
     return deepcopy(frame.loc[:, list(factor_columns)])

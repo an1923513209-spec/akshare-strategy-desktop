@@ -35,9 +35,20 @@ def _frame_for_dates(dataset: pd.DataFrame, dates: Iterable) -> pd.DataFrame:
 def model_prediction_frame(model: NextSessionModel, frame: pd.DataFrame) -> pd.DataFrame:
     """Return both probability and expected return for an evaluation partition."""
     x = frame[model.feature_columns]
-    result = frame[["date", "code", "next_open_to_next_open_return"]].copy()
+    context_columns = [
+        column for column in (
+            "date", "code", "name", "close", "industry",
+            "next_open_to_next_open_return", "next_low_excursion", "next_high_excursion",
+        ) if column in frame.columns
+    ]
+    result = frame[context_columns].copy()
     result["probability_up"] = model.models["up"].predict_proba(x)[:, 1]
+    result["probability_profitable"] = model.models["profitable"].predict_proba(x)[:, 1]
+    result["probability_down_2pct"] = model.models["down_2pct"].predict_proba(x)[:, 1]
     result["predicted_return"] = model.models["open_to_open"].predict(x)
+    result["return_q10"] = model.models["q10"].predict(x)
+    result["return_q50"] = model.models["q50"].predict(x)
+    result["return_q90"] = model.models["q90"].predict(x)
     return result
 
 

@@ -50,7 +50,7 @@ class DecisionConfig:
 
     start_date: str = "20200101"
     training_universe: TrainingUniverse = "custom"
-    external_factor_lag: int = 1
+    external_factor_lag: int = 0
     down_threshold: float = -0.02
     utility_mode: UtilityMode = "q10"
     minimum_action_edge: float = 0.001

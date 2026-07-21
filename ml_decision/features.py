@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 
 from .lhb_data import assert_no_forbidden_features
+from .cross_section import RANK_BASE_COLUMNS
+from .trading_rules import TRADE_RULE_COLUMNS
 
 
 REQUIRED_COLUMNS = ("date", "code", "open", "high", "low", "close", "volume", "amount")
@@ -201,8 +203,10 @@ def build_features(
     market_df: pd.DataFrame,
     external_factor_lag: int = 1,
     include_optional: Iterable[str] = OPTIONAL_FACTOR_COLUMNS,
+    cross_sectional_rank_frame: pd.DataFrame | None = None,
+    allow_local_cross_sectional_ranks: bool = False,
 ) -> pd.DataFrame:
-    """Build time-safe technical, optional, market rank, and industry rank factors."""
+    """Build time-safe factors without inventing ranks from a desktop subset."""
     data = normalize_market_df(market_df)
     groups = []
     optional_cols = [column for column in include_optional if column in data.columns]
@@ -292,24 +296,28 @@ def build_features(
         groups.append(g)
 
     data = pd.concat(groups, ignore_index=True).sort_values(["date", "code"]).reset_index(drop=True).copy()
-    rank_base = [
-        "ret_5",
-        "ret_20",
-        "volatility_20",
-        "breakout_gap_20",
-        "support_gap_20",
-        "bias_20",
-        "rsi_6",
-        "atr_pct",
-        "volume_ratio_20",
-        "amount_ratio_20",
-    ]
-    for column in rank_base:
-        if column not in data.columns:
-            continue
-        data[f"market_rank_{column}"] = data.groupby("date")[column].rank(pct=True)
-        if "industry" in data.columns:
-            data[f"industry_rank_{column}"] = data.groupby(["date", "industry"])[column].rank(pct=True)
+    if cross_sectional_rank_frame is not None and not cross_sectional_rank_frame.empty:
+        ranks = cross_sectional_rank_frame.copy()
+        ranks["date"] = pd.to_datetime(ranks["date"], errors="coerce").dt.normalize()
+        ranks["code"] = ranks["code"].astype(str).str.zfill(6)
+        rank_columns = [
+            column for column in ranks.columns
+            if column.startswith(("market_rank_", "industry_rank_"))
+        ]
+        data = data.drop(columns=[column for column in rank_columns if column in data.columns], errors="ignore")
+        data = data.merge(
+            ranks[["date", "code", *rank_columns]],
+            on=["date", "code"],
+            how="left",
+            validate="many_to_one",
+        )
+    elif allow_local_cross_sectional_ranks:
+        for column in RANK_BASE_COLUMNS:
+            if column not in data.columns:
+                continue
+            data[f"market_rank_{column}"] = data.groupby("date")[column].rank(pct=True)
+            if "industry" in data.columns:
+                data[f"industry_rank_{column}"] = data.groupby(["date", "industry"])[column].rank(pct=True)
     return data.replace([np.inf, -np.inf], np.nan)
 
 
@@ -361,6 +369,7 @@ def feature_columns(
         *exclude,
         *DATA_AVAILABILITY_COLUMNS,
         *LHB_NON_MODEL_COLUMNS,
+        *TRADE_RULE_COLUMNS,
     }
     columns = []
     selection = dataset if selection_df is None else selection_df

@@ -34,6 +34,8 @@ class Holding:
     current_price: float
     position_value: float
     position_weight: float
+    available_shares_known: bool = True
+    today_bought_shares: int = 0
     holding_days: int = 0
     industry: str = ""
     name: str = ""
@@ -43,7 +45,7 @@ class Holding:
 class ActionScore:
     """Utility and trade details for one candidate action."""
 
-    requested_action: ActionName
+    requested_action: str
     effective_action: str
     trade_shares: int
     target_shares: int
@@ -79,6 +81,9 @@ def _trade_cost(value: float, is_sell: bool, account: AccountState) -> float:
 
 
 def _is_one_price_limit(row: pd.Series, up: bool) -> bool:
+    explicit = "is_one_price_up" if up else "is_one_price_down"
+    if explicit in row and not pd.isna(row.get(explicit)):
+        return bool(row.get(explicit))
     limit_col = "limit_up_price" if up else "limit_down_price"
     if limit_col not in row or pd.isna(row.get(limit_col)):
         return False
@@ -221,6 +226,98 @@ def choose_action(scores: list[ActionScore], minimum_action_edge: float) -> Acti
     return best
 
 
+def score_policy_target(
+    holding: Holding,
+    latest_row: pd.Series,
+    prediction: PredictionPack,
+    account: AccountState,
+    target_weight: float,
+    predicted_utility: float,
+) -> ActionScore:
+    """Convert an absolute ML policy weight into one executable A-share order."""
+    account = account.normalized()
+    price = max(float(holding.current_price), 0.01)
+    current_weight = max(float(holding.position_value), 0.0) / max(account.total_asset, 1.0)
+    requested_weight = float(np.clip(target_weight, 0.0, account.max_single_position_weight))
+    desired_shares = _round_lot(requested_weight * account.total_asset / price, account.lot_size)
+    suspended = bool(latest_row.get("is_suspended", False))
+    no_volume = float(latest_row.get("volume", 0) or 0) <= 0
+    cannot_buy = suspended or no_volume or _is_one_price_limit(latest_row, up=True)
+    cannot_sell = suspended or no_volume or _is_one_price_limit(latest_row, up=False)
+    reason = (
+        f"因子仓位政策选择 {requested_weight * 100:.1f}%：比较候选仓位的预测净效用后取最高值。"
+    )
+    feasible = True
+    if desired_shares > holding.shares:
+        requested_action = "POLICY_BUY_ADD"
+        effective_action = requested_action
+        buy_capacity = min(
+            max(account.cash - account.minimum_commission, 0.0),
+            max(account.max_single_position_weight * account.total_asset - holding.position_value, 0.0),
+        )
+        desired_buy = desired_shares - holding.shares
+        trade_shares = min(desired_buy, _round_lot(buy_capacity / price, account.lot_size))
+        if cannot_buy and trade_shares > 0:
+            feasible = False
+            effective_action = "NO_TRADE_LIMIT_OR_SUSPENSION"
+            trade_shares = 0
+            reason += " 当前停牌、无量或一字涨停，买入不可执行。"
+    elif desired_shares < holding.shares:
+        requested_action = "POLICY_SELL_CLEAR" if desired_shares == 0 else "POLICY_REDUCE"
+        effective_action = requested_action
+        if not holding.available_shares_known:
+            feasible = False
+            effective_action = "NO_TRADE_AVAILABLE_UNKNOWN"
+            trade_shares = 0
+            reason += " 可卖股数未知，按 T+1 规则不假设能够卖出。"
+        else:
+            desired_sell = holding.shares - desired_shares
+            if desired_shares == 0:
+                executable_sell = min(desired_sell, max(holding.available_shares, 0))
+            else:
+                executable_sell = _round_lot(
+                    min(desired_sell, max(holding.available_shares, 0)), account.lot_size
+                )
+            trade_shares = -executable_sell
+            if executable_sell < desired_sell:
+                effective_action = "POLICY_SELL_AVAILABLE"
+                reason += " 受 T+1 可卖股数限制，仅卖出当前可用股份。"
+            if cannot_sell and trade_shares < 0:
+                feasible = False
+                effective_action = "NO_TRADE_LIMIT_OR_SUSPENSION"
+                trade_shares = 0
+                reason += " 当前停牌、无量或一字跌停，卖出不可执行。"
+    else:
+        requested_action = "POLICY_HOLD"
+        effective_action = requested_action
+        trade_shares = 0
+
+    if trade_shares == 0 and requested_action != "POLICY_HOLD" and feasible:
+        effective_action = "POLICY_HOLD_LOT_LIMIT"
+        reason += " 目标变化不足一个可执行交易单位。"
+    target_shares = max(holding.shares + trade_shares, 0)
+    executable_target_weight = target_shares * price / max(account.total_asset, 1.0)
+    trade_value = abs(trade_shares) * price
+    transaction_cost = _trade_cost(trade_value, trade_shares < 0, account) if trade_shares else 0.0
+    expected_net_pnl = target_shares * price * float(prediction.expected_open_to_open_return) - transaction_cost
+    downside_risk = executable_target_weight * abs(min(float(prediction.return_q10), 0.0))
+    return ActionScore(
+        requested_action=requested_action,
+        effective_action=effective_action,
+        trade_shares=trade_shares,
+        target_shares=target_shares,
+        target_weight=executable_target_weight,
+        expected_net_return=expected_net_pnl / max(account.total_asset, 1.0),
+        expected_net_pnl=expected_net_pnl,
+        downside_risk=downside_risk,
+        transaction_cost=transaction_cost,
+        turnover=trade_value / max(account.total_asset, 1.0),
+        utility_score=float(predicted_utility),
+        feasible=feasible,
+        reason=reason,
+    )
+
+
 def score_actions(
     holding: Holding,
     latest_row: pd.Series,
@@ -243,12 +340,19 @@ def score_actions(
         reason = ""
         effective_action = requested_action
         if multiplier < 0:
-            if requested_action == "SELL_ALL":
+            if not holding.available_shares_known:
+                trade_shares = 0
+                feasible = False
+                effective_action = "NO_TRADE_AVAILABLE_UNKNOWN"
+                reason = "Available shares are unknown; T+1 sell sizing is conservatively disabled."
+                sell_shares = 0
+            elif requested_action == "SELL_ALL":
                 sell_shares = min(max(holding.available_shares, 0), max(holding.shares, 0))
             else:
                 desired = min(max(holding.available_shares, 0), int(abs(multiplier) * max(holding.shares, 0)))
                 sell_shares = _round_lot(desired, account.lot_size)
-            trade_shares = -sell_shares
+            if holding.available_shares_known:
+                trade_shares = -sell_shares
             if requested_action == "SELL_ALL" and 0 < sell_shares < holding.shares:
                 effective_action = "SELL_AVAILABLE"
                 reason = "Available shares are below total shares; sell all currently available shares."
@@ -272,7 +376,11 @@ def score_actions(
 
         trade_value = abs(trade_shares) * holding.current_price
         is_exact_liquidation = requested_action == "SELL_ALL" and trade_shares < 0
-        if requested_action != "HOLD" and trade_shares == 0:
+        if (
+            requested_action != "HOLD"
+            and trade_shares == 0
+            and effective_action == requested_action
+        ):
             feasible = False
             effective_action = "NO_TRADE"
             reason = reason or "Requested action produced no executable shares."
@@ -399,12 +507,13 @@ def apply_account_constraints(table: pd.DataFrame, account: AccountState) -> pd.
         current_value = float(current_values.at[index])
         current_total = float(target_values.sum())
         industry = str(result.at[index, "industry"])
-        industry_value = float(target_values[result["industry"].eq(industry)].sum())
+        industry_value = float(target_values[result["industry"].eq(industry)].sum()) if industry else 0.0
+        industry_capacity = max(industry_cap - industry_value, 0.0) if industry else float("inf")
         capacity_value = min(
             max(cash - account.minimum_commission, 0.0),
             max(total_cap - current_total, 0.0),
             max(single_cap - current_value, 0.0),
-            max(industry_cap - industry_value, 0.0),
+            industry_capacity,
             requested_shares * price,
         )
         allowed_shares = min(requested_shares, _round_lot(capacity_value / price, account.lot_size))

@@ -36,7 +36,22 @@ def prepare_holdings(holdings_df: pd.DataFrame, latest_market: pd.DataFrame, acc
     latest = latest_market.sort_values("date").groupby("code").tail(1)[["code", "close"]]
     data = data.merge(latest.rename(columns={"close": "latest_close"}), on="code", how="left")
     data["shares"] = pd.to_numeric(data.get("shares", 0), errors="coerce").fillna(0).astype(int)
-    data["available_shares"] = pd.to_numeric(data.get("available_shares", data["shares"]), errors="coerce").fillna(data["shares"]).astype(int)
+    if "available_shares" in data.columns:
+        raw_available = pd.to_numeric(data["available_shares"], errors="coerce")
+        data["available_shares_known"] = raw_available.notna()
+        data["available_shares"] = raw_available.fillna(0).clip(lower=0).astype(int)
+    else:
+        data["available_shares_known"] = False
+        data["available_shares"] = 0
+    data["available_shares"] = data[["available_shares", "shares"]].min(axis=1).astype(int)
+    raw_today_bought = (
+        data["today_bought_shares"]
+        if "today_bought_shares" in data.columns
+        else pd.Series(0, index=data.index, dtype="int64")
+    )
+    data["today_bought_shares"] = (
+        pd.to_numeric(raw_today_bought, errors="coerce").fillna(0).clip(lower=0).astype(int)
+    )
     data["average_cost"] = pd.to_numeric(data.get("average_cost", np.nan), errors="coerce")
     data["current_price"] = pd.to_numeric(data.get("current_price", data["latest_close"]), errors="coerce").fillna(data["latest_close"])
     data["position_value"] = pd.to_numeric(data.get("position_value", np.nan), errors="coerce")
@@ -103,6 +118,8 @@ def run_holding_decision(
                 current_price=float(holding_row.get("current_price") or latest_row["close"]),
                 position_value=float(holding_row.get("position_value") or 0),
                 position_weight=float(holding_row.get("position_weight") or 0),
+                available_shares_known=bool(holding_row.get("available_shares_known", False)),
+                today_bought_shares=int(holding_row.get("today_bought_shares") or 0),
                 holding_days=int(holding_row.get("holding_days") or 0),
                 industry=str(holding_row.get("industry") or latest_row.get("industry", "")),
                 name=str(holding_row.get("name") or ""),
@@ -145,6 +162,8 @@ def _output_row(
         "name": holding.name,
         "shares": holding.shares,
         "available_shares": holding.available_shares,
+        "available_shares_known": holding.available_shares_known,
+        "today_bought_shares": holding.today_bought_shares,
         "average_cost": holding.average_cost,
         "current_price": holding.current_price,
         "position_weight": holding.position_weight,

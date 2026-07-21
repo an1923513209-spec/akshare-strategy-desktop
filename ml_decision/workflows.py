@@ -11,10 +11,15 @@ import numpy as np
 import pandas as pd
 
 from .audit import group_shap_summary, grouped_permutation_importance, run_ablation
+from .baselines import evaluate_stable_baselines
+from .cross_section import compute_full_universe_ranks, save_rank_cache
 from .ensemble import apply_event_gates, combine_group_predictions, compute_dynamic_weights, equal_weights
 from .evaluation import evaluate_factors, evaluate_prediction_frame
-from .factor_registry import build_factor_groups, factor_group_counts
+from .factor_registry import build_factor_groups, classify_factor, factor_group_counts, source_requirements
 from .features import TARGET_COLUMNS, add_labels, build_features, feature_columns
+from .models import NextSessionModel
+from .policy import FactorPolicyParameters, calibrate_factor_policy
+from .schema import FEATURE_SCHEMA_VERSION, feature_schema_hash
 from .governance_training import (
     WindowModelResult,
     model_prediction_frame,
@@ -53,7 +58,7 @@ def ensure_labelled_dataset(frame: pd.DataFrame, config: Mapping) -> pd.DataFram
         return data
     feature_markers = {"ret_5", "rsi_14", "market_rank_ret_5"}
     if not feature_markers.intersection(data.columns):
-        data = build_features(data)
+        data = build_features(data, external_factor_lag=0)
     return add_labels(
         data,
         round_trip_cost=float(config["factor_evaluation"].get("transaction_cost", 0.0016)),
@@ -176,18 +181,40 @@ def monthly_train(
     root = Path(project_root).resolve()
     settings = dict(config or load_governance_config())
     dataset = ensure_labelled_dataset(source_frame, settings)
+    universe_size = int(dataset["code"].astype(str).nunique())
+    if universe_size >= 500:
+        try:
+            rank_frame = compute_full_universe_ranks(dataset)
+            save_rank_cache(rank_frame, root)
+            rank_columns = [
+                column
+                for column in rank_frame.columns
+                if column.startswith(("market_rank_", "industry_rank_"))
+            ]
+            dataset = dataset.drop(columns=rank_columns, errors="ignore").merge(
+                rank_frame[["date", "code", *rank_columns]],
+                on=["date", "code"],
+                how="left",
+                validate="many_to_one",
+            )
+            print(f"[cross-section] full-universe rank cache: {len(rank_frame)} rows", flush=True)
+        except ValueError as exc:
+            print(f"[cross-section] disabled: {exc}", flush=True)
     target = settings["target"]["column"]
     dataset = dataset.dropna(subset=[target]).copy()
     windows = rolling_windows_from_config(dataset, settings)
     if not windows:
         raise ValueError("No complete 36/2/1/1 rolling window is available")
-    first_train = windows[0].as_splits().frame(dataset, "train")
-    candidates = feature_columns(dataset, selection_df=first_train)
+    # Global candidates are based only on legality and whether a factor is
+    # completely unusable. Each rolling window performs its own train-only
+    # coverage/variance selection inside train_fixed_window.
+    candidates = feature_columns(dataset, selection_df=dataset)
     groups = build_factor_groups(candidates)
     oos_rows: list[dict] = []
     weight_reports: list[pd.DataFrame] = []
     previous_weights: dict[str, float] | None = None
     latest_results: dict[str, WindowModelResult] = {}
+    policy_oos_frames: list[pd.DataFrame] = []
     history = pd.DataFrame()
     for window_index, window in enumerate(windows, start=1):
         print(
@@ -202,6 +229,31 @@ def monthly_train(
                 oos_rows.append({"window_id": window.window_id, **result.metrics})
             else:
                 oos_rows.append({"window_id": window.window_id, "model_group": group, "status": result.status, "failure_reason": result.reason, **window.ranges()})
+        all_factor_result = results.get("all_factor")
+        if all_factor_result is not None and all_factor_result.status == "ACTIVE" and not all_factor_result.predictions.empty:
+            policy_oos_frames.append(all_factor_result.predictions.assign(window_id=window.window_id))
+        if all_factor_result is not None and all_factor_result.feature_columns:
+            try:
+                oos_rows.extend(
+                    evaluate_stable_baselines(
+                        dataset,
+                        all_factor_result.feature_columns,
+                        window,
+                        transaction_cost=float(
+                            settings["factor_evaluation"].get("transaction_cost", 0.0016)
+                        ),
+                    )
+                )
+            except Exception as exc:
+                oos_rows.append(
+                    {
+                        "window_id": window.window_id,
+                        "model_group": "stable_baselines",
+                        "status": "FAILED",
+                        "failure_reason": f"{type(exc).__name__}: {exc}",
+                        **window.ranges(),
+                    }
+                )
         history = pd.DataFrame(oos_rows)
         active_groups = _active_group_names(results)
         weights, report = compute_dynamic_weights(
@@ -243,25 +295,134 @@ def monthly_train(
     )
     weight_reports.append(final_weight_report.assign(window_id="production_next"))
     weights_frame = pd.concat(weight_reports, ignore_index=True) if weight_reports else pd.DataFrame()
+    policy_predictions = (
+        pd.concat(policy_oos_frames, ignore_index=True, sort=False)
+        .sort_values(["date", "code"], kind="stable")
+        .drop_duplicates(["date", "code"], keep="last")
+        if policy_oos_frames else pd.DataFrame()
+    )
+    policy_settings = dict(settings.get("factor_policy", {}))
+    policy_settings.setdefault(
+        "transaction_cost", float(settings["factor_evaluation"].get("transaction_cost", 0.0016))
+    )
+    print("[policy] calibrating allocation policy on rolling OOS predictions", flush=True)
+    try:
+        policy_parameters, policy_report, policy_backtest, policy_summary = calibrate_factor_policy(
+            policy_predictions,
+            policy_settings,
+        )
+    except Exception as exc:
+        policy_parameters = FactorPolicyParameters(
+            transaction_cost=float(policy_settings.get("transaction_cost", 0.0016)),
+            max_single_weight=float(policy_settings.get("max_single_weight", 0.25)),
+            weight_step=float(policy_settings.get("weight_step", 0.05)),
+        )
+        policy_report = {
+            "status": "failed",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "parameters": policy_parameters.to_dict(),
+        }
+        policy_backtest = pd.DataFrame()
+        policy_summary = pd.DataFrame()
     factor_status = {
         group: ("ACTIVE" if result.status == "ACTIVE" else "INACTIVE")
         for group, result in latest_results.items()
     }
-    models = {group: result.model for group, result in latest_results.items() if result.status == "ACTIVE"}
     factor_columns = {group: result.feature_columns for group, result in latest_results.items()}
+    model_settings = settings.get("model", {})
+    models: dict[str, NextSessionModel] = {}
+    refit_groups = [
+        (group, result)
+        for group, result in latest_results.items()
+        if result.status == "ACTIVE" and result.feature_columns
+    ]
+    print(f"[refit] fitting {len(refit_groups)} production factor-group models", flush=True)
+    for refit_index, (group, result) in enumerate(refit_groups, start=1):
+        print(f"[refit {refit_index}/{len(refit_groups)}] {group}", flush=True)
+        models[group] = NextSessionModel(
+            calibration_method=model_settings.get("calibration_method", "sigmoid"),
+            random_state=int(model_settings.get("random_state", 42)),
+            use_shap=bool(model_settings.get("use_shap", True)),
+        ).refit_production(
+            dataset,
+            result.feature_columns,
+            frozen_metrics=dict(getattr(result.model, "metrics", {})),
+            purge_days=int(settings.get("rolling_training", {}).get("purge_trading_days", 2)),
+        )
     latest_ranges = windows[-1].ranges()
+    unique_symbols = int(dataset["code"].astype(str).nunique())
+    universe_definition = "all_a_share" if unique_symbols >= 500 else "custom_training_panel"
+    timing_lag = 0
+    production_training_end = str(pd.to_datetime(dataset["date"]).max().date())
+    dataset_dates = pd.to_datetime(dataset["date"], errors="coerce").dt.normalize()
+    latest_train_mask = dataset_dates.isin(windows[-1].train_dates)
+    recent_dates = set(dataset_dates.dropna().drop_duplicates().sort_values().tail(60))
+    recent_mask = dataset_dates.isin(recent_dates)
+    active_features = set(factor_columns.get("all_factor", []))
+    factor_diagnostics: dict[str, dict[str, Any]] = {}
+    for column in candidates:
+        values = pd.to_numeric(dataset[column], errors="coerce")
+        valid_dates = dataset_dates.loc[values.notna()]
+        group = classify_factor(column)
+        factor_diagnostics[column] = {
+            "factor_group": group,
+            "status": "ACTIVE" if column in active_features else "INACTIVE",
+            "first_available_date": (
+                str(valid_dates.min().date()) if not valid_dates.empty else None
+            ),
+            "training_coverage": float(values.loc[latest_train_mask].notna().mean()),
+            "recent_coverage": float(values.loc[recent_mask].notna().mean()),
+            "inactive_reason": "" if column in active_features else "not_selected_in_latest_training_window",
+            "data_source": group,
+            "current_group_weight": float(final_weights.get(group, 0.0)),
+        }
+    schema_hash = feature_schema_hash(
+        factor_columns,
+        external_factor_lag=timing_lag,
+        universe_definition=universe_definition,
+    )
     metadata = {
         "target_definition": "features known after t close -> execute t+1 open -> exit t+2 open",
         "label_definition": "t close-known factors -> execute t+1 open -> exit t+2 open",
         "target_column": target,
         "factor_count": len(candidates),
         "factor_group_counts": factor_group_counts(groups),
+        "factor_diagnostics": factor_diagnostics,
         "random_seed": settings.get("model", {}).get("random_state", 42),
         "transaction_cost": settings["factor_evaluation"].get("transaction_cost", 0.0016),
         "model_backend": "XGBoost CUDA",
         "calibration_status": latest_results["all_factor"].model.metrics.get("calibration_up_status", "unknown"),
+        "calibration_metrics": {
+            key: value
+            for key, value in models["all_factor"].metrics.items()
+            if key.startswith(("calibration_", "test_brier_", "test_log_loss_", "test_ece_", "test_calibration_", "test_reliability_"))
+        },
+        "factor_policy": {
+            **policy_report,
+            "parameters": policy_parameters.to_dict(),
+            "decision_source": "factor_model_oos_predictions",
+            "traditional_strategy_dependency": False,
+        },
         "rolling_windows": [window.ranges() for window in windows],
         "latest_window": latest_ranges,
+        "oos_evaluation_end": latest_ranges.get("test_end"),
+        "production_training_end": production_training_end,
+        "production_refit": True,
+        "decision_time": "after_close",
+        "execution_time": "next_open",
+        "market_data_lag": 0,
+        "external_factor_lag": timing_lag,
+        "news_cutoff_time": "15:00:00",
+        "universe_definition": universe_definition,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "feature_schema_hash": schema_hash,
+        "feature_columns": factor_columns,
+        "source_requirements": source_requirements(
+            column
+            for columns in factor_columns.values()
+            for column in columns
+        ),
+        "latest_complete_bar_only": True,
         "training_start": latest_ranges.get("train_start"),
         "training_end": latest_ranges.get("train_end"),
         "calibration_start": latest_ranges.get("calibration_start"),
@@ -274,6 +435,7 @@ def monthly_train(
     }
     version = version or datetime.now().strftime("%Y-%m-%d_%H%M%S")
     registry = ModelRegistry(root)
+    print(f"[reports] saving candidate model and strict OOS reports as {version}", flush=True)
     model_path = registry.save_version(
         version,
         models,
@@ -285,6 +447,22 @@ def monthly_train(
     )
     reports = root / "reports"
     reports.mkdir(exist_ok=True)
+    persisted_policy_backtest = policy_backtest.copy()
+    if "candidate_utilities" in persisted_policy_backtest.columns:
+        persisted_policy_backtest["candidate_utilities"] = persisted_policy_backtest["candidate_utilities"].map(
+            lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        )
+    for directory in (reports, Path(model_path)):
+        directory.mkdir(parents=True, exist_ok=True)
+        backtest_path = directory / "ml_policy_backtest.parquet"
+        if not persisted_policy_backtest.empty:
+            persisted_policy_backtest.to_parquet(backtest_path, index=False)
+        elif backtest_path.exists():
+            backtest_path.unlink()
+        _write_csv(policy_summary, directory / "ml_policy_stock_summary.csv")
+        (directory / "ml_policy_report.json").write_text(
+            json.dumps(policy_report, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+        )
     _write_csv(oos_metrics, reports / "model_oos_metrics.csv")
     _write_csv(weights_frame, reports / "dynamic_group_weights.csv")
     _write_csv(pd.DataFrame([{"factor_name": key, "status": value} for key, value in factor_status.items()]), reports / "factor_status.csv")
@@ -323,6 +501,9 @@ def monthly_train(
         "dynamic_weights": weights_frame,
         "final_weights": final_weights,
         "comparison": comparison,
+        "factor_policy": policy_report,
+        "policy_backtest": policy_backtest,
+        "policy_stock_summary": policy_summary,
     }
 
 
@@ -401,7 +582,7 @@ def quarterly_audit(
     if not windows:
         raise ValueError("No complete rolling OOS window is available for quarterly audit")
     first_train = windows[0].as_splits().frame(dataset, "train")
-    factors = feature_columns(dataset, selection_df=first_train)
+    factors = feature_columns(dataset, selection_df=dataset)
     groups = build_factor_groups(factors)
     oos_dates = pd.DatetimeIndex([])
     for window in windows:

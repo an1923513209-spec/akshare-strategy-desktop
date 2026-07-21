@@ -11,7 +11,7 @@ import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor, RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import brier_score_loss, mean_absolute_error, mean_squared_error, roc_auc_score
+from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error, mean_squared_error, roc_auc_score
 from sklearn.pipeline import Pipeline
 
 try:
@@ -100,6 +100,7 @@ class _LegacyNextSessionModel:
         self.models: dict[str, Any] = {}
         self.metrics: dict[str, float] = {}
         self._calibration_metrics: dict[str, Any] = {}
+        self._uncalibrated_classifiers: dict[str, Any] = {}
 
     def fit(self, dataset: pd.DataFrame, features: list[str]) -> "NextSessionModel":
         """Fit all required models using chronological train/validation slices."""
@@ -434,6 +435,69 @@ class NextSessionModel(_LegacyNextSessionModel):
         )
         return self
 
+    def refit_production(
+        self,
+        dataset: pd.DataFrame,
+        features: list[str],
+        *,
+        frozen_metrics: dict[str, Any] | None = None,
+        calibration_days: int = 20,
+        purge_days: int = 2,
+    ) -> "NextSessionModel":
+        """Refit frozen model choices through the latest labelled session.
+
+        Regressors and quantiles use every labelled row.  Classifiers reserve
+        only the trailing calibration dates, with a two-session purge, so the
+        already-selected calibration method remains effective without running
+        model or hyperparameter selection again.
+        """
+        self.feature_columns = list(features)
+        usable = dataset.dropna(subset=["next_open_to_next_open_return"]).sort_values(
+            ["date", "code"], kind="stable"
+        )
+        if len(usable) < self.MIN_USABLE_ROWS:
+            raise ValueError(f"Not enough labelled rows for production refit: {len(usable)}")
+        dates = pd.DatetimeIndex(pd.to_datetime(usable["date"]).dt.normalize().unique()).sort_values()
+        calibration_days = min(max(int(calibration_days), 10), max(len(dates) // 4, 10))
+        purge_days = max(int(purge_days), 2)
+        calibration_dates = dates[-calibration_days:]
+        train_dates = dates[: -(calibration_days + purge_days)]
+        train = usable.loc[pd.to_datetime(usable["date"]).dt.normalize().isin(train_dates)]
+        calibration = usable.loc[pd.to_datetime(usable["date"]).dt.normalize().isin(calibration_dates)]
+        if train.empty or calibration.empty:
+            raise ValueError("Production refit split is empty")
+        x_all = usable[self.feature_columns]
+        x_train = train[self.feature_columns]
+        x_calibration = calibration[self.feature_columns]
+        self._calibration_metrics = {}
+        self.models["gap"] = self._fit_regressor(x_all, usable["next_gap_return"])
+        self.models["open_to_open"] = self._fit_regressor(x_all, usable["next_open_to_next_open_return"])
+        self.models["up"] = self._fit_classifier(
+            "up", x_train, train["label_up"], x_calibration, calibration["label_up"]
+        )
+        self.models["profitable"] = self._fit_classifier(
+            "profitable", x_train, train["label_profitable"], x_calibration, calibration["label_profitable"]
+        )
+        self.models["down_2pct"] = self._fit_classifier(
+            "down_2pct", x_train, train["label_down_2pct"], x_calibration, calibration["label_down_2pct"]
+        )
+        self.models["q10"] = self._fit_quantile(x_all, usable["next_open_to_next_open_return"], 0.10)
+        self.models["q50"] = self._fit_quantile(x_all, usable["next_open_to_next_open_return"], 0.50)
+        self.models["q90"] = self._fit_quantile(x_all, usable["next_open_to_next_open_return"], 0.90)
+        self.metrics = dict(frozen_metrics or {})
+        self.metrics.update(self._calibration_metrics)
+        self.metrics.update(
+            {
+                "production_refit": True,
+                "production_rows": float(len(usable)),
+                "production_training_end": str(dates.max().date()),
+                "production_calibration_start": str(calibration_dates.min().date()),
+                "production_calibration_end": str(calibration_dates.max().date()),
+                "model_backend": "XGBoost CUDA",
+            }
+        )
+        return self
+
     def _fit_classifier(
         self,
         name: str,
@@ -448,6 +512,7 @@ class NextSessionModel(_LegacyNextSessionModel):
             [("imputer", SimpleImputer(strategy="median")), ("model", self._xgb_classifier())]
         )
         pipe.fit(x_train, y_train.astype(int))
+        self._uncalibrated_classifiers[name] = pipe
         status_key = f"calibration_{name}_status"
         if y_calibration.nunique() < 2 or len(y_calibration) < 20:
             self._calibration_metrics[status_key] = "skipped_insufficient_classes_or_rows"
@@ -481,8 +546,51 @@ class NextSessionModel(_LegacyNextSessionModel):
         metrics["test_rmse"] = float(mean_squared_error(realized, prediction) ** 0.5)
         if test["label_up"].nunique() >= 2:
             try:
+                labels = test["label_up"].astype(int)
+                calibrated_probability = self.models["up"].predict_proba(x_test)[:, 1]
                 metrics["auc_up"] = float(
-                    roc_auc_score(test["label_up"], self.models["up"].predict_proba(x_test)[:, 1])
+                    roc_auc_score(labels, calibrated_probability)
+                )
+                metrics["test_brier_calibrated"] = float(
+                    brier_score_loss(labels, calibrated_probability)
+                )
+                metrics["test_log_loss_calibrated"] = float(
+                    log_loss(labels, np.clip(calibrated_probability, 1e-6, 1 - 1e-6))
+                )
+                raw_model = self._uncalibrated_classifiers.get("up")
+                if raw_model is not None:
+                    raw_probability = raw_model.predict_proba(x_test)[:, 1]
+                    metrics["test_brier_uncalibrated"] = float(
+                        brier_score_loss(labels, raw_probability)
+                    )
+                    metrics["test_log_loss_uncalibrated"] = float(
+                        log_loss(labels, np.clip(raw_probability, 1e-6, 1 - 1e-6))
+                    )
+                bins = pd.cut(
+                    pd.Series(calibrated_probability),
+                    bins=np.linspace(0.0, 1.0, 11),
+                    include_lowest=True,
+                )
+                calibration = pd.DataFrame(
+                    {"bin": bins, "probability": calibrated_probability, "label": labels.to_numpy()}
+                ).groupby("bin", observed=False).agg(
+                    count=("label", "size"),
+                    mean_probability=("probability", "mean"),
+                    actual_rate=("label", "mean"),
+                )
+                valid_bins = calibration.loc[calibration["count"].gt(0)]
+                metrics["test_ece_calibrated"] = float(
+                    (
+                        valid_bins["count"] / max(valid_bins["count"].sum(), 1)
+                        * (valid_bins["mean_probability"] - valid_bins["actual_rate"]).abs()
+                    ).sum()
+                )
+                metrics["test_calibration_bias"] = float(
+                    calibrated_probability.mean() - labels.mean()
+                )
+                metrics["test_reliability_bins_json"] = calibration.reset_index().to_json(
+                    orient="records",
+                    force_ascii=False,
                 )
             except Exception as exc:
                 LOGGER.warning("Test AUC failed: %s", exc)

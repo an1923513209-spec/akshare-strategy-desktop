@@ -7,15 +7,15 @@ import multiprocessing as mp
 import os
 import pickle
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 import traceback
-import tempfile
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,17 +26,29 @@ from tkinter import messagebox, ttk
 
 import app as engine
 from ml_decision import AccountState, DecisionConfig
+from ml_decision.accounting import resolve_account_snapshot, save_account_snapshot
+from ml_decision.trading_rules import drop_incomplete_latest_daily_bar
 from ml_decision.data_sources import fetch_external_factor_frame, merge_external_factors
 from ml_decision.engine import result_to_jsonable, run_holding_decision
 from ml_decision.inference import production_result_to_jsonable, run_production_holding_decision
+from ml_decision.stock_pool import load_all_a_share_universe, merge_universe_into_pool
 from ml_decision.model_registry import (
     evaluate_candidate_model,
     ProductionModelLoader,
     ProductionModelNotFound,
     promote_candidate_model,
     rollback_production_model,
+    set_production_model_version,
 )
+from ml_decision.versioning import ModelRegistry
 from ml_decision.actions import apply_account_constraints
+from services.task_manager import (
+    classify_task_error,
+    create_task,
+    latest_task,
+    write_task_error,
+    write_task_result,
+)
 
 MONITOR_SNAPSHOT_PATH = engine.CACHE_DIR / "monitor_snapshot.json"
 ML_PORTFOLIO_SETTINGS_PATH = engine.CACHE_DIR / "ml_portfolio_settings.json"
@@ -47,7 +59,6 @@ CONTENT_MIN_WIDTH = 1180
 CONTENT_MIN_HEIGHT = 650
 CONTENT_RESIZE_FINAL_DELAY_MS = 90
 ML_BATCH_PARALLEL_WORKERS = max(1, int(os.environ.get("ML_BATCH_PARALLEL_WORKERS", "3") or "3"))
-ML_BATCH_CHUNK_SIZE = max(1, int(os.environ.get("ML_BATCH_CHUNK_SIZE", "10") or "10"))
 
 try:
     import ttkbootstrap as tb
@@ -81,6 +92,45 @@ def _short_error_text(error: object) -> str:
             if line and not line.startswith("File ") and not line.startswith("^"):
                 return line[:260]
     return text[:260]
+
+
+def _monthly_training_progress(lines: list[str]) -> tuple[float, str]:
+    """Translate structured monthly-training log markers into a stable total progress."""
+    cleaned = [line.strip() for line in lines if line.strip()]
+    if not cleaned:
+        return 0.0, "等待训练进程输出"
+    for line in reversed(cleaned):
+        if line.startswith("[backtest]"):
+            return 100.0, "严格样本外报告已生成"
+        if line.startswith("[candidate]"):
+            return 99.0, "候选模型已保存，正在核对回测报告"
+        if line.startswith("[reports]"):
+            return 98.0, "正在保存模型和严格样本外报告"
+        refit = re.match(r"^\[refit\s+(\d+)/(\d+)\]\s*(.*)$", line)
+        if refit:
+            current, total = int(refit.group(1)), max(int(refit.group(2)), 1)
+            return min(97.0, 91.0 + 6.0 * current / total), f"生产模型重拟合 {current}/{total} {refit.group(3)}".strip()
+        if line.startswith("[refit]"):
+            return 91.0, "正在使用最新完整数据重拟合生产模型"
+        if line.startswith("[policy]"):
+            return 90.0, "正在校准仓位策略并计算严格样本外收益"
+        training = re.match(r"^\[training\s+(\d+)/(\d+)\]\s*(.*)$", line)
+        if training:
+            current, total = int(training.group(1)), max(int(training.group(2)), 1)
+            return min(90.0, 40.0 + 50.0 * current / total), f"滚动样本外训练 {current}/{total} {training.group(3)}".strip()
+        if line.startswith("[cross-section]"):
+            return 38.0, "正在构造全市场横截面因子"
+        if line.startswith("[panel]"):
+            return 35.0, "训练数据面板已生成，准备构造因子"
+        if line.startswith("[external]") or line.startswith("[source]"):
+            return 30.0, "正在读取资金流、新闻、机构和龙虎榜因子"
+        market = re.match(r"^\[market\s+(\d+)/(\d+)\]\s*(.*)$", line)
+        if market:
+            current, total = int(market.group(1)), max(int(market.group(2)), 1)
+            return min(28.0, 3.0 + 25.0 * current / total), f"读取行情 {current}/{total} {market.group(3)}".strip()
+        if line.startswith("[market]"):
+            return 2.0, "正在启动行情读取"
+    return 1.0, "训练进程已启动，等待阶段信息"
 
 
 def _ui_debug(message: str) -> None:
@@ -365,6 +415,15 @@ def _ml_prediction_row(result: dict[str, Any]) -> dict[str, Any]:
     negative = decision_row.get("top_negative_factor_details", [])
     driver_names = [item.get("factor_name", "") for item in positive[:2] if isinstance(item, dict)]
     driver_names += [item.get("factor_name", "") for item in negative[:1] if isinstance(item, dict)]
+    source_details = decision_row.get("data_source_details", {})
+    if not isinstance(source_details, dict):
+        source_details = {}
+    degraded_sources = [
+        str(name).removesuffix("_data_available").replace("_", "/")
+        for name, detail in source_details.items()
+        if isinstance(detail, dict) and detail.get("degraded")
+    ]
+    data_status = f"降级: {', '.join(degraded_sources)}" if degraded_sources else "完整"
     return {
         "symbol": result["symbol"],
         "name": result["name"],
@@ -396,6 +455,8 @@ def _ml_prediction_row(result: dict[str, Any]) -> dict[str, Any]:
         "confidence": float(decision_row.get("confidence_score", np.nan)) * 100,
         "confidence_level": str(decision_row.get("confidence_level", "-")),
         "completeness": float(decision_row.get("data_completeness_score", np.nan)) * 100,
+        "data_status": data_status,
+        "drift_status": str(decision_row.get("drift_status") or "-"),
         "model_version": str(decision_row.get("model_version") or prediction.get("model_version") or "-"),
         "event_status": "/".join(str(value) for value in events.values()) if events else "-",
         "main_driver": ", ".join(name for name in driver_names if name) or "-",
@@ -531,6 +592,7 @@ def _compute_ml_decision_payload_legacy(form: dict[str, Any]) -> dict[str, Any]:
 
 def _compute_ml_decision_payload(form: dict[str, Any]) -> dict[str, Any]:
     """Run one production-model inference pass for the entire requested batch."""
+    print("[stage 1/9] read market data", flush=True)
     batch_symbols = _parse_batch_symbols(str(form.get("batch_symbols", "")))
     if not batch_symbols:
         batch_symbols = [engine.resolve_stock_identifier(str(form["symbol"]))]
@@ -542,12 +604,6 @@ def _compute_ml_decision_payload(form: dict[str, Any]) -> dict[str, Any]:
     refresh_external = str(form.get("refresh_external_data") or "").lower() in {
         "1", "true", "yes", "on"
     }
-    account = AccountState(
-        cash=float(form.get("cash") or 100000),
-        total_asset=float(form.get("cash") or 100000),
-        max_total_position_weight=float(form.get("target_position") or 80) / 100.0,
-        commission_rate=float(form.get("fee") or 0.0003),
-    )
     errors: list[str] = []
     market_frames: list[pd.DataFrame] = []
     holdings_rows: list[dict[str, Any]] = []
@@ -555,6 +611,7 @@ def _compute_ml_decision_payload(form: dict[str, Any]) -> dict[str, Any]:
     for symbol in batch_symbols:
         try:
             data = engine.cached_data(symbol, start, adjust).copy()
+            data = drop_incomplete_latest_daily_bar(data)
         except Exception as exc:
             errors.append(f"{symbol}: daily data failed; skipped: {_short_error_text(exc)}")
             continue
@@ -578,20 +635,27 @@ def _compute_ml_decision_payload(form: dict[str, Any]) -> dict[str, Any]:
         )
         frame["code"] = symbol
         frame["amount"] = frame["volume"] * frame["close"]
+        position = positions.get(symbol, {}) if isinstance(positions.get(symbol), dict) else {}
         market = frame[["date", "code", "open", "high", "low", "close", "volume", "amount"]].copy()
+        market["name"] = str(position.get("name") or "")
         market["market_data_available"] = 1.0
         market_frames.append(market)
         data_by_symbol[symbol] = data
-        position = positions.get(symbol, {}) if isinstance(positions.get(symbol), dict) else {}
         latest_close = float(data["Close"].iloc[-1])
         shares = int(float(position.get("shares") or form.get("shares") or 0))
         cost = float(position.get("cost") or form.get("buy_price") or latest_close)
+        raw_available = position.get("available_shares")
+        available_known = raw_available not in (None, "")
+        available_shares = int(float(raw_available)) if available_known else 0
         holdings_rows.append(
             {
                 "code": symbol,
                 "name": str(position.get("name") or ""),
                 "shares": shares,
-                "available_shares": shares,
+                "available_shares": max(min(available_shares, shares), 0),
+                "available_shares_known": available_known,
+                "today_bought_shares": int(float(position.get("today_bought_shares") or 0)),
+                "buy_date": str(position.get("buy_date") or ""),
                 "average_cost": cost,
                 "current_price": latest_close,
                 "position_value": shares * latest_close,
@@ -601,18 +665,43 @@ def _compute_ml_decision_payload(form: dict[str, Any]) -> dict[str, Any]:
 
     if not market_frames:
         raise ValueError("No usable daily data. " + "; ".join(errors[:6]))
+    print(f"[stage 1/9] market data ready {len(market_frames)}/{len(batch_symbols)}", flush=True)
     combined_market = pd.concat(market_frames, ignore_index=True, sort=False)
+    available_cash = float(form.get("available_cash") or form.get("cash") or 100000)
+    total_asset_text = str(form.get("total_asset") or "").strip()
+    holdings_market_value = float(sum(row["position_value"] for row in holdings_rows))
+    market_date = str(pd.to_datetime(combined_market["date"], errors="coerce").max().date())
+    account_snapshot = resolve_account_snapshot(
+        available_cash=available_cash,
+        holdings_market_value=holdings_market_value,
+        total_asset=float(total_asset_text) if total_asset_text else None,
+        market_date=market_date,
+    )
+    save_account_snapshot(account_snapshot, engine.ROOT)
+    account = AccountState(
+        cash=account_snapshot.available_cash,
+        total_asset=account_snapshot.total_asset,
+        max_total_position_weight=float(form.get("target_position") or 80) / 100.0,
+        max_single_position_weight=float(form.get("max_single_position") or 25) / 100.0,
+        commission_rate=float(form.get("fee") or 0.0003),
+    )
     try:
+        print("[stage 2/9] update external data", flush=True)
         external, source_notes = fetch_external_factor_frame(
             list(data_by_symbol),
             force_refresh=refresh_external,
             market_df=combined_market,
+            max_workers=int(form.get("_parallel_workers") or 6),
         )
     except Exception as exc:
         external, source_notes = pd.DataFrame(), []
         errors.append(f"External factors unavailable; using market data only: {_short_error_text(exc)}")
     combined_market = merge_external_factors(combined_market, external)
     try:
+        print("[stage 3/9] validate market date", flush=True)
+        print("[stage 4/9] build factors", flush=True)
+        print("[stage 5/9] load production model", flush=True)
+        print("[stage 6/9] batch inference", flush=True)
         decision = run_production_holding_decision(
             combined_market,
             pd.DataFrame(holdings_rows),
@@ -621,12 +710,22 @@ def _compute_ml_decision_payload(form: dict[str, Any]) -> dict[str, Any]:
             config=DecisionConfig(start_date=start, train_min_rows=50, external_factor_lag=0),
             source_notes=source_notes,
         )
+        print("[stage 7/9] apply portfolio constraints", flush=True)
+        print("[stage 8/9] save snapshot", flush=True)
     except ProductionModelNotFound as exc:
         raise ValueError(
             "No production ML model is registered. Run monthly training from Model Diagnostics "
             "and promote the candidate before daily evaluation."
         ) from exc
     payload = production_result_to_jsonable(decision)
+    payload["account_snapshot"] = {
+        "available_cash": account_snapshot.available_cash,
+        "total_asset": account_snapshot.total_asset,
+        "holdings_market_value": account_snapshot.holdings_market_value,
+        "total_asset_estimated": account_snapshot.total_asset_estimated,
+        "calculated_at": account_snapshot.calculated_at,
+        "market_date": account_snapshot.market_date,
+    }
     rows = {str(row["code"]).zfill(6): row for row in payload["table"]}
     results: list[dict[str, Any]] = []
     for symbol, data in data_by_symbol.items():
@@ -645,17 +744,49 @@ def _compute_ml_decision_payload(form: dict[str, Any]) -> dict[str, Any]:
             errors.append(f"{symbol}: result formatting failed; skipped: {_short_error_text(exc)}")
     if not results:
         raise ValueError("Production inference returned no displayable rows. " + "; ".join(errors[:6]))
+    source_records = payload.get("source_notes") if isinstance(payload.get("source_notes"), list) else []
+    cache_hits = sum(
+        1 for note in source_records
+        if isinstance(note, dict) and str(note.get("status")) in {"cache", "stale_cache"}
+    )
+    external_failures = sum(
+        1 for note in source_records
+        if isinstance(note, dict) and str(note.get("status")) == "failed"
+    )
+    degraded = any(
+        isinstance(note, dict) and str(note.get("status")) in {"failed", "degraded", "legacy_unverified"}
+        for note in source_records
+    ) or any(str(row.get("drift_status")) in {"review", "severe", "monitor_error"} for row in payload["table"])
+    task_summary = {
+        "total": len(batch_symbols),
+        "success": len(results),
+        "failed": len(errors),
+        "cache_hits": cache_hits,
+        "external_failures": external_failures,
+        "model_version": payload.get("model_version"),
+        "data_date": market_date,
+        "degraded": degraded,
+    }
+    print(
+        f"[stage 8/9] model={task_summary['model_version']} date={market_date} "
+        f"success={len(results)} failed={len(errors)} cache={cache_hits} degraded={int(degraded)}",
+        flush=True,
+    )
+    print("[stage 9/9] complete", flush=True)
     if len(results) == 1 and len(batch_symbols) == 1:
+        results[0]["task_summary"] = task_summary
         return results[0]
     return {
         "results": results,
         "errors": errors,
         "total": len(batch_symbols),
         "cancelled": False,
+        "task_summary": task_summary,
         "decision_meta": {
             "model_version": payload.get("model_version"),
             "model_metadata": payload.get("model_metadata", {}),
             "snapshot_path": payload.get("snapshot_path"),
+            "account_snapshot": payload.get("account_snapshot", {}),
         },
     }
 
@@ -812,6 +943,7 @@ def _ml_decision_result_from_row(
         "model_metadata": decision_payload.get("model_metadata", {}),
         "snapshot_path": decision_payload.get("snapshot_path"),
         "data_completeness_score": row.get("data_completeness_score"),
+        "data_source_details": row.get("data_source_details", {}),
         "confidence_score": row.get("confidence_score"),
         "confidence_level": row.get("confidence_level"),
         "event_status": row.get("event_status", {}),
@@ -819,6 +951,7 @@ def _ml_decision_result_from_row(
         "group_predictions": row.get("group_predictions", {}),
         "top_positive_factor_details": row.get("top_positive_factor_details", []),
         "top_negative_factor_details": row.get("top_negative_factor_details", []),
+        "drift_report": decision_payload.get("drift_report", {}),
     }
     result = {
         "symbol": symbol,
@@ -879,6 +1012,7 @@ class StrategyDesktopApp(tk.Tk):
         self.monitor_refresh_pending = False
         self.monitor_pending_symbols: set[str] = set()
         self.monitor_last_symbol_refresh: dict[str, float] = {}
+        self.monitor_schedule_var = tk.StringVar(value="自动监控未启动")
         self.monitor_select_job: str | None = None
         self.ml_monitor_running = False
         self.ml_monitor_worker: threading.Thread | None = None
@@ -887,6 +1021,13 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_monitor_strategy_keys: dict[str, str] = {}
         self.backtest_result: dict[str, Any] | None = None
         self.ml_backtest_result: dict[str, Any] | None = None
+        self.ml_policy_backtest_frame = pd.DataFrame()
+        self.ml_policy_summary_frame = pd.DataFrame()
+        self.ml_policy_selected_code: str | None = None
+        self.ml_policy_report_directory: Path | None = None
+        self.ml_policy_model_sources: dict[str, tuple[Path, str]] = {}
+        self.ml_policy_stock_options: dict[str, str] = {}
+        self.ml_policy_chart_resize_job: str | None = None
         self.ml_prediction_results: dict[str, dict[str, Any]] = {}
         self.ml_sort_column: str | None = None
         self.ml_sort_reverse = False
@@ -917,6 +1058,7 @@ class StrategyDesktopApp(tk.Tk):
         self.content_last_layout_size: tuple[int, int] = (0, 0)
         self.content_pending_size: tuple[int, int] | None = None
         self.model_training_process: subprocess.Popen | None = None
+        self.model_training_start_candidate: str | None = None
         self.model_training_log_path = engine.CACHE_DIR / "monthly_training.log"
         self.model_training_poll_job: str | None = None
 
@@ -939,7 +1081,7 @@ class StrategyDesktopApp(tk.Tk):
         ttk.Label(header, text="A股策略桌面版", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
-            text="传统策略负责买卖点，ML负责持仓风险、异常检测和组合仓位。数据和信号仅供研究，实盘请人工复核。",
+            text="传统回测与 ML 独立；ML 根据因子预测收益分布并优化目标仓位。数据和信号仅供研究，实盘请人工复核。",
             style="Subtitle.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
@@ -959,14 +1101,20 @@ class StrategyDesktopApp(tk.Tk):
         self.monitor_tab = ttk.Frame(self.notebook, padding=12)
         self.backtest_tab = ttk.Frame(self.notebook, padding=12)
         self.ml_tab = ttk.Frame(self.notebook, padding=12)
+        self.ml_monitor_tab = ttk.Frame(self.notebook, padding=12)
+        self.ml_policy_backtest_tab = ttk.Frame(self.notebook, padding=12)
         self.model_diagnostics_tab = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(self.backtest_tab, text="传统回测")
         self.notebook.add(self.monitor_tab, text="盘中监控")
         self.notebook.add(self.ml_tab, text="ML持仓决策")
+        self.notebook.add(self.ml_monitor_tab, text="ML盘中监控")
 
         self._build_backtest_tab()
         self._build_monitor_tab()
         self._build_ml_tab()
+        self._build_ml_monitor_tab()
+        self.notebook.add(self.ml_policy_backtest_tab, text="ML因子回测")
+        self._build_ml_policy_backtest_tab()
         self.notebook.add(self.model_diagnostics_tab, text="模型诊断")
         self._build_model_diagnostics_tab()
 
@@ -1084,7 +1232,7 @@ class StrategyDesktopApp(tk.Tk):
 
         top = ttk.Frame(self.monitor_tab)
         top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        top.columnconfigure(4, weight=1)
+        top.columnconfigure(5, weight=1)
 
         self.monitor_period = tk.StringVar(value="5")
         self.monitor_interval = tk.StringVar(value="30")
@@ -1093,7 +1241,10 @@ class StrategyDesktopApp(tk.Tk):
         self._labeled_combo(top, "周期", self.monitor_period, ("1", "5", "15"), 0)
         self._labeled_entry(top, "刷新秒", self.monitor_interval, 1, width=8)
         ttk.Button(top, text="刷新一次", command=self.refresh_monitor_once).grid(row=1, column=2, padx=(0, 8))
-        ttk.Label(top, text="点击左侧股票立即显示盘中监测曲线；后台只刷新当前股票。持股/成本在下方填写。", foreground="#607086").grid(row=1, column=3, columnspan=2, sticky="w")
+        self.monitor_start_button = ttk.Button(top, text="开始自动监控", command=self.toggle_monitor)
+        self.monitor_start_button.grid(row=1, column=3, padx=(0, 8))
+        ttk.Label(top, textvariable=self.monitor_schedule_var, foreground="#607086").grid(row=0, column=4, columnspan=2, sticky="w")
+        ttk.Label(top, text="自动监控只刷新当前股票，上一轮未完成时跳过重复任务。", foreground="#607086").grid(row=1, column=4, columnspan=2, sticky="w")
 
         body = ttk.PanedWindow(self.monitor_tab, orient=tk.HORIZONTAL)
         body.grid(row=1, column=0, sticky="nsew")
@@ -1373,14 +1524,447 @@ class StrategyDesktopApp(tk.Tk):
         self.saved_bt_context_menu.add_command(label="加入左侧并设为使用策略", command=self._add_right_saved_strategy_to_left)
         self._render_strategy_cache_list()
 
+    def _build_ml_policy_backtest_tab(self) -> None:
+        tab = self.ml_policy_backtest_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(tab)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(toolbar, text="模型版本").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.ml_policy_model_version = tk.StringVar(value="")
+        self.ml_policy_model_combo = ttk.Combobox(
+            toolbar, textvariable=self.ml_policy_model_version, state="readonly", width=28
+        )
+        self.ml_policy_model_combo.grid(row=0, column=1, sticky="w", padx=(0, 12))
+        self.ml_policy_model_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._load_ml_policy_backtest_reports()
+        )
+        ttk.Label(toolbar, text="股票").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        self.ml_policy_stock_query = tk.StringVar(value="")
+        self.ml_policy_stock_combo = ttk.Combobox(
+            toolbar, textvariable=self.ml_policy_stock_query, width=16
+        )
+        self.ml_policy_stock_combo.grid(row=0, column=3, sticky="w", padx=(0, 6))
+        self.ml_policy_stock_combo.bind("<<ComboboxSelected>>", self._focus_ml_policy_stock)
+        self.ml_policy_stock_combo.bind("<Return>", self._focus_ml_policy_stock)
+        ttk.Button(toolbar, text="查看该股回测", command=self._focus_ml_policy_stock).grid(
+            row=0, column=4, sticky="w", padx=(0, 6)
+        )
+        ttk.Button(toolbar, text="刷新报告", command=self._load_ml_policy_backtest_reports).grid(
+            row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0)
+        )
+        ttk.Button(toolbar, text="重新训练并生成报告", command=self._generate_ml_policy_report).grid(
+            row=1, column=1, sticky="w", padx=(0, 6), pady=(6, 0)
+        )
+        ttk.Button(toolbar, text="打开报告目录", command=self._open_ml_policy_report_directory).grid(
+            row=1, column=2, sticky="w", pady=(6, 0)
+        )
+        self.ml_policy_report_status = tk.StringVar(value="尚未加载 ML 因子策略报告")
+        ttk.Label(toolbar, textvariable=self.ml_policy_report_status, wraplength=1080).grid(
+            row=2, column=0, columnspan=5, sticky="w", pady=(6, 0)
+        )
+
+        pane = ttk.Panedwindow(tab, orient=tk.HORIZONTAL)
+        pane.grid(row=1, column=0, sticky="nsew")
+        summary_frame = ttk.LabelFrame(pane, text="逐股严格样本外结果", padding=6)
+        detail_frame = ttk.Frame(pane)
+        pane.add(summary_frame, weight=1)
+        pane.add(detail_frame, weight=3)
+
+        summary_frame.columnconfigure(0, weight=1)
+        summary_frame.rowconfigure(0, weight=1)
+        summary_columns = (
+            "code", "name", "policy_return", "benchmark_return", "excess_return",
+            "max_drawdown", "sharpe", "trade_days",
+        )
+        self.ml_policy_summary_tree = ttk.Treeview(
+            summary_frame, columns=summary_columns, show="headings", selectmode="browse", height=24
+        )
+        summary_headings = {
+            "code": "代码", "name": "名称", "policy_return": "策略收益%",
+            "benchmark_return": "固定仓位%", "excess_return": "超额%",
+            "max_drawdown": "最大回撤%", "sharpe": "夏普", "trade_days": "调仓天数",
+        }
+        summary_widths = {
+            "code": 72, "name": 96, "policy_return": 82, "benchmark_return": 82,
+            "excess_return": 72, "max_drawdown": 82, "sharpe": 62, "trade_days": 72,
+        }
+        self._setup_tree(self.ml_policy_summary_tree, summary_headings, summary_widths)
+        for column in summary_columns:
+            self.ml_policy_summary_tree.heading(
+                column,
+                text=summary_headings[column],
+                command=lambda selected=column: self._sort_ml_policy_summary(selected),
+            )
+        self.ml_policy_summary_tree.grid(row=0, column=0, sticky="nsew")
+        summary_vscroll = ttk.Scrollbar(
+            summary_frame, orient=tk.VERTICAL, command=self.ml_policy_summary_tree.yview
+        )
+        summary_vscroll.grid(row=0, column=1, sticky="ns")
+        summary_hscroll = ttk.Scrollbar(
+            summary_frame, orient=tk.HORIZONTAL, command=self.ml_policy_summary_tree.xview
+        )
+        summary_hscroll.grid(row=1, column=0, sticky="ew")
+        self.ml_policy_summary_tree.configure(
+            yscrollcommand=summary_vscroll.set, xscrollcommand=summary_hscroll.set
+        )
+        self.ml_policy_summary_tree.bind("<<TreeviewSelect>>", self._on_ml_policy_stock_selected)
+
+        detail_frame.columnconfigure(0, weight=1)
+        detail_frame.rowconfigure(1, weight=3)
+        detail_frame.rowconfigure(2, weight=2)
+        self.ml_policy_stock_status = tk.StringVar(
+            value="选择左侧股票查看：蓝线为 ML 策略净值，灰线为固定最大仓位基准。"
+        )
+        ttk.Label(detail_frame, textvariable=self.ml_policy_stock_status).grid(
+            row=0, column=0, sticky="ew", pady=(0, 5)
+        )
+        self.ml_policy_chart = tk.Canvas(
+            detail_frame, background="#ffffff", highlightthickness=1, highlightbackground="#d8e2ee"
+        )
+        self.ml_policy_chart.grid(row=1, column=0, sticky="nsew")
+        self.ml_policy_chart.bind("<Configure>", self._schedule_ml_policy_chart_redraw)
+        self.ml_policy_chart.bind("<Button-1>", self._on_ml_policy_chart_click)
+
+        daily_frame = ttk.LabelFrame(detail_frame, text="每日模型决策与随后实现收益", padding=5)
+        daily_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        daily_frame.columnconfigure(0, weight=1)
+        daily_frame.rowconfigure(0, weight=1)
+        daily_columns = (
+            "date", "action", "probability", "predicted_return", "realized_return",
+            "current_weight", "target_weight", "trade_weight", "cost", "net_return", "equity",
+        )
+        self.ml_policy_daily_tree = ttk.Treeview(
+            daily_frame, columns=daily_columns, show="headings", height=10
+        )
+        daily_headings = {
+            "date": "因子日期t", "action": "t+1开盘动作", "probability": "上涨概率%",
+            "predicted_return": "预测收益%", "realized_return": "实际收益%",
+            "current_weight": "原仓位%", "target_weight": "目标仓位%",
+            "trade_weight": "调仓%", "cost": "成本%", "net_return": "策略净收益%", "equity": "累计净值",
+        }
+        daily_widths = {
+            "date": 90, "action": 100, "probability": 82, "predicted_return": 82,
+            "realized_return": 82, "current_weight": 72, "target_weight": 72,
+            "trade_weight": 70, "cost": 65, "net_return": 88, "equity": 78,
+        }
+        self._setup_tree(self.ml_policy_daily_tree, daily_headings, daily_widths)
+        self.ml_policy_daily_tree.grid(row=0, column=0, sticky="nsew")
+        daily_vscroll = ttk.Scrollbar(daily_frame, orient=tk.VERTICAL, command=self.ml_policy_daily_tree.yview)
+        daily_vscroll.grid(row=0, column=1, sticky="ns")
+        daily_hscroll = ttk.Scrollbar(daily_frame, orient=tk.HORIZONTAL, command=self.ml_policy_daily_tree.xview)
+        daily_hscroll.grid(row=1, column=0, sticky="ew")
+        self.ml_policy_daily_tree.configure(
+            yscrollcommand=daily_vscroll.set, xscrollcommand=daily_hscroll.set
+        )
+        self.after(200, self._load_ml_policy_backtest_reports)
+
+    @staticmethod
+    def _missing_ml_policy_report_files(directory: Path) -> list[str]:
+        required = (
+            "ml_policy_backtest.parquet",
+            "ml_policy_stock_summary.csv",
+            "ml_policy_report.json",
+        )
+        return [filename for filename in required if not (directory / filename).exists()]
+
+    def _refresh_ml_policy_model_options(self, preferred_version: str = "") -> None:
+        status = ProductionModelLoader(engine.ROOT).status()
+        current_label = self.ml_policy_model_version.get().strip()
+        current_source = self.ml_policy_model_sources.get(current_label)
+        current_version = current_source[1] if current_source else ""
+        sources: dict[str, tuple[Path, str]] = {}
+        for version in ModelRegistry(engine.ROOT).list_versions():
+            roles = [
+                label
+                for key, label in (
+                    ("production", "正式"),
+                    ("candidate", "候选"),
+                    ("previous_production", "上一正式"),
+                )
+                if str(status.get(key) or "") == version
+            ]
+            role = "/".join(roles) if roles else "历史"
+            directory = engine.ROOT / "models" / version
+            report_state = "有报告" if not self._missing_ml_policy_report_files(directory) else "无报告"
+            display = f"{role} {version}（{report_state}）"
+            sources[display] = (directory, version)
+        reports = engine.ROOT / "reports"
+        if not self._missing_ml_policy_report_files(reports):
+            sources["最近一次训练报告（未绑定模型版本）"] = (reports, "reports")
+        self.ml_policy_model_sources = sources
+        values = list(sources)
+        self.ml_policy_model_combo.configure(values=values)
+        target_version = preferred_version or current_version or str(status.get("production") or "")
+        selected = next(
+            (label for label, (_path, version) in sources.items() if version == target_version),
+            values[0] if values else "",
+        )
+        self.ml_policy_model_version.set(selected)
+
+    def _ml_policy_report_source(self) -> tuple[Path | None, str]:
+        if not self.ml_policy_model_sources:
+            self._refresh_ml_policy_model_options()
+        label = self.ml_policy_model_version.get().strip()
+        source = self.ml_policy_model_sources.get(label)
+        if source is None:
+            return None, "尚无模型版本"
+        return source[0], label
+
+    def _load_ml_policy_backtest_reports(self) -> None:
+        self._refresh_ml_policy_model_options()
+        directory, source = self._ml_policy_report_source()
+        for tree in (self.ml_policy_summary_tree, self.ml_policy_daily_tree):
+            for item in tree.get_children():
+                tree.delete(item)
+        self.ml_policy_chart.delete("all")
+        self.ml_policy_backtest_frame = pd.DataFrame()
+        self.ml_policy_summary_frame = pd.DataFrame()
+        self.ml_policy_selected_code = None
+        self.ml_policy_report_directory = directory
+        self.ml_policy_stock_options = {}
+        self.ml_policy_stock_combo.configure(values=())
+        if directory is None:
+            self.ml_policy_report_status.set("尚无可用模型版本；请先在模型诊断中完成月度训练。")
+            return
+        missing = self._missing_ml_policy_report_files(directory)
+        if missing:
+            self.ml_policy_report_status.set(
+                f"{source} 没有严格样本外逐股报告（缺少 {', '.join(missing)}）。"
+                "该版本只保存了最终模型，不能安全回放训练期；请点击“重新训练并生成报告”。"
+            )
+            return
+        try:
+            backtest = pd.read_parquet(directory / "ml_policy_backtest.parquet")
+            summary_path = directory / "ml_policy_stock_summary.csv"
+            summary = pd.read_csv(summary_path, dtype={"code": str}) if summary_path.exists() else pd.DataFrame()
+            report_path = directory / "ml_policy_report.json"
+            report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
+            backtest["code"] = backtest["code"].astype(str).str.zfill(6)
+            if not summary.empty:
+                summary["code"] = summary["code"].astype(str).str.zfill(6)
+            self.ml_policy_backtest_frame = backtest
+            self.ml_policy_summary_frame = summary
+            self._refresh_ml_policy_stock_options()
+            self.ml_policy_report_status.set(
+                f"{source} | 严格样本外测试 {report.get('test_start', '-')} 至 {report.get('test_end', '-')} | "
+                f"校准与测试隔离 {report.get('embargo_trading_days', '-')} 个交易日 | 共 {len(summary)} 只"
+            )
+            self._render_ml_policy_summary()
+        except Exception as exc:
+            self.ml_policy_report_status.set(f"ML 回测报告读取失败：{_short_error_text(exc)}")
+
+    def _refresh_ml_policy_stock_options(self) -> None:
+        options: dict[str, str] = {}
+        for row in self.ml_policy_summary_frame.to_dict("records"):
+            code = str(row.get("code", "")).zfill(6)
+            name = str(row.get("name", "") or "").strip()
+            display = f"{code} {name}".strip()
+            options[display] = code
+        self.ml_policy_stock_options = options
+        self.ml_policy_stock_combo.configure(values=list(options))
+
+    def _focus_ml_policy_stock(self, _event: Any = None) -> None:
+        if self.ml_policy_summary_frame.empty:
+            self.ml_policy_report_status.set("当前模型没有可查看的逐股回测报告。")
+            return
+        query = self.ml_policy_stock_query.get().strip()
+        code = self.ml_policy_stock_options.get(query, "")
+        if not code:
+            normalized = query.split()[0] if query else ""
+            if normalized.isdigit():
+                normalized = normalized.zfill(6)
+                if normalized in set(self.ml_policy_summary_frame["code"].astype(str).str.zfill(6)):
+                    code = normalized
+            if not code and query:
+                matches = self.ml_policy_summary_frame.loc[
+                    self.ml_policy_summary_frame["name"].astype(str).str.contains(query, case=False, na=False)
+                ]
+                if not matches.empty:
+                    code = str(matches.iloc[0]["code"]).zfill(6)
+        if not code or not self.ml_policy_summary_tree.exists(code):
+            self.ml_policy_report_status.set(f"报告中没有找到股票：{query or '-'}")
+            return
+        self.ml_policy_summary_tree.selection_set(code)
+        self.ml_policy_summary_tree.focus(code)
+        self.ml_policy_summary_tree.see(code)
+        self._on_ml_policy_stock_selected()
+
+    def _generate_ml_policy_report(self) -> None:
+        if self.model_training_process is not None and self.model_training_process.poll() is None:
+            self.ml_policy_report_status.set("月度训练正在运行；完成后会自动加载新候选模型的严格报告。")
+            return
+        confirmed = messagebox.askyesno(
+            "生成严格样本外报告",
+            "严格回测需要重新执行滚动月度训练，并保存每个测试窗口的样本外预测。\n\n"
+            "这可能耗时较长，但不会替换当前正式模型；训练完成后只生成新的候选模型和回测报告。\n\n"
+            "现在开始吗？",
+        )
+        if not confirmed:
+            return
+        self.ml_policy_report_status.set("正在重新训练并生成严格样本外逐股报告，请勿关闭程序。")
+        self.run_monthly_model_training()
+
+    def _render_ml_policy_summary(self) -> None:
+        for item in self.ml_policy_summary_tree.get_children():
+            self.ml_policy_summary_tree.delete(item)
+        for row in self.ml_policy_summary_frame.to_dict("records"):
+            code = str(row.get("code", "")).zfill(6)
+            self.ml_policy_summary_tree.insert(
+                "", tk.END, iid=code,
+                values=(
+                    code, row.get("name", ""),
+                    self._fmt_number(float(row.get("policy_return", np.nan)) * 100, 2),
+                    self._fmt_number(float(row.get("benchmark_return", np.nan)) * 100, 2),
+                    self._fmt_number(float(row.get("excess_return", np.nan)) * 100, 2),
+                    self._fmt_number(float(row.get("max_drawdown", np.nan)) * 100, 2),
+                    self._fmt_number(row.get("sharpe", np.nan), 2),
+                    int(row.get("trade_days", 0) or 0),
+                ),
+            )
+        children = self.ml_policy_summary_tree.get_children()
+        if children:
+            self.ml_policy_summary_tree.selection_set(children[0])
+            self.ml_policy_summary_tree.focus(children[0])
+            self._on_ml_policy_stock_selected()
+
+    def _sort_ml_policy_summary(self, column: str) -> None:
+        if self.ml_policy_summary_frame.empty or column not in self.ml_policy_summary_frame.columns:
+            return
+        previous = getattr(self, "ml_policy_sort_column", None)
+        reverse = bool(getattr(self, "ml_policy_sort_reverse", False)) if previous == column else False
+        self.ml_policy_sort_column = column
+        self.ml_policy_sort_reverse = not reverse
+        numeric = column not in {"code", "name"}
+        frame = self.ml_policy_summary_frame.copy()
+        sort_key = pd.to_numeric(frame[column], errors="coerce") if numeric else frame[column].astype(str)
+        self.ml_policy_summary_frame = frame.assign(_sort=sort_key).sort_values(
+            "_sort", ascending=reverse, kind="stable", na_position="last"
+        ).drop(columns="_sort")
+        self._render_ml_policy_summary()
+
+    def _on_ml_policy_stock_selected(self, _event: Any = None) -> None:
+        selection = self.ml_policy_summary_tree.selection()
+        if not selection:
+            return
+        self.ml_policy_selected_code = str(selection[0]).zfill(6)
+        stock = self.ml_policy_backtest_frame.loc[
+            self.ml_policy_backtest_frame["code"].eq(self.ml_policy_selected_code)
+        ].sort_values("date", kind="stable")
+        for item in self.ml_policy_daily_tree.get_children():
+            self.ml_policy_daily_tree.delete(item)
+        for row in stock.to_dict("records"):
+            date = pd.to_datetime(row.get("date"), errors="coerce")
+            self.ml_policy_daily_tree.insert(
+                "", tk.END,
+                values=(
+                    date.strftime("%Y-%m-%d") if not pd.isna(date) else "-",
+                    row.get("policy_action", "-"),
+                    self._fmt_number(float(row.get("probability_up", np.nan)) * 100, 2),
+                    self._fmt_number(float(row.get("predicted_return", np.nan)) * 100, 2),
+                    self._fmt_number(float(row.get("next_open_to_next_open_return", np.nan)) * 100, 2),
+                    self._fmt_number(float(row.get("current_weight", np.nan)) * 100, 1),
+                    self._fmt_number(float(row.get("target_weight", np.nan)) * 100, 1),
+                    self._fmt_number(float(row.get("trade_weight", np.nan)) * 100, 1),
+                    self._fmt_number(float(row.get("transaction_cost", np.nan)) * 100, 3),
+                    self._fmt_number(float(row.get("net_strategy_return", np.nan)) * 100, 2),
+                    self._fmt_number(row.get("equity", np.nan), 4),
+                ),
+            )
+        name = str(stock.iloc[-1].get("name", "")) if not stock.empty else ""
+        self.ml_policy_stock_query.set(f"{self.ml_policy_selected_code} {name}".strip())
+        self.ml_policy_stock_status.set(
+            f"{self.ml_policy_selected_code} {name} | 因子在 t 日收盘后可见，t+1 开盘调仓，收益检验到 t+2 开盘。"
+        )
+        self._draw_ml_policy_backtest_chart()
+
+    def _schedule_ml_policy_chart_redraw(self, _event: Any = None) -> None:
+        if self.ml_policy_chart_resize_job:
+            self.after_cancel(self.ml_policy_chart_resize_job)
+        self.ml_policy_chart_resize_job = self.after(100, self._draw_ml_policy_backtest_chart)
+
+    def _draw_ml_policy_backtest_chart(self) -> None:
+        self.ml_policy_chart_resize_job = None
+        canvas = self.ml_policy_chart
+        canvas.delete("all")
+        code = self.ml_policy_selected_code
+        if not code or self.ml_policy_backtest_frame.empty:
+            return
+        stock = self.ml_policy_backtest_frame.loc[self.ml_policy_backtest_frame["code"].eq(code)].sort_values("date")
+        if stock.empty:
+            return
+        width = max(canvas.winfo_width(), 520)
+        height = max(canvas.winfo_height(), 260)
+        left, right, top, bottom = 58, 18, 28, 45
+        plot_width = max(width - left - right, 1)
+        plot_height = max(height - top - bottom, 1)
+        equity = pd.to_numeric(stock["equity"], errors="coerce").to_numpy(dtype=float)
+        benchmark = pd.to_numeric(stock["benchmark_equity"], errors="coerce").to_numpy(dtype=float)
+        values = np.concatenate([equity[np.isfinite(equity)], benchmark[np.isfinite(benchmark)]])
+        if len(values) == 0:
+            return
+        ymin, ymax = float(values.min()), float(values.max())
+        pad = max((ymax - ymin) * 0.08, 0.01)
+        ymin, ymax = ymin - pad, ymax + pad
+
+        def point(index: int, value: float) -> tuple[float, float]:
+            x = left + (index / max(len(stock) - 1, 1)) * plot_width
+            y = top + (ymax - value) / max(ymax - ymin, 1e-9) * plot_height
+            return x, y
+
+        for grid_index in range(5):
+            ratio = grid_index / 4
+            y = top + ratio * plot_height
+            value = ymax - ratio * (ymax - ymin)
+            canvas.create_line(left, y, width - right, y, fill="#e8eef5")
+            canvas.create_text(left - 7, y, text=f"{value:.3f}", anchor="e", fill="#607086", font=("Microsoft YaHei UI", 8))
+        for series, color, line_width in ((benchmark, "#94a3b8", 2), (equity, "#1d5fd1", 3)):
+            coords: list[float] = []
+            for index, value in enumerate(series):
+                if np.isfinite(value):
+                    coords.extend(point(index, float(value)))
+            if len(coords) >= 4:
+                canvas.create_line(*coords, fill=color, width=line_width, smooth=False)
+        dates = pd.to_datetime(stock["date"], errors="coerce")
+        for index in np.linspace(0, len(stock) - 1, min(6, len(stock)), dtype=int):
+            x, _ = point(int(index), float(equity[int(index)]))
+            label = dates.iloc[int(index)].strftime("%Y-%m-%d") if not pd.isna(dates.iloc[int(index)]) else "-"
+            canvas.create_text(x, height - 20, text=label, fill="#607086", font=("Microsoft YaHei UI", 8))
+        canvas.create_text(left, 12, text="ML策略净值", anchor="w", fill="#1d5fd1", font=("Microsoft YaHei UI", 9, "bold"))
+        canvas.create_text(left + 92, 12, text="固定最大仓位基准", anchor="w", fill="#64748b", font=("Microsoft YaHei UI", 9))
+
+    def _on_ml_policy_chart_click(self, event: Any) -> None:
+        code = self.ml_policy_selected_code
+        if not code or self.ml_policy_backtest_frame.empty:
+            return
+        stock = self.ml_policy_backtest_frame.loc[self.ml_policy_backtest_frame["code"].eq(code)].sort_values("date")
+        if stock.empty:
+            return
+        width = max(self.ml_policy_chart.winfo_width(), 520)
+        index = int(round(np.clip((event.x - 58) / max(width - 76, 1), 0, 1) * max(len(stock) - 1, 0)))
+        row = stock.iloc[index]
+        date = pd.to_datetime(row.get("date"), errors="coerce")
+        self.ml_policy_stock_status.set(
+            f"{code} | {date.strftime('%Y-%m-%d') if not pd.isna(date) else '-'} | "
+            f"{row.get('policy_action', '-')} | 上涨概率 {float(row.get('probability_up', np.nan)) * 100:.1f}% | "
+            f"目标仓位 {float(row.get('target_weight', 0)) * 100:.1f}% | 实际收益 {float(row.get('next_open_to_next_open_return', np.nan)) * 100:.2f}%"
+        )
+
+    def _open_ml_policy_report_directory(self) -> None:
+        directory, _source = self._ml_policy_report_source()
+        target = directory or (engine.ROOT / "reports")
+        target.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(target))
+
     def _build_model_diagnostics_tab(self) -> None:
         tab = self.model_diagnostics_tab
         tab.columnconfigure(0, weight=1)
         tab.columnconfigure(1, weight=1)
-        tab.rowconfigure(1, weight=1)
+        tab.rowconfigure(2, weight=1)
 
         current = ttk.LabelFrame(tab, text="当前正式模型", padding=12)
-        current.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        current.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 10))
         current.columnconfigure(1, weight=1)
         current.columnconfigure(3, weight=1)
         self.model_diag_vars = {
@@ -1390,13 +1974,18 @@ class StrategyDesktopApp(tk.Tk):
             "backend": tk.StringVar(value="-"),
             "features": tk.StringVar(value="-"),
             "calibration": tk.StringVar(value="-"),
+            "oos_end": tk.StringVar(value="-"),
+            "production_end": tk.StringVar(value="-"),
             "updated": tk.StringVar(value="-"),
+            "drift": tk.StringVar(value="-"),
         }
         fields = [
             ("模型版本", "version"), ("训练范围", "range"),
             ("标签定义", "target"), ("模型后端", "backend"),
             ("因子数量", "features"), ("概率校准", "calibration"),
+            ("样本外截止", "oos_end"), ("生产训练截止", "production_end"),
             ("更新时间", "updated"),
+            ("模型漂移", "drift"),
         ]
         for index, (label, key) in enumerate(fields):
             row, pair = divmod(index, 2)
@@ -1406,7 +1995,7 @@ class StrategyDesktopApp(tk.Tk):
             )
 
         metrics_frame = ttk.LabelFrame(tab, text="最近样本外指标", padding=8)
-        metrics_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
+        metrics_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 5))
         metrics_frame.rowconfigure(0, weight=1)
         metrics_frame.columnconfigure(0, weight=1)
         self.model_metrics_tree = ttk.Treeview(metrics_frame, columns=("metric", "value"), show="headings", height=10)
@@ -1417,7 +2006,7 @@ class StrategyDesktopApp(tk.Tk):
         self.model_metrics_tree.grid(row=0, column=0, sticky="nsew")
 
         weights_frame = ttk.LabelFrame(tab, text="当前因子组权重", padding=8)
-        weights_frame.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
+        weights_frame.grid(row=2, column=1, sticky="nsew", padx=(5, 0))
         weights_frame.rowconfigure(0, weight=1)
         weights_frame.columnconfigure(0, weight=1)
         self.model_weights_tree = ttk.Treeview(
@@ -1429,7 +2018,7 @@ class StrategyDesktopApp(tk.Tk):
         self.model_weights_tree.grid(row=0, column=0, sticky="nsew")
 
         contribution = ttk.LabelFrame(tab, text="因子组样本外贡献（读取离线报告）", padding=8)
-        contribution.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        contribution.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         contribution.columnconfigure(0, weight=1)
         self.model_contribution_tree = ttk.Treeview(
             contribution,
@@ -1448,8 +2037,43 @@ class StrategyDesktopApp(tk.Tk):
             self.model_contribution_tree.column(column, width=width, anchor="center")
         self.model_contribution_tree.grid(row=0, column=0, sticky="ew")
 
+        factor_frame = ttk.LabelFrame(tab, text="正式模型因子状态", padding=8)
+        factor_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        factor_frame.columnconfigure(0, weight=1)
+        self.model_factor_tree = ttk.Treeview(
+            factor_frame,
+            columns=("factor", "group", "status", "first", "training", "recent", "weight", "reason"),
+            show="headings",
+            height=6,
+        )
+        factor_headings = {
+            "factor": "因子",
+            "group": "数据源/组",
+            "status": "状态",
+            "first": "首次可用",
+            "training": "训练覆盖%",
+            "recent": "近期覆盖%",
+            "weight": "组权重%",
+            "reason": "未启用原因",
+        }
+        factor_widths = {
+            "factor": 210,
+            "group": 120,
+            "status": 80,
+            "first": 100,
+            "training": 95,
+            "recent": 95,
+            "weight": 90,
+            "reason": 250,
+        }
+        self._setup_tree(self.model_factor_tree, factor_headings, factor_widths)
+        self.model_factor_tree.grid(row=0, column=0, sticky="ew")
+        factor_scroll = ttk.Scrollbar(factor_frame, orient=tk.VERTICAL, command=self.model_factor_tree.yview)
+        factor_scroll.grid(row=0, column=1, sticky="ns")
+        self.model_factor_tree.configure(yscrollcommand=factor_scroll.set)
+
         operations = ttk.LabelFrame(tab, text="模型操作", padding=10)
-        operations.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        operations.grid(row=0, column=0, columnspan=2, sticky="ew")
         operations.columnconfigure(1, weight=1)
         ttk.Label(operations, text="训练数据").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.model_training_data_path = tk.StringVar(
@@ -1457,16 +2081,63 @@ class StrategyDesktopApp(tk.Tk):
         )
         ttk.Entry(operations, textvariable=self.model_training_data_path).grid(row=0, column=1, sticky="ew", padx=(0, 8))
         self.model_training_status = tk.StringVar(value="空闲")
-        ttk.Label(operations, textvariable=self.model_training_status).grid(row=0, column=2, sticky="w")
+        ttk.Label(operations, textvariable=self.model_training_status, wraplength=620).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0)
+        )
+        progress_row = ttk.Frame(operations)
+        progress_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.model_training_progress = tk.DoubleVar(value=0.0)
+        self.model_training_progress_bar = ttk.Progressbar(
+            progress_row,
+            variable=self.model_training_progress,
+            maximum=100.0,
+            mode="determinate",
+            length=620,
+        )
+        self.model_training_progress_bar.grid(row=0, column=0, sticky="w")
+        self.model_training_progress_text = tk.StringVar(value="0% 尚未开始")
+        ttk.Label(
+            progress_row,
+            textvariable=self.model_training_progress_text,
+            wraplength=620,
+        ).grid(
+            row=1, column=0, sticky="w", pady=(4, 0)
+        )
         buttons = ttk.Frame(operations)
-        buttons.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        ttk.Button(buttons, text="刷新模型状态", command=self.refresh_model_diagnostics).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(buttons, text="运行月度训练", command=self.run_monthly_model_training).pack(side=tk.LEFT, padx=6)
-        ttk.Button(buttons, text="取消训练", command=self.cancel_monthly_model_training).pack(side=tk.LEFT, padx=6)
-        ttk.Button(buttons, text="查看训练日志", command=self.open_model_training_log).pack(side=tk.LEFT, padx=6)
-        ttk.Button(buttons, text="晋升候选模型", command=self.promote_candidate_from_ui).pack(side=tk.LEFT, padx=6)
-        ttk.Button(buttons, text="回退上一正式模型", command=self.rollback_model_from_ui).pack(side=tk.LEFT, padx=6)
-        ttk.Button(buttons, text="打开模型目录", command=self.open_model_directory).pack(side=tk.LEFT, padx=6)
+        buttons.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.model_operation_buttons = []
+        operation_specs = (
+            ("刷新模型状态", self.refresh_model_diagnostics),
+            ("运行月度训练", self.run_monthly_model_training),
+            ("取消训练", self.cancel_monthly_model_training),
+            ("查看训练日志", self.open_model_training_log),
+            ("自动验收候选", self.promote_candidate_from_ui),
+            ("回退上一正式模型", self.rollback_model_from_ui),
+            ("打开模型目录", self.open_model_directory),
+        )
+        for index, (text, command) in enumerate(operation_specs):
+            button = ttk.Button(buttons, text=text, command=command)
+            button.grid(row=index // 3, column=index % 3, sticky="ew", padx=(0, 6), pady=3)
+            self.model_operation_buttons.append(button)
+        manual = ttk.Frame(operations)
+        manual.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Label(manual, text="人工选择模型版本").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.manual_model_version = tk.StringVar(value="")
+        self.manual_model_version_combo = ttk.Combobox(
+            manual, textvariable=self.manual_model_version, state="readonly", width=32
+        )
+        self.manual_model_version_combo.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        self.manual_promote_button = ttk.Button(
+            manual, text="人工设为正式模型", command=self.manual_promote_selected_model
+        )
+        self.manual_promote_button.grid(
+            row=0, column=2, sticky="w"
+        )
+        ttk.Label(
+            manual,
+            text="人工晋升会绕过指标门槛；自动验收结果仍保留供参考。",
+            wraplength=620,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.after(150, self.refresh_model_diagnostics)
 
     def _load_ml_prediction_snapshot_banner(self) -> None:
@@ -1489,12 +2160,18 @@ class StrategyDesktopApp(tk.Tk):
         loader = ProductionModelLoader(engine.ROOT)
         status = loader.status()
         version = status.get("production")
-        for tree in (self.model_metrics_tree, self.model_weights_tree, self.model_contribution_tree):
+        self._refresh_manual_model_versions(status)
+        for tree in (
+            self.model_metrics_tree,
+            self.model_weights_tree,
+            self.model_contribution_tree,
+            self.model_factor_tree,
+        ):
             for item in tree.get_children():
                 tree.delete(item)
         if not version:
             self.model_diag_vars["version"].set("未注册，请先训练并晋升候选模型")
-            for key in ("range", "target", "backend", "features", "calibration", "updated"):
+            for key in ("range", "target", "backend", "features", "calibration", "oos_end", "production_end", "updated", "drift"):
                 self.model_diag_vars[key].set("-")
             return
         version_path = engine.ROOT / "models" / str(version)
@@ -1513,7 +2190,23 @@ class StrategyDesktopApp(tk.Tk):
         self.model_diag_vars["backend"].set(str(metadata.get("model_backend", "XGBoost CUDA")))
         self.model_diag_vars["features"].set(str(metadata.get("factor_count", "-")))
         self.model_diag_vars["calibration"].set(str(metadata.get("calibration_status", "unknown")))
+        self.model_diag_vars["oos_end"].set(str(metadata.get("oos_evaluation_end", "-")))
+        self.model_diag_vars["production_end"].set(str(metadata.get("production_training_end", "-")))
         self.model_diag_vars["updated"].set(str(metadata.get("training_time", "-")))
+        drift_report: dict[str, Any] = {}
+        drift_path = engine.CACHE_DIR / "ml_drift_report.json"
+        if drift_path.exists():
+            try:
+                loaded_drift = json.loads(drift_path.read_text(encoding="utf-8"))
+                if str(loaded_drift.get("model_version")) == str(version):
+                    drift_report = loaded_drift
+            except Exception:
+                drift_report = {}
+        drift_reasons = ", ".join(str(item) for item in drift_report.get("reasons", []))
+        self.model_diag_vars["drift"].set(
+            f"{drift_report.get('status', '尚无监控历史')}"
+            + (f" ({drift_reasons})" if drift_reasons else "")
+        )
         latest_all = {}
         if isinstance(metrics_rows, list):
             candidates = [row for row in metrics_rows if isinstance(row, dict) and row.get("model_group") == "all_factor"]
@@ -1522,9 +2215,50 @@ class StrategyDesktopApp(tk.Tk):
             value = latest_all.get(key, "-")
             text = f"{value:.6f}" if isinstance(value, (int, float)) and np.isfinite(value) else str(value)
             self.model_metrics_tree.insert("", tk.END, values=(key, text))
+        for key, value in (metadata.get("calibration_metrics") or {}).items():
+            if key.endswith("_json"):
+                continue
+            text = f"{value:.6f}" if isinstance(value, (int, float)) and np.isfinite(value) else str(value)
+            self.model_metrics_tree.insert("", tk.END, values=(key, text))
+        factor_policy = metadata.get("factor_policy") if isinstance(metadata.get("factor_policy"), dict) else {}
+        for key in (
+            "status", "calibration_start", "calibration_end", "test_start", "test_end",
+            "embargo_trading_days", "test_stock_count", "calibration_objective",
+        ):
+            if key not in factor_policy:
+                continue
+            value = factor_policy.get(key)
+            text = f"{value:.6f}" if isinstance(value, float) and np.isfinite(value) else str(value)
+            self.model_metrics_tree.insert("", tk.END, values=(f"policy.{key}", text))
+        for key, value in (drift_report.get("metrics") or {}).items():
+            text = f"{value:.6f}" if isinstance(value, (int, float)) and np.isfinite(value) else "数据不足"
+            self.model_metrics_tree.insert("", tk.END, values=(f"drift.{key}", text))
         for group, weight in sorted(weights.items()):
             self.model_weights_tree.insert(
                 "", tk.END, values=(group, f"{float(weight) * 100:.2f}%", factor_status.get(group, "-"))
+            )
+        factor_diagnostics = metadata.get("factor_diagnostics", {})
+        if isinstance(factor_diagnostics, dict) and factor_diagnostics:
+            for factor_name, detail in sorted(factor_diagnostics.items()):
+                if not isinstance(detail, dict):
+                    continue
+                self.model_factor_tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        factor_name,
+                        detail.get("data_source") or detail.get("factor_group") or "-",
+                        detail.get("status", "-"),
+                        detail.get("first_available_date") or "-",
+                        self._fmt_number(float(detail.get("training_coverage", np.nan)) * 100),
+                        self._fmt_number(float(detail.get("recent_coverage", np.nan)) * 100),
+                        self._fmt_number(float(detail.get("current_group_weight", np.nan)) * 100),
+                        detail.get("inactive_reason") or "-",
+                    ),
+                )
+        else:
+            self.model_factor_tree.insert(
+                "", tk.END, values=("旧模型未保存逐因子诊断；月度重训后生成", "-", "-", "-", "-", "-", "-", "-")
             )
         contribution_path = engine.ROOT / "reports" / "factor_group_ablation.csv"
         if contribution_path.exists():
@@ -1551,6 +2285,7 @@ class StrategyDesktopApp(tk.Tk):
         if self.model_training_process is not None and self.model_training_process.poll() is None:
             self.model_training_status.set("训练仍在运行")
             return
+        self._set_model_training_progress(0.0, "正在启动训练进程")
         data_path = Path(self.model_training_data_path.get().strip())
         self.model_training_log_path.parent.mkdir(parents=True, exist_ok=True)
         log_handle = self.model_training_log_path.open("w", encoding="utf-8")
@@ -1560,6 +2295,9 @@ class StrategyDesktopApp(tk.Tk):
             "--data",
             str(data_path),
         ]
+        self.model_training_start_candidate = str(
+            ProductionModelLoader(engine.ROOT).status().get("candidate") or ""
+        )
         self.model_training_process = subprocess.Popen(
             command,
             cwd=str(engine.ROOT),
@@ -1572,6 +2310,11 @@ class StrategyDesktopApp(tk.Tk):
         self.model_training_status.set(f"训练中，PID {self.model_training_process.pid}")
         self._poll_model_training()
 
+    def _set_model_training_progress(self, value: float, stage: str) -> None:
+        progress = float(np.clip(value, 0.0, 100.0))
+        self.model_training_progress.set(progress)
+        self.model_training_progress_text.set(f"{progress:.0f}% {stage}")
+
     def _poll_model_training(self) -> None:
         process = self.model_training_process
         if process is None:
@@ -1580,19 +2323,74 @@ class StrategyDesktopApp(tk.Tk):
         if code is None:
             try:
                 lines = self.model_training_log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                progress_prefixes = ("[market ", "[external]", "[panel]", "[training ", "[candidate]", "[skip]")
+                progress_value, progress_stage = _monthly_training_progress(lines)
+                self._set_model_training_progress(progress_value, progress_stage)
+                progress_prefixes = (
+                    "[market ", "[external]", "[panel]", "[cross-section]", "[training ",
+                    "[policy]", "[refit", "[reports]", "[candidate]", "[backtest]", "[skip]",
+                )
                 progress_lines = [line.strip() for line in lines if line.strip().startswith(progress_prefixes)]
                 if progress_lines:
-                    self.model_training_status.set(f"训练中：{progress_lines[-1][-120:]}")
+                    progress = f"训练中：{progress_lines[-1][-120:]}"
+                    self.model_training_status.set(progress)
+                    self.ml_policy_report_status.set(f"严格回测报告生成中：{progress_lines[-1][-120:]}")
                 elif lines:
                     self.model_training_status.set(f"训练中，PID {process.pid}")
             except Exception:
                 pass
             self.model_training_poll_job = self.after(1000, self._poll_model_training)
             return
-        self.model_training_status.set("训练完成，已生成候选模型" if code == 0 else f"训练失败，退出码 {code}")
+        if code == 0:
+            ok, detail = self._verify_monthly_training_artifacts()
+            self.model_training_status.set(detail)
+            self.ml_policy_report_status.set(detail)
+            if ok:
+                self._set_model_training_progress(100.0, "训练与严格回测报告已完成")
+            else:
+                self.model_training_progress_text.set(
+                    f"{self.model_training_progress.get():.0f}% 训练结束，但报告校验未通过"
+                )
+        else:
+            ok = False
+            self.model_training_status.set(f"训练未完成，子进程退出码 {code}；请查看训练日志")
+            self.ml_policy_report_status.set(f"严格回测报告未生成：训练子进程退出码 {code}；请查看训练日志")
+            self.model_training_progress_text.set(
+                f"{self.model_training_progress.get():.0f}% 已停止，退出码 {code}"
+            )
         self.model_training_process = None
         self.refresh_model_diagnostics()
+        candidate = str(ProductionModelLoader(engine.ROOT).status().get("candidate") or "")
+        self._refresh_ml_policy_model_options(candidate if ok else "")
+        self._load_ml_policy_backtest_reports()
+
+    def _verify_monthly_training_artifacts(self) -> tuple[bool, str]:
+        status = ProductionModelLoader(engine.ROOT).status()
+        candidate = str(status.get("candidate") or "")
+        if not candidate or candidate == str(self.model_training_start_candidate or ""):
+            return False, "训练进程已退出，但没有生成新的候选模型；请查看训练日志"
+        directory = engine.ROOT / "models" / candidate
+        report_path = directory / "ml_policy_report.json"
+        summary_path = directory / "ml_policy_stock_summary.csv"
+        backtest_path = directory / "ml_policy_backtest.parquet"
+        missing = [
+            path.name for path in (report_path, summary_path, backtest_path) if not path.exists()
+        ]
+        if missing:
+            return False, f"候选模型 {candidate} 已生成，但缺少回测报告：{', '.join(missing)}"
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return False, f"候选模型 {candidate} 的回测报告无法读取：{_short_error_text(exc)}"
+        if str(report.get("status", "")).lower() != "calibrated":
+            return False, f"候选模型 {candidate} 已生成，但因子回测失败：{report.get('reason') or report.get('status') or 'unknown'}"
+        try:
+            summary = pd.read_csv(summary_path)
+            backtest = pd.read_parquet(backtest_path, columns=["code", "date"])
+        except Exception as exc:
+            return False, f"候选模型 {candidate} 的逐股回测文件损坏：{_short_error_text(exc)}"
+        if summary.empty or backtest.empty:
+            return False, f"候选模型 {candidate} 已生成，但逐股回测结果为空"
+        return True, f"训练完成：候选模型 {candidate}，逐股回测 {len(summary)} 只"
 
     def cancel_monthly_model_training(self) -> None:
         process = self.model_training_process
@@ -1601,8 +2399,13 @@ class StrategyDesktopApp(tk.Tk):
             return
         process.terminate()
         self.model_training_status.set("正在取消训练")
+        self.model_training_progress_text.set(
+            f"{self.model_training_progress.get():.0f}% 正在取消"
+        )
 
     def _on_app_close(self) -> None:
+        self.monitor_running = False
+        self.ml_monitor_running = False
         self.backtest_stop_event.set()
         processes: list[Any] = []
         if self.model_training_process is not None:
@@ -1630,6 +2433,51 @@ class StrategyDesktopApp(tk.Tk):
         path.mkdir(parents=True, exist_ok=True)
         os.startfile(str(path))
 
+    def _refresh_manual_model_versions(self, status: dict[str, Any] | None = None) -> None:
+        if not hasattr(self, "manual_model_version_combo"):
+            return
+        status = status or ProductionModelLoader(engine.ROOT).status()
+        versions = ModelRegistry(engine.ROOT).list_versions()
+        current = self.manual_model_version.get().strip()
+        self.manual_model_version_combo.configure(values=versions)
+        preferred = str(status.get("candidate") or status.get("production") or "")
+        if current in versions:
+            self.manual_model_version.set(current)
+        elif preferred in versions:
+            self.manual_model_version.set(preferred)
+        elif versions:
+            self.manual_model_version.set(versions[0])
+        else:
+            self.manual_model_version.set("")
+
+    def manual_promote_selected_model(self) -> None:
+        version = self.manual_model_version.get().strip()
+        if not version:
+            messagebox.showwarning("未选择模型", "请先选择一个已完成训练的模型版本。")
+            return
+        current = str(ProductionModelLoader(engine.ROOT).status().get("production") or "未设置")
+        confirmed = messagebox.askyesno(
+            "确认人工晋升",
+            f"将模型 {version} 人工设为正式模型？\n\n"
+            f"当前正式模型：{current}\n"
+            "该操作会绕过自动测试和指标门槛，但会保留当前正式模型用于回退。",
+            icon="warning",
+        )
+        if not confirmed:
+            return
+        try:
+            changed = set_production_model_version(engine.ROOT, version)
+            text = (
+                f"已人工将 {version} 设为正式模型；自动验收门槛已按你的选择绕过"
+                if changed else f"{version} 已经是当前正式模型"
+            )
+            self.model_training_status.set(text)
+            self.refresh_model_diagnostics()
+            self._load_ml_policy_backtest_reports()
+            messagebox.showinfo("人工晋升完成", text)
+        except Exception as exc:
+            messagebox.showerror("人工晋升失败", _short_error_text(exc))
+
     def promote_candidate_from_ui(self) -> None:
         comparison_path = engine.ROOT / "reports" / "model_comparison.json"
         if not comparison_path.exists():
@@ -1649,11 +2497,18 @@ class StrategyDesktopApp(tk.Tk):
         try:
             comparison = json.loads((engine.ROOT / "reports" / "model_comparison.json").read_text(encoding="utf-8"))
             comparison["regression_tests_passed"] = completed.returncode == 0
-            comparison.setdefault("minimum_better_windows", 3)
             evaluation = evaluate_candidate_model(engine.ROOT, comparison)
+            (engine.ROOT / "reports" / "promotion_evaluation.json").write_text(
+                json.dumps(evaluation, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+            )
             promoted = promote_candidate_model(engine.ROOT, comparison)
             if promoted:
-                mode = "首次绝对指标" if evaluation.get("mode") == "initial_absolute" else "相对改进指标"
+                mode_labels = {
+                    "initial_absolute": "首次绝对指标",
+                    "replacement_shared_oos": "候选/正式模型共同样本外非劣性指标",
+                    "legacy_explicit": "旧版兼容指标",
+                }
+                mode = mode_labels.get(str(evaluation.get("mode")), "模型验收指标")
                 detail = f"候选模型已通过{mode}并晋升为正式模型"
             else:
                 failed = ", ".join(evaluation.get("failed_checks", [])) or "unknown"
@@ -1680,14 +2535,17 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_start = tk.StringVar(value=self.bt_start.get())
         self.ml_adjust = tk.StringVar(value=self.bt_adjust.get())
         ml_settings = self._load_ml_portfolio_settings()
-        self.ml_cash = tk.StringVar(value=str(ml_settings.get("cash") or self.bt_cash.get()))
+        self.ml_cash = tk.StringVar(value=str(ml_settings.get("available_cash") or ml_settings.get("cash") or self.bt_cash.get()))
+        self.ml_total_asset = tk.StringVar(value=str(ml_settings.get("total_asset") or ""))
         self.ml_target_position = tk.StringVar(value=str(ml_settings.get("target_position") or "80"))
+        self.ml_single_position = tk.StringVar(value=str(ml_settings.get("max_single_position") or "25"))
         self.ml_fee = tk.StringVar(value=self.bt_fee.get())
         self.ml_risk = tk.StringVar(value=self.bt_risk.get())
         self.ml_horizon = tk.StringVar(value=self.bt_horizon.get())
         self.ml_advice_days = tk.StringVar(value="3")
         self.ml_parallel_workers = tk.StringVar(value=str(ml_settings.get("parallel_workers") or ML_BATCH_PARALLEL_WORKERS))
         self.ml_refresh_external_data = tk.BooleanVar(value=False)
+        self.ml_view_mode = tk.StringVar(value=str(ml_settings.get("view_mode") or "简洁模式"))
         self.ml_shares = tk.StringVar(value=self.bt_shares.get())
         self.ml_buy_price = tk.StringVar(value=self.bt_buy_price.get())
         self.ml_buy_date = tk.StringVar(value=self.bt_buy_date.get())
@@ -1720,8 +2578,11 @@ class StrategyDesktopApp(tk.Tk):
         ml_pool_buttons.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
         ml_pool_buttons.columnconfigure(0, weight=1)
         ml_pool_buttons.columnconfigure(1, weight=1)
+        ml_pool_buttons.columnconfigure(2, weight=1)
         ttk.Button(ml_pool_buttons, text="批量加入ML股票池", command=self._add_ml_pool_symbols, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(ml_pool_buttons, text="清空代码", command=lambda: self.ml_pool_text.delete("1.0", tk.END)).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.ml_add_all_stocks_button = ttk.Button(ml_pool_buttons, text="全部A股入池", command=self._add_all_a_share_symbols)
+        self.ml_add_all_stocks_button.grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(ml_pool_buttons, text="清空代码", command=lambda: self.ml_pool_text.delete("1.0", tk.END)).grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
         ml_eval_buttons = ttk.Frame(saved_box)
         ml_eval_buttons.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 8))
@@ -1734,15 +2595,15 @@ class StrategyDesktopApp(tk.Tk):
         ttk.Label(ml_eval_buttons, text="ML股票池和传统回测互不影响；右键股票可填持股/成本，或删除选中的多只股票。", foreground="#607086").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.ml_saved_stock_tree = ttk.Treeview(
             saved_box,
-            columns=("checked", "symbol", "name", "shares", "cost", "added"),
+            columns=("checked", "symbol", "name", "shares", "available", "cost", "added"),
             show="headings",
             height=12,
             selectmode="extended",
         )
         self._setup_tree(
             self.ml_saved_stock_tree,
-            {"checked": "选择", "symbol": "代码", "name": "名称", "shares": "持股数", "cost": "成本价", "added": "加入时间"},
-            {"checked": 48, "symbol": 80, "name": 100, "shares": 80, "cost": 80, "added": 135},
+            {"checked": "选择", "symbol": "代码", "name": "名称", "shares": "持股数", "available": "可卖股数", "cost": "成本价", "added": "加入时间"},
+            {"checked": 48, "symbol": 80, "name": 100, "shares": 75, "available": 80, "cost": 75, "added": 130},
         )
         self.ml_saved_stock_tree.grid(row=3, column=0, sticky="nsew")
         ml_saved_vscroll = ttk.Scrollbar(saved_box, orient=tk.VERTICAL, command=self.ml_saved_stock_tree.yview)
@@ -1759,8 +2620,8 @@ class StrategyDesktopApp(tk.Tk):
 
         top = ttk.LabelFrame(ml_result_frame, text="ML 持仓次日决策参数")
         top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        for idx in range(15):
-            top.columnconfigure(idx, weight=1 if idx == 14 else 0)
+        for idx in range(19):
+            top.columnconfigure(idx, weight=1 if idx == 18 else 0)
         ttk.Label(top, text="建议周期").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=6)
         ttk.Combobox(top, textvariable=self.ml_advice_days, values=("1", "3", "10"), width=6, state="readonly").grid(row=0, column=1, sticky="w", padx=(0, 14), pady=6)
         ttk.Label(top, text="开始日期").grid(row=0, column=2, sticky="w", padx=(0, 4), pady=6)
@@ -1769,13 +2630,34 @@ class StrategyDesktopApp(tk.Tk):
         ttk.Combobox(top, textvariable=self.ml_adjust, values=("qfq", "", "hfq"), width=7, state="readonly").grid(row=0, column=5, sticky="w", padx=(0, 14), pady=6)
         ttk.Label(top, text="手续费").grid(row=0, column=6, sticky="w", padx=(0, 4), pady=6)
         ttk.Entry(top, textvariable=self.ml_fee, width=9).grid(row=0, column=7, sticky="w", padx=(0, 14), pady=6)
-        ttk.Label(top, text="总资金").grid(row=0, column=8, sticky="w", padx=(0, 4), pady=6)
+        ttk.Label(top, text="可用现金").grid(row=0, column=8, sticky="w", padx=(0, 4), pady=6)
         ttk.Entry(top, textvariable=self.ml_cash, width=11).grid(row=0, column=9, sticky="w", padx=(0, 14), pady=6)
-        ttk.Label(top, text="目标仓位%").grid(row=0, column=10, sticky="w", padx=(0, 4), pady=6)
-        ttk.Entry(top, textvariable=self.ml_target_position, width=8).grid(row=0, column=11, sticky="w", padx=(0, 14), pady=6)
-        ttk.Label(top, text="并行数").grid(row=0, column=12, sticky="w", padx=(0, 4), pady=6)
-        ttk.Entry(top, textvariable=self.ml_parallel_workers, width=5).grid(row=0, column=13, sticky="w", padx=(0, 14), pady=6)
-        ttk.Checkbutton(top, text="刷新外部数据", variable=self.ml_refresh_external_data).grid(row=0, column=14, sticky="w", padx=(0, 8), pady=6)
+        ttk.Label(top, text="总资产").grid(row=0, column=10, sticky="w", padx=(0, 4), pady=6)
+        ttk.Entry(top, textvariable=self.ml_total_asset, width=11).grid(row=0, column=11, sticky="w", padx=(0, 14), pady=6)
+        ttk.Label(top, text="目标总仓位%").grid(row=0, column=12, sticky="w", padx=(0, 4), pady=6)
+        ttk.Entry(top, textvariable=self.ml_target_position, width=7).grid(row=0, column=13, sticky="w", padx=(0, 14), pady=6)
+        ttk.Label(top, text="单股上限%").grid(row=0, column=14, sticky="w", padx=(0, 4), pady=6)
+        ttk.Entry(top, textvariable=self.ml_single_position, width=7).grid(row=0, column=15, sticky="w", padx=(0, 14), pady=6)
+        ttk.Label(top, text="并行数").grid(row=0, column=16, sticky="w", padx=(0, 4), pady=6)
+        ttk.Entry(top, textvariable=self.ml_parallel_workers, width=5).grid(row=0, column=17, sticky="w", padx=(0, 14), pady=6)
+        ttk.Checkbutton(top, text="刷新外部数据", variable=self.ml_refresh_external_data).grid(row=0, column=18, sticky="w", padx=(0, 8), pady=6)
+        ttk.Label(top, text="表格模式").grid(row=1, column=0, sticky="w", padx=(8, 4), pady=(0, 6))
+        ttk.Combobox(
+            top,
+            textvariable=self.ml_view_mode,
+            values=("简洁模式", "研究模式"),
+            width=9,
+            state="readonly",
+        ).grid(row=1, column=1, sticky="w", padx=(0, 14), pady=(0, 6))
+        ttk.Button(top, text="查看任务日志", command=self.open_latest_task_log).grid(
+            row=1, column=16, columnspan=3, sticky="e", padx=(0, 8), pady=(0, 6)
+        )
+        self.ml_account_hint = tk.StringVar(
+            value="总资产留空时，将按可用现金 + 当前持仓市值自动估算"
+        )
+        ttk.Label(top, textvariable=self.ml_account_hint, foreground="#607086").grid(
+            row=1, column=8, columnspan=11, sticky="w", padx=(0, 8), pady=(0, 6)
+        )
 
         self.ml_summary_var = tk.StringVar(value="尚未 ML 持仓决策评估")
         ttk.Label(ml_result_frame, textvariable=self.ml_summary_var, anchor="w").grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -1833,12 +2715,25 @@ class StrategyDesktopApp(tk.Tk):
             "factor",
             "confidence",
             "completeness",
+            "data_status",
             "event_status",
             "main_driver",
             "detail",
         )
         frozen_columns = ("rank", "symbol", "name")
         scroll_columns = tuple(column for column in columns if column not in frozen_columns)
+        self.ml_research_columns = scroll_columns
+        self.ml_simple_columns = (
+            "action",
+            "current_weight",
+            "target_weight",
+            "trade_shares",
+            "prob10",
+            "exp10",
+            "holding_risk",
+            "confidence",
+            "data_status",
+        )
         self.ml_frozen_tree = ttk.Treeview(ml_table_frame, columns=frozen_columns, show="headings", height=9, selectmode="extended")
         self.ml_tree = ttk.Treeview(
             ml_table_frame,
@@ -1870,6 +2765,7 @@ class StrategyDesktopApp(tk.Tk):
             "factor": "因子分",
             "confidence": "模型置信度%",
             "completeness": "数据完整度%",
+            "data_status": "数据状态",
             "event_status": "事件状态",
             "main_driver": "主要驱动",
             "detail": "决策说明",
@@ -1893,6 +2789,7 @@ class StrategyDesktopApp(tk.Tk):
             "factor": 75,
             "confidence": 100,
             "completeness": 105,
+            "data_status": 150,
             "event_status": 190,
             "main_driver": 220,
             "detail": 360,
@@ -1921,6 +2818,8 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_tree.bind("<MouseWheel>", self._on_ml_table_mousewheel)
         self.ml_frozen_tree.bind("<MouseWheel>", self._on_ml_table_mousewheel)
         self.ml_advice_days.trace_add("write", lambda *_args: self._refresh_ml_advice_view())
+        self.ml_view_mode.trace_add("write", lambda *_args: self._apply_ml_view_mode())
+        self._apply_ml_view_mode()
 
     def _build_ml_monitor_tab(self) -> None:
         self.ml_monitor_tab.columnconfigure(0, weight=1)
@@ -2065,14 +2964,35 @@ class StrategyDesktopApp(tk.Tk):
         engine.CACHE_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "cash": self.ml_cash.get().strip(),
+            "available_cash": self.ml_cash.get().strip(),
+            "total_asset": self.ml_total_asset.get().strip(),
             "target_position": self.ml_target_position.get().strip(),
+            "max_single_position": self.ml_single_position.get().strip(),
             "parallel_workers": self.ml_parallel_workers.get().strip(),
+            "view_mode": self.ml_view_mode.get(),
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         tmp_path = ML_PORTFOLIO_SETTINGS_PATH.with_suffix(".tmp")
         with tmp_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
         tmp_path.replace(ML_PORTFOLIO_SETTINGS_PATH)
+
+    def _apply_ml_view_mode(self) -> None:
+        if not hasattr(self, "ml_tree"):
+            return
+        columns = self.ml_research_columns if self.ml_view_mode.get() == "研究模式" else self.ml_simple_columns
+        self.ml_tree.configure(displaycolumns=columns)
+        self._save_ml_portfolio_settings()
+
+    def open_latest_task_log(self) -> None:
+        directory = getattr(self, "latest_task_directory", None) or latest_task(engine.CACHE_DIR)
+        if directory is None:
+            messagebox.showinfo("任务日志", "尚无 ML/回测任务日志。")
+            return
+        log_path = Path(directory) / "job.log"
+        if not log_path.exists():
+            log_path.write_text("No worker output was recorded.\n", encoding="utf-8")
+        os.startfile(str(log_path))
 
     def _load_ml_stock_pool(self) -> dict[str, dict[str, Any]]:
         if not ML_STOCK_POOL_PATH.exists():
@@ -2099,6 +3019,9 @@ class StrategyDesktopApp(tk.Tk):
                 "name": str(item.get("name") or ""),
                 "shares": str(item.get("shares") or ""),
                 "cost": str(item.get("cost") or ""),
+                "available_shares": str(item.get("available_shares") or ""),
+                "today_bought_shares": str(item.get("today_bought_shares") or ""),
+                "buy_date": str(item.get("buy_date") or ""),
                 "added_at": str(item.get("added_at") or ""),
                 "updated_at": str(item.get("updated_at") or ""),
             }
@@ -2159,9 +3082,23 @@ class StrategyDesktopApp(tk.Tk):
         except Exception:
             code = str(symbol).strip()
         item = self._load_ml_stock_pool().get(code, {})
-        return {"shares": str(item.get("shares") or ""), "cost": str(item.get("cost") or "")}
+        return {
+            "shares": str(item.get("shares") or ""),
+            "cost": str(item.get("cost") or ""),
+            "available_shares": str(item.get("available_shares") or ""),
+            "today_bought_shares": str(item.get("today_bought_shares") or ""),
+            "buy_date": str(item.get("buy_date") or ""),
+        }
 
-    def _save_ml_stock_position(self, symbol: str, shares: str, cost: str) -> None:
+    def _save_ml_stock_position(
+        self,
+        symbol: str,
+        shares: str,
+        cost: str,
+        available_shares: str | None = None,
+        today_bought_shares: str | None = None,
+        buy_date: str | None = None,
+    ) -> None:
         try:
             code = engine.normalize_symbol(symbol)
         except Exception:
@@ -2176,6 +3113,9 @@ class StrategyDesktopApp(tk.Tk):
                 "name": engine.stock_display_name(code),
                 "shares": "",
                 "cost": "",
+                "available_shares": "",
+                "today_bought_shares": "",
+                "buy_date": "",
                 "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "updated_at": "",
             },
@@ -2183,6 +3123,12 @@ class StrategyDesktopApp(tk.Tk):
         item["name"] = str(item.get("name") or engine.stock_display_name(code))
         item["shares"] = shares.strip()
         item["cost"] = cost.strip()
+        if available_shares is not None:
+            item["available_shares"] = available_shares.strip()
+        if today_bought_shares is not None:
+            item["today_bought_shares"] = today_bought_shares.strip()
+        if buy_date is not None:
+            item["buy_date"] = buy_date.strip()
         item["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self._save_ml_stock_pool(pool)
 
@@ -2207,6 +3153,7 @@ class StrategyDesktopApp(tk.Tk):
                     "symbol": symbol,
                     "name": name,
                     "shares": shares,
+                    "available_shares": str(item.get("available_shares") or ""),
                     "cost": str(item.get("cost") or ""),
                     "added_at": str(item.get("added_at") or ""),
                     "updated_at": str(item.get("updated_at") or ""),
@@ -2450,6 +3397,7 @@ class StrategyDesktopApp(tk.Tk):
                         symbol,
                         row.get("name", ""),
                         row.get("shares", ""),
+                        row.get("available_shares", ""),
                         row.get("cost", ""),
                         row.get("added_at", ""),
                     )
@@ -2548,6 +3496,57 @@ class StrategyDesktopApp(tk.Tk):
             self.ml_pool_text.delete("1.0", tk.END)
         self.status_var.set(f"已加入/更新 {added} 只 ML 股票，并自动勾选")
 
+    def _add_all_a_share_symbols(self) -> None:
+        if getattr(self, "ml_add_all_stocks_running", False):
+            self.status_var.set("正在取得全部 A 股代码，请稍候")
+            return
+        if not messagebox.askyesno(
+            "全部 A 股入池",
+            "将把当前上市的全部 A 股加入 ML 股票池。\n"
+            "已有持股数、成本价和 T+1 信息不会被覆盖。\n\n"
+            "全量月度训练耗时和磁盘占用会明显增加，是否继续？",
+        ):
+            return
+        self.ml_add_all_stocks_running = True
+        if hasattr(self, "ml_add_all_stocks_button"):
+            self.ml_add_all_stocks_button.configure(state=tk.DISABLED)
+        self.status_var.set("正在获取全部 A 股代码，不会阻塞界面...")
+
+        def worker() -> None:
+            try:
+                universe, source = load_all_a_share_universe(engine.CACHE_DIR)
+                payload: tuple[pd.DataFrame | None, str, Exception | None] = (universe, source, None)
+            except Exception as exc:
+                payload = (None, "failed", exc)
+            try:
+                self.after(0, lambda: self._finish_add_all_a_share_symbols(*payload))
+            except tk.TclError:
+                return
+
+        threading.Thread(target=worker, name="ml-all-a-share-pool", daemon=True).start()
+
+    def _finish_add_all_a_share_symbols(
+        self,
+        universe: pd.DataFrame | None,
+        source: str,
+        error: Exception | None,
+    ) -> None:
+        self.ml_add_all_stocks_running = False
+        if hasattr(self, "ml_add_all_stocks_button"):
+            self.ml_add_all_stocks_button.configure(state=tk.NORMAL)
+        if error is not None or universe is None:
+            detail = _short_error_text(error) if error is not None else "未取得股票列表"
+            self.status_var.set(f"全部 A 股入池失败：{detail}")
+            messagebox.showerror("全部 A 股入池失败", detail)
+            return
+        pool, added, updated = merge_universe_into_pool(self._load_ml_stock_pool(), universe)
+        self._save_ml_stock_pool(pool)
+        self._render_saved_stock_picker()
+        self.status_var.set(
+            f"全部 A 股已入池：共 {len(universe)} 只，新增 {added}，补全名称 {updated}；"
+            f"来源 {source}。月度训练将读取整个股票池"
+        )
+
     def _selected_ml_pool_symbols_for_menu(self) -> list[str]:
         if not hasattr(self, "ml_saved_stock_tree"):
             return []
@@ -2568,7 +3567,7 @@ class StrategyDesktopApp(tk.Tk):
             self.ml_saved_stock_tree.focus(row_id)
         symbols = self._selected_ml_pool_symbols_for_menu()
         menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="填写持股/成本", command=self._edit_selected_ml_position, state=tk.NORMAL if symbols else tk.DISABLED)
+        menu.add_command(label="填写持股/T+1信息", command=self._edit_selected_ml_position, state=tk.NORMAL if symbols else tk.DISABLED)
         menu.add_separator()
         menu.add_command(label="勾选选中股票", command=lambda: self._set_selected_ml_checked(True), state=tk.NORMAL if symbols else tk.DISABLED)
         menu.add_command(label="取消勾选选中股票", command=lambda: self._set_selected_ml_checked(False), state=tk.NORMAL if symbols else tk.DISABLED)
@@ -2611,6 +3610,9 @@ class StrategyDesktopApp(tk.Tk):
 
         shares_var = tk.StringVar(value=str(position.get("shares", "")))
         cost_var = tk.StringVar(value=str(position.get("cost", "")))
+        available_var = tk.StringVar(value=str(position.get("available_shares", "")))
+        today_bought_var = tk.StringVar(value=str(position.get("today_bought_shares", "")))
+        buy_date_var = tk.StringVar(value=str(position.get("buy_date", "")))
 
         ttk.Label(popup, text=f"{symbol} {name}").grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(12, 8))
         ttk.Label(popup, text="持股数").grid(row=1, column=0, sticky="w", padx=(14, 8), pady=6)
@@ -2619,6 +3621,14 @@ class StrategyDesktopApp(tk.Tk):
         ttk.Label(popup, text="成本价").grid(row=2, column=0, sticky="w", padx=(14, 8), pady=6)
         cost_entry = ttk.Entry(popup, textvariable=cost_var, width=18)
         cost_entry.grid(row=2, column=1, sticky="ew", padx=(0, 14), pady=6)
+        ttk.Label(popup, text="可卖股数").grid(row=3, column=0, sticky="w", padx=(14, 8), pady=6)
+        available_entry = ttk.Entry(popup, textvariable=available_var, width=18)
+        available_entry.grid(row=3, column=1, sticky="ew", padx=(0, 14), pady=6)
+        ttk.Label(popup, text="今日买入股数").grid(row=4, column=0, sticky="w", padx=(14, 8), pady=6)
+        today_bought_entry = ttk.Entry(popup, textvariable=today_bought_var, width=18)
+        today_bought_entry.grid(row=4, column=1, sticky="ew", padx=(0, 14), pady=6)
+        ttk.Label(popup, text="买入日期").grid(row=5, column=0, sticky="w", padx=(14, 8), pady=6)
+        ttk.Entry(popup, textvariable=buy_date_var, width=18).grid(row=5, column=1, sticky="ew", padx=(0, 14), pady=6)
 
         def is_number_or_blank(value: str) -> bool:
             if not value:
@@ -2632,13 +3642,28 @@ class StrategyDesktopApp(tk.Tk):
         def save() -> None:
             shares = shares_var.get().strip()
             cost = cost_var.get().strip()
+            available = available_var.get().strip()
+            today_bought = today_bought_var.get().strip()
             if not is_number_or_blank(shares):
                 messagebox.showwarning("持仓格式不对", "持股数只能填数字，或留空。", parent=popup)
                 return
             if not is_number_or_blank(cost):
                 messagebox.showwarning("成本格式不对", "成本价只能填数字，或留空。", parent=popup)
                 return
-            self._save_ml_stock_position(symbol, shares, cost)
+            if not is_number_or_blank(available) or not is_number_or_blank(today_bought):
+                messagebox.showwarning("T+1 格式不对", "可卖股数和今日买入股数只能填数字，或留空。", parent=popup)
+                return
+            if available and shares and float(available) > float(shares):
+                messagebox.showwarning("可卖股数不对", "可卖股数不能大于总持股数。", parent=popup)
+                return
+            self._save_ml_stock_position(
+                symbol,
+                shares,
+                cost,
+                available,
+                today_bought,
+                buy_date_var.get().strip(),
+            )
             self._render_saved_stock_picker()
             if self.ml_saved_stock_tree.exists(symbol):
                 self.ml_saved_stock_tree.selection_set(symbol)
@@ -2647,7 +3672,7 @@ class StrategyDesktopApp(tk.Tk):
             popup.destroy()
 
         buttons = ttk.Frame(popup)
-        buttons.grid(row=3, column=0, columnspan=2, sticky="ew", padx=14, pady=(8, 14))
+        buttons.grid(row=6, column=0, columnspan=2, sticky="ew", padx=14, pady=(8, 14))
         buttons.columnconfigure(0, weight=1)
         buttons.columnconfigure(1, weight=1)
         ttk.Button(buttons, text="保存", command=save, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 4))
@@ -2907,8 +3932,6 @@ class StrategyDesktopApp(tk.Tk):
             symbol = str(focused or (selection[0] if selection else ""))
         shares = self.ml_shares.get().strip()
         cost = self.ml_buy_price.get().strip()
-        cash = self.ml_cash.get().strip()
-        target_position = self.ml_target_position.get().strip()
 
         def is_number_or_blank(value: str) -> bool:
             if not value:
@@ -2919,17 +3942,8 @@ class StrategyDesktopApp(tk.Tk):
             except ValueError:
                 return False
 
-        if not is_number_or_blank(cash) or (cash and float(cash) <= 0):
-            messagebox.showwarning("总资金格式不对", "总资金只能填大于 0 的数字。")
+        if not self._validate_and_save_ml_account_settings():
             return
-        if not is_number_or_blank(target_position):
-            messagebox.showwarning("总仓位格式不对", "目标总仓位只能填 0-100 的数字。")
-            return
-        if target_position:
-            target = float(target_position)
-            if target < 0 or target > 100:
-                messagebox.showwarning("总仓位格式不对", "目标总仓位只能填 0-100。")
-                return
         if not is_number_or_blank(shares):
             messagebox.showwarning("持仓格式不对", "持股数只能填数字，或留空。")
             return
@@ -2937,7 +3951,6 @@ class StrategyDesktopApp(tk.Tk):
             messagebox.showwarning("成本格式不对", "成本价只能填数字，或留空。")
             return
 
-        self._save_ml_portfolio_settings()
         if symbol:
             selected = list(self.ml_saved_stock_tree.selection()) if hasattr(self, "ml_saved_stock_tree") else []
             self._save_ml_stock_position(symbol, shares, cost)
@@ -2955,7 +3968,9 @@ class StrategyDesktopApp(tk.Tk):
 
     def _validate_and_save_ml_account_settings(self) -> bool:
         cash = self.ml_cash.get().strip()
+        total_asset = self.ml_total_asset.get().strip()
         target_position = self.ml_target_position.get().strip()
+        single_position = self.ml_single_position.get().strip()
         parallel_workers = self.ml_parallel_workers.get().strip()
 
         def is_number_or_blank(value: str) -> bool:
@@ -2967,8 +3982,14 @@ class StrategyDesktopApp(tk.Tk):
             except ValueError:
                 return False
 
-        if not is_number_or_blank(cash) or (cash and float(cash) <= 0):
-            messagebox.showwarning("总资金格式不对", "总资金只能填大于 0 的数字。")
+        if not is_number_or_blank(cash) or (cash and float(cash) < 0):
+            messagebox.showwarning("可用现金格式不对", "可用现金只能填不小于 0 的数字。")
+            return False
+        if not is_number_or_blank(total_asset) or (total_asset and float(total_asset) <= 0):
+            messagebox.showwarning("总资产格式不对", "总资产应留空自动估算，或填写大于 0 的数字。")
+            return False
+        if total_asset and cash and float(total_asset) < float(cash):
+            messagebox.showwarning("账户数据不一致", "总资产不能小于可用现金。")
             return False
         if not is_number_or_blank(target_position):
             messagebox.showwarning("总仓位格式不对", "目标总仓位只能填 0-100 的数字。")
@@ -2977,6 +3998,14 @@ class StrategyDesktopApp(tk.Tk):
             target = float(target_position)
             if target < 0 or target > 100:
                 messagebox.showwarning("总仓位格式不对", "目标总仓位只能填 0-100。")
+                return False
+        if not is_number_or_blank(single_position):
+            messagebox.showwarning("单股仓位格式不对", "单股最高仓位只能填 0-100 的数字。")
+            return False
+        if single_position:
+            single = float(single_position)
+            if single < 0 or single > 100:
+                messagebox.showwarning("单股仓位格式不对", "单股最高仓位只能填 0-100。")
                 return False
         try:
             workers = int(parallel_workers or ML_BATCH_PARALLEL_WORKERS)
@@ -3516,15 +4545,48 @@ class StrategyDesktopApp(tk.Tk):
         except ValueError:
             return 30
 
+    @staticmethod
+    def _is_a_share_trading_time(now: datetime | None = None) -> bool:
+        current = now or datetime.now()
+        if current.weekday() >= 5:
+            return False
+        clock = current.time()
+        return (
+            datetime.strptime("09:25", "%H:%M").time()
+            <= clock
+            <= datetime.strptime("11:35", "%H:%M").time()
+            or datetime.strptime("12:55", "%H:%M").time()
+            <= clock
+            <= datetime.strptime("15:05", "%H:%M").time()
+        )
+
     def _auto_monitor_tick(self) -> None:
-        self.after(self._monitor_interval_seconds() * 1000, self._auto_monitor_tick)
+        interval = self._monitor_interval_seconds()
+        trading_time = self._is_a_share_trading_time()
+        if not trading_time:
+            interval = max(interval, 300)
+        if self.monitor_running and self.selected_monitor_symbol and trading_time:
+            if self.monitor_worker and self.monitor_worker.is_alive():
+                self.monitor_schedule_var.set("上一轮仍在运行，本轮已跳过")
+            else:
+                self._start_monitor_worker(loop=False, symbols=[str(self.selected_monitor_symbol)])
+                next_at = time.strftime("%H:%M:%S", time.localtime(time.time() + interval))
+                self.monitor_schedule_var.set(f"已刷新；下次 {next_at}")
+        elif self.monitor_running and not trading_time:
+            next_at = time.strftime("%H:%M:%S", time.localtime(time.time() + interval))
+            self.monitor_schedule_var.set(f"非交易时段，自动请求暂停；{next_at} 再检查")
+        self.after(interval * 1000, self._auto_monitor_tick)
 
     def toggle_monitor(self) -> None:
         self.monitor_running = not self.monitor_running
         if hasattr(self, "monitor_start_button"):
-            self.monitor_start_button.configure(text="停止监控" if self.monitor_running else "开始监控")
+            self.monitor_start_button.configure(text="停止自动监控" if self.monitor_running else "开始自动监控")
         if self.monitor_running:
-            self._start_monitor_worker(loop=True)
+            self.monitor_schedule_var.set("自动监控已启动；休市时暂停网络请求")
+            if self.selected_monitor_symbol and self._is_a_share_trading_time():
+                self._start_monitor_worker(loop=False, symbols=[str(self.selected_monitor_symbol)])
+        else:
+            self.monitor_schedule_var.set("自动监控已停止")
 
     def refresh_monitor_once(self) -> None:
         if not self.selected_monitor_symbol:
@@ -3914,6 +4976,8 @@ class StrategyDesktopApp(tk.Tk):
             "start": self.ml_start.get().strip() or "20200101",
             "adjust": self.ml_adjust.get(),
             "cash": self.ml_cash.get().strip() or "100000",
+            "available_cash": self.ml_cash.get().strip() or "0",
+            "total_asset": self.ml_total_asset.get().strip(),
             "fee": self.ml_fee.get().strip() or "0.0003",
             "risk": self.ml_risk.get(),
             "horizon": self.ml_horizon.get(),
@@ -3924,6 +4988,7 @@ class StrategyDesktopApp(tk.Tk):
             "buy_date": self.ml_buy_date.get().strip(),
             "batch_symbols": "",
             "target_position": self.ml_target_position.get().strip() or "80",
+            "max_single_position": self.ml_single_position.get().strip() or "25",
             "positions": {},
             "refresh_external_data": "1" if self.ml_refresh_external_data.get() else "0",
             "_parallel_workers": self.ml_parallel_workers.get().strip() or str(ML_BATCH_PARALLEL_WORKERS),
@@ -3931,12 +4996,16 @@ class StrategyDesktopApp(tk.Tk):
 
     def _ml_positions_for_symbols(self, symbols: list[str]) -> dict[str, dict[str, str]]:
         positions: dict[str, dict[str, str]] = {}
+        pool = self._load_ml_stock_pool()
         for symbol in symbols:
-            position = self._ml_stock_position(symbol)
+            position = pool.get(symbol, {})
             positions[symbol] = {
                 "shares": str(position.get("shares", "")),
                 "cost": str(position.get("cost", "")),
-                "name": self._ml_stock_cached_name(symbol),
+                "available_shares": str(position.get("available_shares", "")),
+                "today_bought_shares": str(position.get("today_bought_shares", "")),
+                "buy_date": str(position.get("buy_date", "")),
+                "name": str(position.get("name") or self._saved_stock_name(symbol)),
             }
         return positions
 
@@ -4048,75 +5117,25 @@ class StrategyDesktopApp(tk.Tk):
             return form
 
         if target == "ml":
-            chunks = [symbols[index:index + ML_BATCH_CHUNK_SIZE] for index in range(0, len(symbols), ML_BATCH_CHUNK_SIZE)]
-            try:
-                requested_workers = int(float(base_form.get("_parallel_workers") or ML_BATCH_PARALLEL_WORKERS))
-            except Exception:
-                requested_workers = ML_BATCH_PARALLEL_WORKERS
-            max_workers = min(len(chunks), max(1, requested_workers))
-            completed = 0
-
-            def run_chunk(chunk: list[str]) -> dict[str, Any]:
-                chunk_form = base_form.copy()
-                chunk_form["symbol"] = chunk[0]
-                chunk_form["batch_symbols"] = " ".join(chunk)
-                chunk_form["_timeout_seconds"] = "240"
-                positions = base_form.get("positions", {})
-                if isinstance(positions, dict):
-                    chunk_form["positions"] = {symbol: positions.get(symbol, {}) for symbol in chunk}
-                payload = self._run_backtest_process(chunk_form)
-                if isinstance(payload, dict) and "results" in payload:
-                    return payload
-                return {"results": [payload], "errors": [], "total": len(chunk), "cancelled": False}
-
-            _ui_debug(
-                f"ml_chunked_start chunks={len(chunks)} chunk_size={ML_BATCH_CHUNK_SIZE} workers={max_workers}"
-            )
-            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ml-batch") as executor:
-                future_to_chunk = {executor.submit(run_chunk, chunk): chunk for chunk in chunks}
-                for future in as_completed(future_to_chunk):
-                    chunk = future_to_chunk[future]
-                    completed += 1
-                    if self.backtest_stop_event.is_set():
-                        cancelled = True
-                    try:
-                        if cancelled:
-                            future.cancel()
-                            continue
-                        payload = future.result()
-                        results.extend(payload.get("results") or [])
-                        errors.extend(str(item) for item in (payload.get("errors") or []))
-                    except BacktestCancelled:
-                        cancelled = True
-                    except Exception as exc:
-                        errors.append(f"{chunk[0]}..{chunk[-1]}: {_short_error_text(exc)}")
-                    self.queue.put(
-                        WorkerMessage(
-                            "status",
-                            payload=(
-                                f"ML分块进度 {completed}/{len(chunks)}："
-                                f"成功 {len(results)}，失败 {len(errors)}"
-                            ),
-                        )
-                    )
-            _ui_debug(
-                f"ml_chunked_done results={len(results)} errors={len(errors)} cancelled={cancelled}"
-            )
-            if cancelled and not results:
-                self.queue.put(WorkerMessage("backtest_cancelled"))
-            else:
-                self.queue.put(
-                    WorkerMessage(
-                        "backtest_batch",
-                        payload={
-                            "target": target,
-                            "results": results,
-                            "errors": errors,
-                            "total": len(symbols),
-                            "cancelled": cancelled,
-                        },
-                    )
+            batch_form = base_form.copy()
+            batch_form["symbol"] = symbols[0]
+            batch_form["batch_symbols"] = " ".join(symbols)
+            batch_form["_timeout_seconds"] = str(base_form.get("_timeout_seconds") or 600)
+            self.queue.put(
+                WorkerMessage(
+                    "status",
+                    payload=f"ML统一批量推理：读取 {len(symbols)} 只股票，最终只执行一次组合约束",
                 )
+            )
+            try:
+                payload = self._run_backtest_process(batch_form)
+                if not isinstance(payload, dict) or "results" not in payload:
+                    payload = {"results": [payload], "errors": [], "total": len(symbols), "cancelled": False}
+                self.queue.put(WorkerMessage("backtest_batch", payload={"target": target, **payload}))
+            except BacktestCancelled:
+                self.queue.put(WorkerMessage("backtest_cancelled"))
+            except Exception as exc:
+                self.queue.put(WorkerMessage("backtest_error", error=_short_error_text(exc)))
             return
 
         for idx, symbol in enumerate(symbols, start=1):
@@ -4150,67 +5169,79 @@ class StrategyDesktopApp(tk.Tk):
         timeout_seconds = int(float(form.get("_timeout_seconds") or (240 if form.get("_job") == "ml_predict" else 180)))
         worker_path = engine.ROOT / "desktop_worker.py"
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
-        with tempfile.TemporaryDirectory(prefix="strategy_worker_") as tmp_dir:
-            input_path = Path(tmp_dir) / "input.json"
-            output_path = Path(tmp_dir) / "output.pkl"
-            with input_path.open("w", encoding="utf-8") as handle:
-                json.dump(form, handle, ensure_ascii=False)
-            _ui_debug(f"run_process_popen symbol={form.get('symbol', '')} timeout={timeout_seconds}")
+        task = create_task(engine.CACHE_DIR, form)
+        self.latest_task_directory = task.directory
+        _ui_debug(f"run_process_popen job={task.job_id} symbol={form.get('symbol', '')} timeout={timeout_seconds}")
+        with task.log_path.open("a", encoding="utf-8") as log_handle:
             process = subprocess.Popen(
-                [sys.executable, str(worker_path), str(input_path), str(output_path)],
+                [sys.executable, str(worker_path), str(task.input_path), str(task.output_path)],
                 cwd=str(engine.ROOT),
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
                 creationflags=creationflags,
             )
-            _ui_debug(f"run_process_started pid={process.pid} symbol={form.get('symbol', '')}")
-            self.backtest_process = process
-            with self.backtest_process_lock:
-                self.backtest_processes.add(process)
-            started_at = time.monotonic()
-            try:
-                while process.poll() is None:
-                    if self.backtest_stop_event.is_set():
-                        process.terminate()
-                        try:
-                            process.wait(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                        raise BacktestCancelled()
-                    if time.monotonic() - started_at > timeout_seconds:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                        symbol = form.get("symbol", "")
-                        raise RuntimeError(
-                            f"{symbol} 所在评估分块超过 {timeout_seconds} 秒，已跳过该分块；"
-                            "其他分块仍会继续，通常是网络/代理或模型进程卡住。"
-                        )
-                    time.sleep(0.2)
+        _ui_debug(f"run_process_started job={task.job_id} pid={process.pid}")
+        self.backtest_process = process
+        with self.backtest_process_lock:
+            self.backtest_processes.add(process)
+        started_at = time.monotonic()
+        last_stage = ""
+        try:
+            while process.poll() is None:
                 if self.backtest_stop_event.is_set():
-                    raise BacktestCancelled()
-                if not output_path.exists():
-                    raise RuntimeError(f"评估子进程没有返回结果，退出码 {process.returncode}")
-                with output_path.open("rb") as handle:
-                    message = pickle.load(handle)
-                if isinstance(message, dict) and message.get("kind") == "ok":
-                    return message["payload"]
-                error = message.get("error") if isinstance(message, dict) else str(message)
-                raise RuntimeError(str(error))
-            finally:
-                if process.poll() is None:
                     process.terminate()
                     try:
-                        process.wait(timeout=1)
+                        process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         process.kill()
-                with self.backtest_process_lock:
-                    self.backtest_processes.discard(process)
-                    if self.backtest_process is process:
-                        self.backtest_process = None
+                    raise BacktestCancelled()
+                if time.monotonic() - started_at > timeout_seconds:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    symbol = form.get("symbol", "")
+                    raise RuntimeError(f"{symbol} evaluation exceeded {timeout_seconds} seconds")
+                try:
+                    lines = task.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    stages = [line.strip() for line in lines if line.strip().startswith("[stage ")]
+                    if stages and stages[-1] != last_stage:
+                        last_stage = stages[-1]
+                        self.queue.put(WorkerMessage("status", payload=last_stage))
+                except OSError:
+                    pass
+                time.sleep(0.2)
+            if self.backtest_stop_event.is_set():
+                raise BacktestCancelled()
+            if not task.output_path.exists():
+                raise RuntimeError(f"Worker returned no result; exit code {process.returncode}")
+            with task.output_path.open("rb") as handle:
+                message = pickle.load(handle)
+            if isinstance(message, dict) and message.get("kind") == "ok":
+                payload = message["payload"]
+                write_task_result(task, payload if isinstance(payload, dict) else {"result": payload})
+                return payload
+            error = message.get("error") if isinstance(message, dict) else str(message)
+            raise RuntimeError(str(error))
+        except BacktestCancelled as exc:
+            write_task_error(task, "cancelled", exc or "cancelled by user")
+            raise
+        except Exception as exc:
+            write_task_error(task, classify_task_error(exc), exc)
+            raise
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            with self.backtest_process_lock:
+                self.backtest_processes.discard(process)
+                if self.backtest_process is process:
+                    self.backtest_process = None
 
     def _backtest_form(self) -> dict[str, str]:
         return {
@@ -4577,7 +5608,11 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_prediction_results = {str(result["symbol"]): result}
         self._render_ml_prediction_table([result])
         self._select_ml_prediction(str(result["symbol"]), force=True)
-        self.status_var.set(f"ML持仓决策完成：{time.strftime('%H:%M:%S')}")
+        summary = result.get("task_summary", {}) if isinstance(result.get("task_summary"), dict) else {}
+        self.status_var.set(
+            f"ML持仓决策完成：模型 {summary.get('model_version', '-')}，数据 {summary.get('data_date', '-')}，"
+            f"缓存命中 {summary.get('cache_hits', 0)}，降级 {'是' if summary.get('degraded') else '否'}"
+        )
         _ui_debug("apply_ml_single_done")
 
     def _apply_ml_backtest_batch_result(self, payload: dict[str, Any]) -> None:
@@ -4586,6 +5621,7 @@ class StrategyDesktopApp(tk.Tk):
         errors: list[str] = list(payload.get("errors") or [])
         total = int(payload.get("total") or (len(results) + len(errors)))
         cancelled = bool(payload.get("cancelled"))
+        task_summary = payload.get("task_summary", {}) if isinstance(payload.get("task_summary"), dict) else {}
         if results:
             _ui_debug(f"apply_ml_batch_weight results={len(results)}")
             weighted = results if any(isinstance(item, dict) and "decision_row" in item for item in results) else self._apply_portfolio_weights(results)
@@ -4598,7 +5634,11 @@ class StrategyDesktopApp(tk.Tk):
             prefix = "ML持仓决策已终止" if cancelled else "ML持仓决策完成"
             error_hint = f"，失败 {len(errors)} 只，失败明细见状态栏" if errors else ""
             self.ml_summary_var.set(f"{prefix}：成功 {len(results)}/{total}{error_hint}，已按推荐动作和目标仓位排序")
-            self.status_var.set(f"{prefix}：成功 {len(results)} 只，失败 {len(errors)} 只")
+            self.status_var.set(
+                f"{prefix}：成功 {len(results)}，失败 {len(errors)}，缓存命中 {task_summary.get('cache_hits', 0)}，"
+                f"外部源失败 {task_summary.get('external_failures', 0)}；模型 {task_summary.get('model_version', '-')}，"
+                f"数据 {task_summary.get('data_date', '-')}，降级 {'是' if task_summary.get('degraded') else '否'}"
+            )
         elif cancelled:
             self.ml_summary_var.set("ML持仓决策已终止")
             self.status_var.set("ML持仓决策已终止，未产生新结果")
@@ -4763,20 +5803,22 @@ class StrategyDesktopApp(tk.Tk):
 
     def _display_ml_action(self, action: Any, shares: int) -> str:
         raw = str(action or "-").strip()
-        if raw in {"HOLD", "持有"}:
+        if raw in {"HOLD", "POLICY_HOLD", "POLICY_HOLD_LOT_LIMIT", "持有"}:
             return "持有/观察" if shares > 0 else "暂不买入"
-        if raw in {"ADD_25", "ADD_50", "加仓25%", "加仓50%"}:
+        if raw in {"ADD_25", "ADD_50", "ADD_CONSTRAINED", "POLICY_BUY_ADD", "加仓25%", "加仓50%"}:
             return "买入/试仓" if shares <= 0 else "买入/加仓"
         if raw == "ADD_LIMITED_LOW_CONFIDENCE":
             return "低置信度限量试仓" if shares <= 0 else "低置信度限量加仓"
         if raw in {"NO_TRADE", "NO_TRADE_LOW_CONFIDENCE"}:
             return "持有/观察" if shares > 0 else "暂不买入"
-        if raw == "SELL_AVAILABLE":
+        if raw in {"SELL_AVAILABLE", "POLICY_SELL_AVAILABLE"}:
             return "卖出全部可用股份"
-        if raw in {"SELL_ALL", "清仓"}:
+        if raw in {"SELL_ALL", "POLICY_SELL_CLEAR", "清仓"}:
             return "卖出/清仓" if shares > 0 else "暂不买入"
-        if raw in {"REDUCE_50", "REDUCE_25", "减仓50%", "减仓25%"}:
+        if raw in {"REDUCE_50", "REDUCE_25", "POLICY_REDUCE", "减仓50%", "减仓25%"}:
             return "卖出/减仓" if shares > 0 else "暂不买入"
+        if raw.startswith("NO_TRADE_"):
+            return "持有/观察（当前不可执行）" if shares > 0 else "暂不买入（当前不可执行）"
         return raw
 
     def _ml_period_advice(self, result: dict[str, Any], days: int | None = None) -> dict[str, Any]:
@@ -4948,6 +5990,7 @@ class StrategyDesktopApp(tk.Tk):
                 self._fmt_number(row.get("factor")),
                 self._fmt_number(row.get("confidence")),
                 self._fmt_number(row.get("completeness")),
+                row.get("data_status", "-"),
                 row.get("event_status", "-"),
                 row.get("main_driver", "-"),
                 advice.get("detail") or row.get("risk_detail", "-"),
@@ -5870,10 +6913,12 @@ class StrategyDesktopApp(tk.Tk):
         advice = self._ml_period_advice(result, days)
         decision_row = result.get("decision_row", {}) if isinstance(result.get("decision_row"), dict) else {}
         metadata = prediction.get("model_metadata", {}) if isinstance(prediction.get("model_metadata"), dict) else {}
+        drift_report = prediction.get("drift_report", {}) if isinstance(prediction.get("drift_report"), dict) else {}
         events = prediction.get("event_status", {}) if isinstance(prediction.get("event_status"), dict) else {}
         group_weights = prediction.get("group_weights", {}) if isinstance(prediction.get("group_weights"), dict) else {}
         group_predictions = prediction.get("group_predictions", {}) if isinstance(prediction.get("group_predictions"), dict) else {}
         availability = decision_row.get("data_availability", {}) if isinstance(decision_row.get("data_availability"), dict) else {}
+        source_details = decision_row.get("data_source_details", {}) if isinstance(decision_row.get("data_source_details"), dict) else {}
         positive = prediction.get("top_positive_factor_details", [])
         negative = prediction.get("top_negative_factor_details", [])
         training_window = metadata.get("latest_window", {}) if isinstance(metadata.get("latest_window"), dict) else {}
@@ -5886,6 +6931,7 @@ class StrategyDesktopApp(tk.Tk):
             f"最近样本外AUC：{self._fmt_number((prediction.get('metrics') or {}).get('auc'), digits=3) if isinstance(prediction.get('metrics'), dict) else '-'}",
             f"模型置信度：{self._fmt_number(float(prediction.get('confidence_score') or np.nan) * 100)}% ({prediction.get('confidence_level', '-')})",
             f"数据完整度：{self._fmt_number(float(prediction.get('data_completeness_score') or np.nan) * 100)}%",
+            f"模型漂移：{drift_report.get('status', decision_row.get('drift_status', '-'))}",
             f"外部数据：{self._ml_external_source_summary(result)}",
             f"持仓风险：{holding.get('level', '-')}",
             f"{period_label}建议：{self._display_ml_action(result.get('rebalance_action') or advice.get('action', '-'), self._ml_position_shares_for_result(result))}",
@@ -5908,7 +6954,17 @@ class StrategyDesktopApp(tk.Tk):
             f"新闻/公告：{news.get('detail', '-')}",
         ]
         lines.extend(["", "数据源状态："])
-        lines.extend(f"- {key}: {'可用' if value else '缺失/失败'}" for key, value in availability.items())
+        if source_details:
+            for key, detail in source_details.items():
+                if not isinstance(detail, dict):
+                    continue
+                role = "必需" if detail.get("required") else "可选"
+                status = "降级" if detail.get("degraded") else "可用" if detail.get("available") else "缺失"
+                latest = detail.get("latest_date") or "-"
+                missing = self._fmt_number(float(detail.get("missing_ratio", np.nan)) * 100)
+                lines.append(f"- {key}: {role} / {status}；最新 {latest}；缺失 {missing}%")
+        else:
+            lines.extend(f"- {key}: {'可用' if value else '缺失/失败'}" for key, value in availability.items())
         lines.extend(["", "事件门控："])
         lines.extend(f"- {key}: {value}" for key, value in events.items())
         lines.extend(["", "当前因子组权重 / 预测："])

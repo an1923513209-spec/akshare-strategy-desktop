@@ -129,3 +129,37 @@ def test_monthly_training_reads_current_nested_ml_pool(monkeypatch, tmp_path: Pa
     monkeypatch.setattr(monthly_train_desktop.engine, "CACHE_DIR", cache)
 
     assert monthly_train_desktop._pool_symbols() == [("002472", "双环传动")]
+
+
+def test_ml_policy_report_requires_the_complete_strict_oos_bundle(tmp_path: Path):
+    required = {
+        "ml_policy_backtest.parquet",
+        "ml_policy_stock_summary.csv",
+        "ml_policy_report.json",
+    }
+    assert set(desktop.StrategyDesktopApp._missing_ml_policy_report_files(tmp_path)) == required
+
+    for filename in required:
+        (tmp_path / filename).touch()
+
+    assert desktop.StrategyDesktopApp._missing_ml_policy_report_files(tmp_path) == []
+
+
+def test_monthly_training_progress_tracks_real_log_counters() -> None:
+    progress, stage = desktop._monthly_training_progress(["[market 5/10] 000001 A"])
+    assert progress == 15.5
+    assert "5/10" in stage
+
+    progress, stage = desktop._monthly_training_progress(
+        ["[market 10/10] 000001 A", "[panel] 1000 rows", "[training 2/4] window=2025-02"]
+    )
+    assert progress == 65.0
+    assert "2/4" in stage
+
+    progress, stage = desktop._monthly_training_progress(["[refit 1/2] all_factor"])
+    assert progress == 94.0
+    assert "all_factor" in stage
+
+    progress, stage = desktop._monthly_training_progress(["[backtest] report.parquet"])
+    assert progress == 100.0
+    assert "报告已生成" in stage

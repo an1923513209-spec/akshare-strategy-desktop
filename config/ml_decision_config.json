@@ -17,7 +17,7 @@
   "decision": {
     "start_date": "20200101",
     "training_universe": "custom",
-    "external_factor_lag": 1,
+    "external_factor_lag": 0,
     "down_threshold": -0.02,
     "utility_mode": "q10",
     "minimum_action_edge": 0.001,

@@ -192,6 +192,35 @@ def test_multi_stock_buys_do_not_exceed_shared_cash() -> None:
     buy_value = float((result["recommended_trade_shares"] * result["current_price"]).sum())
     assert buy_value <= 10000
     assert result.attrs["remaining_cash"] >= 0
+    assert float(result["recommended_target_weight"].sum()) <= 0.8 + 1e-9
+    assert float(result["recommended_target_weight"].max()) <= 0.5 + 1e-9
+
+
+def test_portfolio_constraints_do_not_change_raw_model_predictions() -> None:
+    table = pd.DataFrame(
+        {
+            "code": ["000001", "000002"],
+            "shares": [0, 0],
+            "current_price": [10.0, 20.0],
+            "industry": ["a", "b"],
+            "requested_action": ["ADD_25", "ADD_25"],
+            "effective_action": ["ADD_25", "ADD_25"],
+            "recommended_action": ["ADD_25", "ADD_25"],
+            "recommended_trade_shares": [1000, 500],
+            "utility_score": [2.0, 1.0],
+            "probability_up": [0.73, 0.61],
+            "expected_open_to_open_return": [0.021, 0.012],
+        }
+    )
+    before = table[["code", "probability_up", "expected_open_to_open_return"]].copy()
+    constrained = apply_account_constraints(
+        table,
+        AccountState(cash=5_000, total_asset=100_000, max_single_position_weight=0.2),
+    )
+    pd.testing.assert_frame_equal(
+        before.reset_index(drop=True),
+        constrained[["code", "probability_up", "expected_open_to_open_return"]].reset_index(drop=True),
+    )
 
 
 def test_shap_signs_drive_positive_and_negative_labels() -> None:

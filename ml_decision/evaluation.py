@@ -367,20 +367,36 @@ def evaluate_prediction_frame(
         "rank_ic": _safe_float(data[prediction_col].corr(data[target_col], method="spearman")),
     }
     daily_returns: list[float] = []
+    daily_gross_returns: list[float] = []
+    daily_top_bottom: list[float] = []
+    daily_ics: list[float] = []
     turnovers: list[float] = []
     previous: set[str] = set()
     for _date, group in data.groupby("date", sort=True):
         count = max(1, int(math.ceil(len(group) * 0.2)))
         selected = group.nlargest(count, prediction_col)
+        bottom = group.nsmallest(count, prediction_col)
         current = set(selected["code"].astype(str))
         turnover = 1.0 if not previous else 1.0 - len(current & previous) / max(len(current | previous), 1)
         previous = current
-        daily_returns.append(_safe_float(selected[target_col].mean()) - transaction_cost * turnover)
+        gross_return = _safe_float(selected[target_col].mean())
+        daily_gross_returns.append(gross_return)
+        daily_top_bottom.append(gross_return - _safe_float(bottom[target_col].mean()))
+        if len(group) >= 3:
+            daily_ics.append(_safe_float(group[prediction_col].corr(group[target_col], method="spearman")))
+        daily_returns.append(gross_return - transaction_cost * turnover)
         turnovers.append(turnover)
     net = pd.Series(daily_returns, dtype=float)
     metrics.update(
         {
             "net_return": _safe_float(net.mean()),
+            "gross_return": _safe_float(np.mean(daily_gross_returns)),
+            "top_bottom_return": _safe_float(np.mean(daily_top_bottom)),
+            "icir": (
+                _safe_float(np.mean(daily_ics) / np.std(daily_ics, ddof=1))
+                if len(daily_ics) > 1 and np.std(daily_ics, ddof=1) > 0
+                else np.nan
+            ),
             "sharpe": _sharpe(net),
             "max_drawdown": _max_drawdown(net),
             "turnover": _safe_float(np.mean(turnovers)),
