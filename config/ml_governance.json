@@ -1,0 +1,134 @@
+{
+  "target": {
+    "preserve_existing_if_valid": true,
+    "column": "next_open_to_next_open_return",
+    "type": "next_open_to_next_open_return"
+  },
+  "rolling_training": {
+    "train_months": 36,
+    "calibration_months": 2,
+    "validation_months": 1,
+    "test_months": 1,
+    "step_months": 1,
+    "purge_trading_days": 2,
+    "embargo_trading_days": 2
+  },
+  "retraining": {
+    "daily_prediction": true,
+    "model_retrain_frequency": "monthly",
+    "factor_review_frequency": "quarterly",
+    "weight_update_frequency": "monthly"
+  },
+  "app_ml": {
+    "prediction_mode": "production_model",
+    "allow_runtime_training": false,
+    "show_model_version": true,
+    "show_factor_explanations": true,
+    "show_data_completeness": true
+  },
+  "factor_evaluation": {
+    "minimum_cross_section_samples": 20,
+    "quantile_groups": 5,
+    "permutation_repeats": 30,
+    "include_transaction_costs": true,
+    "transaction_cost": 0.0016,
+    "evaluate_market_regimes": true,
+    "minimum_group_coverage": 0.03,
+    "minimum_group_non_null": 30
+  },
+  "control_features": [
+    "index_ret_1",
+    "index_ret_5",
+    "index_volatility_20",
+    "market_breadth",
+    "industry_ret_5",
+    "industry_ret_20",
+    "amount_ratio_20",
+    "market_rank_volatility_20"
+  ],
+  "dynamic_weights": {
+    "enabled": true,
+    "lookback_months": 12,
+    "minimum_oos_windows": 6,
+    "icir_weight": 0.60,
+    "net_sharpe_weight": 0.25,
+    "positive_window_ratio_weight": 0.15,
+    "shrink_to_equal_weight": 0.50,
+    "smoothing_alpha": 0.20,
+    "max_group_weight": 0.40,
+    "max_monthly_change": 0.05,
+    "minimum_group_weight": 0.00
+  },
+  "event_gating": {
+    "news_enabled": true,
+    "lhb_enabled": true,
+    "strong_news_quantile": 0.80,
+    "lhb_recent_window_days": 5
+  },
+  "confidence": {
+    "minimum_data_completeness": 0.70,
+    "low_confidence_position_multiplier": 0.50
+  },
+  "factor_policy": {
+    "enabled": true,
+    "max_single_weight": 0.25,
+    "weight_step": 0.05,
+    "transaction_cost": 0.0016,
+    "calibration_fraction": 0.70,
+    "embargo_trading_days": 2,
+    "max_calibration_symbols": 300,
+    "objective_drawdown_penalty": 0.50,
+    "objective_turnover_penalty": 0.10,
+    "parameter_grid": {
+      "probability_return_scale": [0.0, 0.01, 0.02],
+      "downside_penalty": [0.25, 0.50, 1.0],
+      "concentration_penalty": [0.0, 0.02, 0.05],
+      "minimum_utility_edge": [0.0, 0.0005]
+    }
+  },
+  "drift_monitoring": {
+    "minimum_realized_rows": 30,
+    "review_rank_ic_20d": -0.02,
+    "severe_rank_ic_20d": -0.08,
+    "review_calibration_bias_20d": 0.12,
+    "severe_calibration_bias_20d": 0.20,
+    "review_prediction_psi": 0.25,
+    "severe_prediction_psi": 0.50,
+    "review_feature_psi": 0.20,
+    "severe_feature_psi": 0.40,
+    "review_missing_rate_change": 0.15,
+    "severe_missing_rate_change": 0.30,
+    "review_return_prediction_bias": 0.03,
+    "severe_return_prediction_bias": 0.06,
+    "review_consecutive_nonpositive_ic_days": 5,
+    "severe_consecutive_nonpositive_ic_days": 10,
+    "review_confidence_multiplier": 0.70,
+    "severe_confidence_multiplier": 0.35
+  },
+  "model_promotion": {
+    "replacement": {
+      "comparison_recent_windows": 12,
+      "minimum_comparable_windows": 12,
+      "rank_ic_tolerance": 0.01,
+      "net_return_tolerance": 0.0005,
+      "max_drawdown_tolerance": 0.02,
+      "brier_tolerance": 0.005
+    },
+    "initial_production": {
+      "minimum_oos_windows": 12,
+      "minimum_auc": 0.52,
+      "minimum_rank_ic": 0.0,
+      "minimum_net_return": 0.0,
+      "minimum_max_drawdown": -0.15,
+      "maximum_brier": 0.255
+    }
+  },
+  "model": {
+    "random_state": 42,
+    "calibration_method": "sigmoid",
+    "use_shap": true,
+    "device": "cuda:0",
+    "host_cpu_threads": 2,
+    "require_cuda": true
+  }
+}

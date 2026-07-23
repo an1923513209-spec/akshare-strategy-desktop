@@ -7,7 +7,10 @@ matplotlib
 numpy
 optuna
 pandas
+pyarrow
 plotly
+pytest
 scikit-learn
+shap
 vectorbt
 xgboost

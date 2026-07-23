@@ -41,7 +41,7 @@ def main() -> None:
     market_df = pd.concat(frames, ignore_index=True)
     notes = []
     if not args.no_external:
-        external_df, notes = fetch_external_factor_frame(symbols)
+        external_df, notes = fetch_external_factor_frame(symbols, market_df=market_df)
         market_df = merge_external_factors(market_df, external_df)
 
     if args.holdings:

@@ -7,6 +7,10 @@ from collections.abc import Iterable
 import numpy as np
 import pandas as pd
 
+from .lhb_data import assert_no_forbidden_features
+from .cross_section import RANK_BASE_COLUMNS
+from .trading_rules import TRADE_RULE_COLUMNS
+
 
 REQUIRED_COLUMNS = ("date", "code", "open", "high", "low", "close", "volume", "amount")
 OPTIONAL_FACTOR_COLUMNS = (
@@ -48,6 +52,44 @@ OPTIONAL_FACTOR_COLUMNS = (
     "relative_industry_ret_20",
     "industry_rank_ret_5",
     "industry_rank_ret_20",
+    "lhb_flag",
+    "lhb_reason_count",
+    "lhb_net_buy_ratio",
+    "lhb_amount_ratio",
+    "lhb_buy_sell_balance",
+    "lhb_net_buy_float_cap_ratio",
+    "lhb_buy_log",
+    "lhb_sell_log",
+    "lhb_net_buy_signed_log",
+    "lhb_reason_price_deviation",
+    "lhb_reason_turnover",
+    "lhb_reason_amplitude",
+    "lhb_reason_abnormal",
+    "lhb_reason_three_day",
+    "lhb_reason_st",
+    "lhb_inst_buy_count",
+    "lhb_inst_sell_count",
+    "lhb_inst_net_buy_ratio",
+    "lhb_inst_buy_sell_balance",
+    "lhb_inst_net_buy_signed_log",
+    "lhb_inst_buy_flag",
+    "lhb_inst_sell_flag",
+    "lhb_inst_net_buy_positive",
+    "lhb_count_5d",
+    "lhb_count_10d",
+    "lhb_count_20d",
+    "lhb_count_60d",
+    "lhb_net_buy_sum_5d",
+    "lhb_net_buy_sum_10d",
+    "lhb_net_buy_sum_20d",
+    "lhb_inst_net_buy_sum_5d",
+    "lhb_inst_net_buy_sum_10d",
+    "lhb_inst_net_buy_sum_20d",
+    "days_since_last_lhb",
+    "consecutive_lhb_days",
+    "lhb_positive_count_5d",
+    "lhb_negative_count_5d",
+    "lhb_inst_positive_count_20d",
 )
 TARGET_COLUMNS = (
     "next_gap_return",
@@ -63,6 +105,52 @@ TARGET_COLUMNS = (
 MIN_FEATURE_NON_NULL = 30
 MIN_OPTIONAL_FACTOR_NON_NULL = 20
 MIN_OPTIONAL_FACTOR_COVERAGE = 0.03
+
+LHB_INITIAL_MODEL_FEATURES = {
+    "lhb_flag",
+    "lhb_reason_count",
+    "lhb_net_buy_ratio",
+    "lhb_amount_ratio",
+    "lhb_buy_sell_balance",
+    "lhb_net_buy_float_cap_ratio",
+    "lhb_inst_buy_count",
+    "lhb_inst_sell_count",
+    "lhb_inst_net_buy_ratio",
+    "lhb_inst_buy_sell_balance",
+    "lhb_count_5d",
+    "lhb_count_20d",
+    "lhb_net_buy_sum_5d",
+    "lhb_inst_net_buy_sum_20d",
+    "days_since_last_lhb",
+    "consecutive_lhb_days",
+}
+LHB_NON_MODEL_COLUMNS = {
+    "lhb_data_available",
+    "lhb_detail_available",
+    "lhb_inst_data_available",
+    "lhb_record_count",
+    "lhb_net_buy",
+    "lhb_buy",
+    "lhb_sell",
+    "lhb_amount",
+    "stock_total_amount",
+    "float_market_cap",
+    "lhb_inst_stock_total_amount",
+    "lhb_inst_buy_amount",
+    "lhb_inst_sell_amount",
+    "lhb_inst_net_buy",
+    "pct_change",
+    "turnover_rate",
+}
+DATA_AVAILABILITY_COLUMNS = {
+    "market_data_available",
+    "fund_flow_data_available",
+    "news_data_available",
+    "institution_data_available",
+    "lhb_data_available",
+    "lhb_detail_available",
+    "lhb_inst_data_available",
+}
 
 
 def normalize_market_df(market_df: pd.DataFrame) -> pd.DataFrame:
@@ -115,8 +203,10 @@ def build_features(
     market_df: pd.DataFrame,
     external_factor_lag: int = 1,
     include_optional: Iterable[str] = OPTIONAL_FACTOR_COLUMNS,
+    cross_sectional_rank_frame: pd.DataFrame | None = None,
+    allow_local_cross_sectional_ranks: bool = False,
 ) -> pd.DataFrame:
-    """Build time-safe technical, optional, market rank, and industry rank factors."""
+    """Build time-safe factors without inventing ranks from a desktop subset."""
     data = normalize_market_df(market_df)
     groups = []
     optional_cols = [column for column in include_optional if column in data.columns]
@@ -189,27 +279,45 @@ def build_features(
 
         for column in optional_cols:
             g[column] = pd.to_numeric(g[column], errors="coerce").shift(external_factor_lag)
+
+        # LHB data at date t is published after the close and may only predict
+        # t+1. The caller uses external_factor_lag=0 for an after-close model.
+        # Consolidate the frame after adding the optional source columns so
+        # sparse LHB interactions do not emit one fragmentation warning per stock.
+        g = g.copy()
+        if "lhb_net_buy_ratio" in g.columns:
+            g["lhb_net_buy_momentum_interaction"] = g["lhb_net_buy_ratio"] * g["ret_5"]
+            g["lhb_volume_interaction"] = g["lhb_net_buy_ratio"] * g["volume_ratio_5"]
+        if "lhb_inst_net_buy_ratio" in g.columns:
+            g["lhb_inst_breakout_interaction"] = g["lhb_inst_net_buy_ratio"] * g["breakout_gap_20"]
+            g["lhb_inst_rsi_interaction"] = g["lhb_inst_net_buy_ratio"] * g["rsi_14"]
+        if "lhb_count_20d" in g.columns:
+            g["lhb_count_momentum_interaction"] = g["lhb_count_20d"] * g["ret_20"]
         groups.append(g)
 
-    data = pd.concat(groups, ignore_index=True).sort_values(["date", "code"]).reset_index(drop=True)
-    rank_base = [
-        "ret_5",
-        "ret_20",
-        "volatility_20",
-        "breakout_gap_20",
-        "support_gap_20",
-        "bias_20",
-        "rsi_6",
-        "atr_pct",
-        "volume_ratio_20",
-        "amount_ratio_20",
-    ]
-    for column in rank_base:
-        if column not in data.columns:
-            continue
-        data[f"market_rank_{column}"] = data.groupby("date")[column].rank(pct=True)
-        if "industry" in data.columns:
-            data[f"industry_rank_{column}"] = data.groupby(["date", "industry"])[column].rank(pct=True)
+    data = pd.concat(groups, ignore_index=True).sort_values(["date", "code"]).reset_index(drop=True).copy()
+    if cross_sectional_rank_frame is not None and not cross_sectional_rank_frame.empty:
+        ranks = cross_sectional_rank_frame.copy()
+        ranks["date"] = pd.to_datetime(ranks["date"], errors="coerce").dt.normalize()
+        ranks["code"] = ranks["code"].astype(str).str.zfill(6)
+        rank_columns = [
+            column for column in ranks.columns
+            if column.startswith(("market_rank_", "industry_rank_"))
+        ]
+        data = data.drop(columns=[column for column in rank_columns if column in data.columns], errors="ignore")
+        data = data.merge(
+            ranks[["date", "code", *rank_columns]],
+            on=["date", "code"],
+            how="left",
+            validate="many_to_one",
+        )
+    elif allow_local_cross_sectional_ranks:
+        for column in RANK_BASE_COLUMNS:
+            if column not in data.columns:
+                continue
+            data[f"market_rank_{column}"] = data.groupby("date")[column].rank(pct=True)
+            if "industry" in data.columns:
+                data[f"industry_rank_{column}"] = data.groupby(["date", "industry"])[column].rank(pct=True)
     return data.replace([np.inf, -np.inf], np.nan)
 
 
@@ -236,7 +344,11 @@ def add_labels(feature_df: pd.DataFrame, round_trip_cost: float, down_threshold:
     return pd.concat(groups, ignore_index=True).replace([np.inf, -np.inf], np.nan)
 
 
-def feature_columns(dataset: pd.DataFrame, exclude: Iterable[str] = ()) -> list[str]:
+def feature_columns(
+    dataset: pd.DataFrame,
+    exclude: Iterable[str] = (),
+    selection_df: pd.DataFrame | None = None,
+) -> list[str]:
     """Return usable numeric model feature columns.
 
     Technical OHLCV factors are kept when they have enough historical samples.
@@ -255,19 +367,29 @@ def feature_columns(dataset: pd.DataFrame, exclude: Iterable[str] = ()) -> list[
         *REQUIRED_COLUMNS,
         *TARGET_COLUMNS,
         *exclude,
+        *DATA_AVAILABILITY_COLUMNS,
+        *LHB_NON_MODEL_COLUMNS,
+        *TRADE_RULE_COLUMNS,
     }
     columns = []
-    if "next_open_to_next_open_return" in dataset.columns:
-        train_mask = dataset["next_open_to_next_open_return"].notna()
+    selection = dataset if selection_df is None else selection_df
+    if "next_open_to_next_open_return" in selection.columns:
+        train_mask = selection["next_open_to_next_open_return"].notna()
     else:
-        train_mask = pd.Series(True, index=dataset.index)
+        train_mask = pd.Series(True, index=selection.index)
     train_rows = max(int(train_mask.sum()), 1)
     optional_set = set(OPTIONAL_FACTOR_COLUMNS)
     for column in dataset.columns:
         if column in blocked:
             continue
+        if column.startswith("lhb_") and column not in LHB_INITIAL_MODEL_FEATURES:
+            # Compute and retain the wider LHB library for research/output, but
+            # initially train only on the explicitly approved sparse features.
+            continue
         if pd.api.types.is_numeric_dtype(dataset[column]):
-            train_series = pd.to_numeric(dataset.loc[train_mask, column], errors="coerce")
+            if column not in selection.columns:
+                continue
+            train_series = pd.to_numeric(selection.loc[train_mask, column], errors="coerce")
             non_null = int(train_series.notna().sum())
             if non_null < MIN_FEATURE_NON_NULL:
                 continue
@@ -276,4 +398,5 @@ def feature_columns(dataset: pd.DataFrame, exclude: Iterable[str] = ()) -> list[
                 if non_null < MIN_OPTIONAL_FACTOR_NON_NULL or coverage < MIN_OPTIONAL_FACTOR_COVERAGE:
                     continue
             columns.append(column)
+    assert_no_forbidden_features(columns)
     return columns

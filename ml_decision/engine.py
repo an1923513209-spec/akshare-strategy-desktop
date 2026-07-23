@@ -9,11 +9,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .actions import Holding, choose_action, score_actions
+from .actions import Holding, apply_account_constraints, choose_action, score_actions
 from .config import AccountState, DecisionConfig
 from .data_sources import SourceNote
 from .features import add_labels, build_features, feature_columns, normalize_market_df
-from .models import NextSessionModel, PredictionPack
+from .models import NextSessionModel, PredictionPack, make_purged_date_splits
 
 
 LOGGER = logging.getLogger(__name__)
@@ -36,7 +36,22 @@ def prepare_holdings(holdings_df: pd.DataFrame, latest_market: pd.DataFrame, acc
     latest = latest_market.sort_values("date").groupby("code").tail(1)[["code", "close"]]
     data = data.merge(latest.rename(columns={"close": "latest_close"}), on="code", how="left")
     data["shares"] = pd.to_numeric(data.get("shares", 0), errors="coerce").fillna(0).astype(int)
-    data["available_shares"] = pd.to_numeric(data.get("available_shares", data["shares"]), errors="coerce").fillna(data["shares"]).astype(int)
+    if "available_shares" in data.columns:
+        raw_available = pd.to_numeric(data["available_shares"], errors="coerce")
+        data["available_shares_known"] = raw_available.notna()
+        data["available_shares"] = raw_available.fillna(0).clip(lower=0).astype(int)
+    else:
+        data["available_shares_known"] = False
+        data["available_shares"] = 0
+    data["available_shares"] = data[["available_shares", "shares"]].min(axis=1).astype(int)
+    raw_today_bought = (
+        data["today_bought_shares"]
+        if "today_bought_shares" in data.columns
+        else pd.Series(0, index=data.index, dtype="int64")
+    )
+    data["today_bought_shares"] = (
+        pd.to_numeric(raw_today_bought, errors="coerce").fillna(0).clip(lower=0).astype(int)
+    )
     data["average_cost"] = pd.to_numeric(data.get("average_cost", np.nan), errors="coerce")
     data["current_price"] = pd.to_numeric(data.get("current_price", data["latest_close"]), errors="coerce").fillna(data["latest_close"])
     data["position_value"] = pd.to_numeric(data.get("position_value", np.nan), errors="coerce")
@@ -72,12 +87,17 @@ def run_holding_decision(
     round_trip_cost = account.commission_rate * 2 + account.stamp_duty_rate + account.slippage_rate * 2 + config.profitable_cost_buffer
     features = build_features(market, external_factor_lag=config.external_factor_lag)
     dataset = add_labels(features, round_trip_cost=round_trip_cost, down_threshold=config.down_threshold)
-    columns = feature_columns(dataset, exclude=config.feature_exclude)
     valid = dataset.dropna(subset=["next_open_to_next_open_return"])
     if len(valid) < config.train_min_rows:
         raise ValueError(f"有效训练样本不足: {len(valid)} < {config.train_min_rows}")
 
-    model = NextSessionModel(calibration_method=config.calibration_method).fit(valid, columns)
+    splits = make_purged_date_splits(valid, purge_days=2)
+    train_selection = splits.frame(valid, "train")
+    columns = feature_columns(dataset, exclude=config.feature_exclude, selection_df=train_selection)
+    model = NextSessionModel(
+        calibration_method=config.calibration_method,
+        use_shap=config.use_shap,
+    ).fit(valid, columns, splits=splits)
     latest_market = features.sort_values("date").groupby("code").tail(1)
     holdings = prepare_holdings(holdings_df, latest_market, account)
     rows: list[dict[str, Any]] = []
@@ -98,13 +118,15 @@ def run_holding_decision(
                 current_price=float(holding_row.get("current_price") or latest_row["close"]),
                 position_value=float(holding_row.get("position_value") or 0),
                 position_weight=float(holding_row.get("position_weight") or 0),
+                available_shares_known=bool(holding_row.get("available_shares_known", False)),
+                today_bought_shares=int(holding_row.get("today_bought_shares") or 0),
                 holding_days=int(holding_row.get("holding_days") or 0),
                 industry=str(holding_row.get("industry") or latest_row.get("industry", "")),
                 name=str(holding_row.get("name") or ""),
             )
             scores = score_actions(holding, latest_row, prediction, account, config)
             selected = choose_action(scores, config.minimum_action_edge)
-            score_map = {score.action: score for score in scores}
+            score_map = {score.requested_action: score for score in scores}
             rows.append(_output_row(holding, latest_row, prediction, selected, score_map))
         except Exception as exc:
             LOGGER.warning("Skip ML decision for %s: %s", code, exc)
@@ -112,6 +134,7 @@ def run_holding_decision(
 
     table = pd.DataFrame(rows)
     if not table.empty:
+        table = apply_account_constraints(table, account)
         table = table.sort_values(["recommended_action", "utility_score"], ascending=[True, False]).reset_index(drop=True)
     return DecisionResult(table=table, metrics=model.metrics, feature_columns=columns, source_notes=source_notes)
 
@@ -139,9 +162,12 @@ def _output_row(
         "name": holding.name,
         "shares": holding.shares,
         "available_shares": holding.available_shares,
+        "available_shares_known": holding.available_shares_known,
+        "today_bought_shares": holding.today_bought_shares,
         "average_cost": holding.average_cost,
         "current_price": holding.current_price,
         "position_weight": holding.position_weight,
+        "industry": holding.industry,
         "unrealized_return": unrealized,
         "expected_gap_return": prediction.expected_gap_return,
         "expected_open_to_open_return": prediction.expected_open_to_open_return,
@@ -157,8 +183,11 @@ def _output_row(
         "reduce_25_score": _score(scores, "REDUCE_25"),
         "add_25_score": _score(scores, "ADD_25"),
         "add_50_score": _score(scores, "ADD_50"),
-        "recommended_action": selected.action,
+        "requested_action": selected.requested_action,
+        "effective_action": selected.effective_action,
+        "recommended_action": selected.effective_action,
         "recommended_trade_shares": selected.trade_shares,
+        "recommended_target_shares": selected.target_shares,
         "recommended_target_weight": selected.target_weight,
         "expected_net_pnl": selected.expected_net_pnl,
         "downside_risk": selected.downside_risk,
@@ -178,6 +207,7 @@ def _output_row(
         "institution_net_buy_amount": _latest_numeric(latest_row, "institution_net_buy_amount"),
         "top_positive_factors": ", ".join(prediction.top_positive_factors),
         "top_negative_factors": ", ".join(prediction.top_negative_factors),
+        "important_factors": ", ".join(prediction.important_factors),
         "reason": reason,
     }
 

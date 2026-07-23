@@ -1,0 +1,26 @@
+{
+  "reason_keywords": {
+    "lhb_reason_price_deviation": ["涨幅偏离", "跌幅偏离", "价格偏离", "偏离值"],
+    "lhb_reason_turnover": ["换手率", "换手"],
+    "lhb_reason_amplitude": ["振幅"],
+    "lhb_reason_abnormal": ["异常波动", "严重异常", "异常期间"],
+    "lhb_reason_three_day": ["连续三个交易日", "三个交易日内", "3个交易日"],
+    "lhb_reason_st": ["ST证券", "*ST", "退市整理"]
+  },
+  "forbidden_feature_keywords": [
+    "future",
+    "next",
+    "target",
+    "label",
+    "上榜后",
+    "未来",
+    "后续"
+  ],
+  "download": {
+    "start_date": "20200101",
+    "chunk_days": 30,
+    "max_retries": 3,
+    "retry_backoff_seconds": 1.5,
+    "request_interval_seconds": 0.35
+  }
+}
