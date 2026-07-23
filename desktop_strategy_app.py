@@ -14,6 +14,7 @@ import threading
 import time
 import traceback
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import app as engine
+from ths_strategy_catalog import build_ths_strategy_card
 from ml_decision import AccountState, DecisionConfig
 from ml_decision.accounting import resolve_account_snapshot, save_account_snapshot
 from ml_decision.trading_rules import drop_incomplete_latest_daily_bar
@@ -59,6 +61,7 @@ CONTENT_MIN_WIDTH = 1180
 CONTENT_MIN_HEIGHT = 650
 CONTENT_RESIZE_FINAL_DELAY_MS = 90
 ML_BATCH_PARALLEL_WORKERS = max(1, int(os.environ.get("ML_BATCH_PARALLEL_WORKERS", "3") or "3"))
+THS_BATCH_PARALLEL_WORKERS = max(1, int(os.environ.get("THS_BATCH_PARALLEL_WORKERS", "3") or "3"))
 
 try:
     import ttkbootstrap as tb
@@ -130,6 +133,8 @@ def _monthly_training_progress(lines: list[str]) -> tuple[float, str]:
             return min(28.0, 3.0 + 25.0 * current / total), f"读取行情 {current}/{total} {market.group(3)}".strip()
         if line.startswith("[market]"):
             return 2.0, "正在启动行情读取"
+        if line.startswith("[gpu]"):
+            return 1.5, f"CUDA 自检通过：{line.removeprefix('[gpu]').strip()}"
     return 1.0, "训练进程已启动，等待阶段信息"
 
 
@@ -157,6 +162,86 @@ def _scan_row_payload(row: pd.Series) -> dict[str, Any]:
         "final_value": float(row.get("final_value", np.nan)),
         "score": float(row.get("score", np.nan)),
     }
+
+
+def _record_is_ths_strategy(record: dict[str, Any]) -> bool:
+    result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
+    signal = result.get("daily_signal", {}) if isinstance(result.get("daily_signal"), dict) else {}
+    return str(signal.get("strategy_type", "")).startswith("ths_")
+
+
+def _set_ths_record_state(
+    cache: dict[str, dict[str, Any]],
+    key_text: str,
+    *,
+    selected: bool,
+    active: bool | None = None,
+) -> None:
+    record = cache.get(key_text)
+    if not isinstance(record, dict):
+        return
+    if active:
+        symbol = engine.normalize_symbol(str(record.get("symbol", "")))
+        for other_key, other_record in cache.items():
+            if other_key == key_text or not isinstance(other_record, dict):
+                continue
+            if not _record_is_ths_strategy(other_record):
+                continue
+            try:
+                other_symbol = engine.normalize_symbol(str(other_record.get("symbol", "")))
+            except Exception:
+                other_symbol = str(other_record.get("symbol", ""))
+            if other_symbol == symbol:
+                other_record["active_for_trading"] = False
+    record["ths_selected"] = bool(selected)
+    record["selected_for_left"] = bool(selected)
+    if active is not None:
+        record["active_for_trading"] = bool(active)
+
+
+def _ensure_ths_best_selected(
+    cache: dict[str, dict[str, Any]],
+) -> bool:
+    """Keep user selections and auto-select the best saved THS strategy per stock."""
+    grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for key_text, record in cache.items():
+        if not isinstance(record, dict) or not _record_is_ths_strategy(record):
+            continue
+        symbol = engine.normalize_symbol(str(record.get("symbol", "")))
+        grouped.setdefault(symbol, []).append((key_text, record))
+
+    def saved_score(item: tuple[str, dict[str, Any]]) -> float:
+        result = item[1].get("result", {}) if isinstance(item[1].get("result"), dict) else {}
+        best = result.get("best", {}) if isinstance(result.get("best"), dict) else {}
+        try:
+            return float(best.get("score", float("-inf")))
+        except (TypeError, ValueError):
+            return float("-inf")
+
+    changed = False
+    for rows in grouped.values():
+        selected_rows = [
+            item
+            for item in rows
+            if bool(item[1].get("ths_selected")) or bool(item[1].get("selected_for_left"))
+        ]
+        if not selected_rows:
+            selected_rows = [max(rows, key=saved_score)]
+
+        for _key_text, record in selected_rows:
+            if not bool(record.get("ths_selected")):
+                record["ths_selected"] = True
+                changed = True
+            if not bool(record.get("selected_for_left")):
+                record["selected_for_left"] = True
+                changed = True
+
+        active_selected = [item for item in selected_rows if bool(item[1].get("active_for_trading"))]
+        if not active_selected:
+            _active_key, active_record = max(selected_rows, key=saved_score)
+            active_record["active_for_trading"] = True
+            changed = True
+    return changed
 
 
 def _daily_gate_from_backtest_payload(
@@ -223,13 +308,32 @@ def _daily_gate_from_backtest_payload(
         },
     }
     engine.attach_ml_risk_snapshot(result, data, fast, slow, strategy_type, stop_line)
-    engine.DAILY_GATE_CACHE[cache_key] = result
+    isolated_workflow = str(form.get("_isolated_workflow", "")).strip().lower()
+    if not isolated_workflow:
+        engine.DAILY_GATE_CACHE[cache_key] = result
     if save_strategy:
-        if active_strategy:
-            result["_active_for_trading"] = True
-        if selected_for_left or active_strategy:
-            result["_selected_for_left"] = True
-        engine.save_daily_gate(cache_key, result)
+        if not isolated_workflow:
+            if active_strategy:
+                result["_active_for_trading"] = True
+            if selected_for_left or active_strategy:
+                result["_selected_for_left"] = True
+        key_text = engine.strategy_cache_key_text(cache_key)
+        old_record = engine.load_persistent_strategy_cache().get(key_text)
+        ths_selected = bool(old_record.get("ths_selected")) if isinstance(old_record, dict) else False
+        ths_active = bool(old_record.get("active_for_trading")) if isinstance(old_record, dict) else False
+        defer_cache_write = str(form.get("_defer_cache_write", "")).lower() in {"1", "true", "yes"}
+        engine.save_daily_gate(cache_key, result, persist=not defer_cache_write and isolated_workflow != "ths")
+        if isolated_workflow == "ths":
+            cache = engine.load_persistent_strategy_cache()
+            select_ths = ths_selected or selected_for_left or active_strategy
+            _set_ths_record_state(
+                cache,
+                key_text,
+                selected=select_ths,
+                active=True if active_strategy else (ths_active if select_ths else False),
+            )
+            if not defer_cache_write:
+                engine.save_persistent_strategy_cache()
     return result
 
 
@@ -249,12 +353,15 @@ def _save_all_scan_strategies_from_payload(
         fast_line, slow_line, entries, exits = engine.strategy_signals(data, fast, slow, horizon, strategy_type)
         save_form = form.copy()
         save_form["_save_strategy"] = "1"
+        save_form["_defer_cache_write"] = "1"
         if active_index is not None and index == active_index:
             save_form["_active_strategy"] = "1"
             save_form["_selected_for_left"] = "1"
         gate = _daily_gate_from_backtest_payload(save_form, symbol, data, row, fast_line, slow_line, entries, exits, horizon)
         if index == active_index:
             active_gate = gate
+    if str(form.get("_defer_process_cache_write", "")).lower() not in {"1", "true", "yes"}:
+        engine.save_persistent_strategy_cache()
     return active_gate
 
 
@@ -282,7 +389,9 @@ def _compute_backtest_payload(form: dict[str, str]) -> dict[str, Any]:
     trades = portfolio.trades.records_readable
     equity = portfolio.value()
     if str(form.get("_save_all_strategies", "")).lower() in {"1", "true", "yes"}:
-        gate = _save_all_scan_strategies_from_payload(form, symbol, data, scan, horizon, None)
+        isolated_workflow = str(form.get("_isolated_workflow", "")).strip().lower()
+        active_index = scan.index[0] if isolated_workflow == "ths" and not scan.empty else None
+        gate = _save_all_scan_strategies_from_payload(form, symbol, data, scan, horizon, active_index)
         if gate is None:
             gate = _daily_gate_from_backtest_payload(form, symbol, data, best, fast_line, slow_line, entries, exits, horizon)
     else:
@@ -304,6 +413,132 @@ def _compute_backtest_payload(form: dict[str, str]) -> dict[str, Any]:
         "strategy_type": strategy_type,
         "daily_gate": gate,
     }
+
+
+def _build_ths_monitor_item(task: dict[str, str]) -> dict[str, Any]:
+    """Build one isolated THS intraday result plus its latest daily signal chart."""
+    key_text = str(task.get("strategy_key", ""))
+    cache = engine.load_persistent_strategy_cache()
+    record = cache.get(key_text)
+    if not isinstance(record, dict) or not _record_is_ths_strategy(record):
+        raise ValueError("同花顺监控策略不存在或已取消加星")
+    if not bool(record.get("ths_selected")):
+        raise ValueError("该同花顺策略未加星")
+
+    symbol = engine.normalize_symbol(str(record.get("symbol") or task.get("symbol", "")))
+    params = record.get("params", {}) if isinstance(record.get("params"), dict) else {}
+    result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
+    best_data = result.get("best", {}) if isinstance(result.get("best"), dict) else {}
+    signal = result.get("daily_signal", {}) if isinstance(result.get("daily_signal"), dict) else {}
+    strategy_type = str(signal.get("strategy_type") or best_data.get("strategy_type") or "")
+    if not strategy_type.startswith("ths_"):
+        raise ValueError("所选策略不是同花顺策略")
+    fast = int(float(signal.get("fast") or best_data.get("fast") or 5))
+    slow = int(float(signal.get("slow") or best_data.get("slow") or 20))
+    horizon = str(params.get("mode", "short")).split(":", 1)[0]
+    if horizon not in engine.STRATEGY_GRIDS:
+        horizon = "short"
+    start = str(params.get("start") or "20200101")
+    adjust = str(params.get("adjust") or "qfq")
+    cash = float(params.get("cash") or 100000)
+    fee = float(params.get("fee") or 0.0003)
+
+    data = drop_incomplete_latest_daily_bar(engine.cached_data(symbol, start, adjust).copy())
+    if data.empty:
+        raise ValueError("没有可用日线数据")
+    fast_line, slow_line, entries, exits = engine.strategy_signals(
+        data, fast, slow, horizon, strategy_type
+    )
+    best_row = pd.Series(
+        {
+            **best_data,
+            "strategy_type": strategy_type,
+            "strategy_label": engine.STRATEGY_TYPES.get(strategy_type, strategy_type),
+            "fast": fast,
+            "slow": slow,
+        }
+    )
+    gate_form = {
+        "symbol": symbol,
+        "start": start,
+        "adjust": adjust,
+        "cash": str(cash),
+        "fee": str(fee),
+        "risk": "normal",
+        "horizon": horizon,
+        "strategy_type": strategy_type,
+        "_isolated_workflow": "ths_monitor",
+    }
+    daily_gate = _daily_gate_from_backtest_payload(
+        gate_form,
+        symbol,
+        data,
+        best_row,
+        fast_line,
+        slow_line,
+        entries,
+        exits,
+        horizon,
+    )
+    item = engine.build_monitor_item(
+        symbol,
+        str(task.get("period") or "5"),
+        str(task.get("shares") or ""),
+        str(task.get("cost") or ""),
+        key_text,
+        strategy_type=strategy_type,
+        exclude_strategy_type=None,
+        daily_override=daily_gate,
+    )
+
+    daily_frame = pd.DataFrame(
+        {"price": data["Close"], "fast": fast_line, "slow": slow_line}
+    ).dropna().tail(240)
+    entry_events = entries.fillna(False) & ~entries.fillna(False).shift(1, fill_value=False)
+    exit_events = exits.fillna(False) & ~exits.fillna(False).shift(1, fill_value=False)
+    points = [
+        {
+            "time": pd.Timestamp(index).strftime("%Y-%m-%d"),
+            "price": round(float(row["price"]), 3),
+            "fast": round(float(row["fast"]), 3),
+            "slow": round(float(row["slow"]), 3),
+        }
+        for index, row in daily_frame.iterrows()
+    ]
+    visible_index = set(daily_frame.index)
+    buys = [
+        {
+            "time": pd.Timestamp(index).strftime("%Y-%m-%d"),
+            "price": float(data.at[index, "Close"]),
+        }
+        for index in data.index[entry_events]
+        if index in visible_index
+    ]
+    sells = [
+        {
+            "time": pd.Timestamp(index).strftime("%Y-%m-%d"),
+            "price": float(data.at[index, "Close"]),
+        }
+        for index in data.index[exit_events]
+        if index in visible_index
+    ]
+    if points and str(item.get("action_code")) in {"buy", "sell"}:
+        marker = {"time": points[-1]["time"], "price": points[-1]["price"], "intraday": True}
+        target = buys if item["action_code"] == "buy" else sells
+        if not any(row.get("time") == marker["time"] for row in target):
+            target.append(marker)
+
+    label = engine.STRATEGY_TYPES.get(strategy_type, strategy_type)
+    item["strategy_key"] = key_text
+    item["shares"] = str(task.get("shares") or "")
+    item["cost"] = str(task.get("cost") or "")
+    item["daily_chart"] = {
+        "points": points,
+        "buys": buys,
+        "sells": sells,
+        "title": f"{symbol} {item.get('name', '')} {label} {fast}/{slow} 日线买卖点",
+    }
+    return item
 
 
 def _strategy_row_from_portfolio(
@@ -1014,6 +1249,11 @@ class StrategyDesktopApp(tk.Tk):
         self.monitor_last_symbol_refresh: dict[str, float] = {}
         self.monitor_schedule_var = tk.StringVar(value="自动监控未启动")
         self.monitor_select_job: str | None = None
+        self.ths_monitor_running = False
+        self.ths_monitor_worker: threading.Thread | None = None
+        self.ths_monitor_items: dict[str, dict[str, Any]] = {}
+        self.ths_monitor_selected_key: str | None = None
+        self.ths_monitor_alert_state: dict[str, str] = {}
         self.ml_monitor_running = False
         self.ml_monitor_worker: threading.Thread | None = None
         self.ml_monitor_items: dict[str, dict[str, Any]] = {}
@@ -1033,10 +1273,21 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_sort_reverse = False
         self.selected_ml_prediction_symbol: str | None = None
         self.selected_scan_rank: int = 0
+        self.ths_selected_scan_rank: int = 0
         self.backtest_checked_symbols: set[str] = set()
+        self.ths_checked_symbols: set[str] = set()
         self.ml_checked_symbols: set[str] = set()
         self.backtest_chart_payload: dict[str, Any] | None = None
+        self.ths_backtest_result: dict[str, Any] | None = None
+        self.ths_backtest_results: dict[str, dict[str, Any]] = {}
+        self.ths_selected_symbol: str | None = None
+        self.ths_saved_scan_keys: dict[int, str] = {}
+        self.ths_cache_preview_key: str | None = None
+        self.ths_cache_preview_worker: threading.Thread | None = None
+        self.ths_history_search_job: str | None = None
+        self.ths_backtest_chart_payload: dict[str, Any] | None = None
         self.backtest_zoom: tuple[int, int] | None = None
+        self.ths_backtest_zoom: tuple[int, int] | None = None
         self.backtest_drag_start_x: int | None = None
         self.backtest_drag_rect: int | None = None
         self.backtest_pan_start_x: int | None = None
@@ -1047,6 +1298,7 @@ class StrategyDesktopApp(tk.Tk):
         self.ml_monitor_resize_job: str | None = None
         self.backtest_fullscreen_window: tk.Toplevel | None = None
         self.backtest_fullscreen_canvas: tk.Canvas | None = None
+        self.backtest_fullscreen_payload: dict[str, Any] | None = None
         self.backtest_fullscreen_zoom: tuple[int, int] | None = None
         self.backtest_fullscreen_drag_start_x: int | None = None
         self.backtest_fullscreen_drag_rect: int | None = None
@@ -1099,18 +1351,24 @@ class StrategyDesktopApp(tk.Tk):
         self.notebook.bind("<Configure>", self._on_notebook_configure)
 
         self.monitor_tab = ttk.Frame(self.notebook, padding=12)
+        self.ths_monitor_tab = ttk.Frame(self.notebook, padding=12)
         self.backtest_tab = ttk.Frame(self.notebook, padding=12)
+        self.ths_tab = ttk.Frame(self.notebook, padding=12)
         self.ml_tab = ttk.Frame(self.notebook, padding=12)
         self.ml_monitor_tab = ttk.Frame(self.notebook, padding=12)
         self.ml_policy_backtest_tab = ttk.Frame(self.notebook, padding=12)
         self.model_diagnostics_tab = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(self.backtest_tab, text="传统回测")
         self.notebook.add(self.monitor_tab, text="盘中监控")
+        self.notebook.add(self.ths_tab, text="同花顺策略")
+        self.notebook.add(self.ths_monitor_tab, text="同花顺盘中监控")
         self.notebook.add(self.ml_tab, text="ML持仓决策")
         self.notebook.add(self.ml_monitor_tab, text="ML盘中监控")
 
         self._build_backtest_tab()
+        self._build_ths_tab()
         self._build_monitor_tab()
+        self._build_ths_monitor_tab()
         self._build_ml_tab()
         self._build_ml_monitor_tab()
         self.notebook.add(self.ml_policy_backtest_tab, text="ML因子回测")
@@ -1348,6 +1606,159 @@ class StrategyDesktopApp(tk.Tk):
         self._render_saved_stock_picker()
         self._render_monitor_detail(None)
 
+    def _build_ths_monitor_tab(self) -> None:
+        tab = self.ths_monitor_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        top.columnconfigure(5, weight=1)
+        self.ths_monitor_period = tk.StringVar(value="5")
+        self.ths_monitor_interval = tk.StringVar(value="30")
+        self.ths_monitor_schedule = tk.StringVar(value="自动监控未启动")
+        self._labeled_combo(top, "周期", self.ths_monitor_period, ("1", "5", "15"), 0)
+        self._labeled_entry(top, "刷新秒", self.ths_monitor_interval, 1, width=8)
+        ttk.Button(
+            top,
+            text="刷新全部",
+            command=self.refresh_ths_monitor_once,
+            style="Primary.TButton",
+        ).grid(row=1, column=2, padx=(0, 8))
+        self.ths_monitor_start_button = ttk.Button(
+            top, text="开始自动监控", command=self.toggle_ths_monitor
+        )
+        self.ths_monitor_start_button.grid(row=1, column=3, padx=(0, 8))
+        ttk.Label(top, textvariable=self.ths_monitor_schedule, foreground="#607086").grid(
+            row=0, column=4, columnspan=2, sticky="w"
+        )
+        ttk.Label(
+            top,
+            text="仅监控同花顺页已加星策略；空仓提示买入，持仓提示卖出，触发提醒自动前置。",
+            foreground="#607086",
+        ).grid(row=1, column=4, columnspan=2, sticky="w")
+
+        body = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
+        body.grid(row=1, column=0, sticky="nsew")
+        left = ttk.Frame(body)
+        right = ttk.Frame(body)
+        body.add(left, weight=2)
+        body.add(right, weight=5)
+
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
+        stock_box = ttk.LabelFrame(left, text="同花顺加星策略")
+        stock_box.grid(row=0, column=0, sticky="nsew")
+        stock_box.columnconfigure(0, weight=1)
+        stock_box.rowconfigure(0, weight=1)
+        columns = ("symbol", "name", "action", "price", "shares", "cost", "strategy")
+        self.ths_monitor_tree = ttk.Treeview(
+            stock_box, columns=columns, show="headings", height=18, selectmode="browse"
+        )
+        self._setup_tree(
+            self.ths_monitor_tree,
+            {
+                "symbol": "代码",
+                "name": "名称",
+                "action": "提醒",
+                "price": "价格",
+                "shares": "持股",
+                "cost": "成本",
+                "strategy": "同花顺策略",
+            },
+            {
+                "symbol": 82,
+                "name": 100,
+                "action": 118,
+                "price": 72,
+                "shares": 70,
+                "cost": 70,
+                "strategy": 170,
+            },
+        )
+        self.ths_monitor_tree.tag_configure("alert_buy", foreground="#087a52")
+        self.ths_monitor_tree.tag_configure("alert_sell", foreground="#b42318")
+        self.ths_monitor_tree.grid(row=0, column=0, sticky="nsew")
+        ths_monitor_scroll = ttk.Scrollbar(
+            stock_box, orient=tk.VERTICAL, command=self.ths_monitor_tree.yview
+        )
+        ths_monitor_scroll.grid(row=0, column=1, sticky="ns")
+        self.ths_monitor_tree.configure(yscrollcommand=ths_monitor_scroll.set)
+        self.ths_monitor_tree.bind("<<TreeviewSelect>>", self._on_ths_monitor_select)
+
+        position_box = ttk.LabelFrame(left, text="选中策略持仓")
+        position_box.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        position_box.columnconfigure(1, weight=1)
+        position_box.columnconfigure(3, weight=1)
+        self.ths_monitor_shares = tk.StringVar(value="")
+        self.ths_monitor_cost = tk.StringVar(value="")
+        ttk.Label(position_box, text="持股数").grid(row=0, column=0, padx=(8, 6), pady=8)
+        ttk.Entry(position_box, textvariable=self.ths_monitor_shares, width=12).grid(
+            row=0, column=1, sticky="ew", pady=8
+        )
+        ttk.Label(position_box, text="成本价").grid(row=0, column=2, padx=(10, 6), pady=8)
+        ttk.Entry(position_box, textvariable=self.ths_monitor_cost, width=12).grid(
+            row=0, column=3, sticky="ew", pady=8
+        )
+        ttk.Button(
+            position_box,
+            text="保存持仓",
+            command=self._save_selected_ths_monitor_position,
+            style="Primary.TButton",
+        ).grid(row=0, column=4, padx=8, pady=8)
+
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+        detail_box = ttk.LabelFrame(right, text="同花顺盘中提醒")
+        detail_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        detail_box.columnconfigure(0, weight=1)
+        self.ths_monitor_detail = tk.Text(
+            detail_box,
+            height=5,
+            wrap="word",
+            background="#ffffff",
+            foreground="#14213d",
+            relief=tk.FLAT,
+            padx=12,
+            pady=8,
+        )
+        self.ths_monitor_detail.grid(row=0, column=0, sticky="ew")
+        self.ths_monitor_detail.configure(state=tk.DISABLED)
+
+        charts = ttk.PanedWindow(right, orient=tk.VERTICAL)
+        charts.grid(row=1, column=0, sticky="nsew")
+        daily_box = ttk.LabelFrame(charts, text="日线策略买卖点（含当天提醒标记）")
+        minute_box = ttk.LabelFrame(charts, text="当日盘中曲线")
+        charts.add(daily_box, weight=3)
+        charts.add(minute_box, weight=2)
+        for frame in (daily_box, minute_box):
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(0, weight=1)
+        self.ths_monitor_daily_canvas = tk.Canvas(
+            daily_box,
+            height=330,
+            background="#fbfdff",
+            highlightthickness=1,
+            highlightbackground="#d8e0ea",
+        )
+        self.ths_monitor_daily_canvas.grid(row=0, column=0, sticky="nsew")
+        self.ths_monitor_minute_canvas = tk.Canvas(
+            minute_box,
+            height=260,
+            background="#fbfdff",
+            highlightthickness=1,
+            highlightbackground="#d8e0ea",
+        )
+        self.ths_monitor_minute_canvas.grid(row=0, column=0, sticky="nsew")
+        self.ths_monitor_daily_canvas.bind(
+            "<Configure>", lambda _event: self._draw_selected_ths_monitor_charts()
+        )
+        self.ths_monitor_minute_canvas.bind(
+            "<Configure>", lambda _event: self._draw_selected_ths_monitor_charts()
+        )
+        self._render_ths_monitor_table()
+        self._render_ths_monitor_detail(None)
+
     def _build_backtest_tab(self) -> None:
         self.backtest_tab.columnconfigure(0, weight=1)
         self.backtest_tab.rowconfigure(2, weight=1)
@@ -1523,6 +1934,217 @@ class StrategyDesktopApp(tk.Tk):
         self.saved_bt_context_menu.add_command(label="查看策略说明", command=self._show_saved_strategy_description_popup)
         self.saved_bt_context_menu.add_command(label="加入左侧并设为使用策略", command=self._add_right_saved_strategy_to_left)
         self._render_strategy_cache_list()
+
+    def _build_ths_tab(self) -> None:
+        self.ths_tab.columnconfigure(0, weight=1)
+        self.ths_tab.rowconfigure(2, weight=1)
+
+        top = ttk.Frame(self.ths_tab)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for idx in range(13):
+            top.columnconfigure(idx, weight=0)
+        top.columnconfigure(13, weight=1)
+
+        self.ths_symbol = tk.StringVar(value="002472")
+        self.ths_start = tk.StringVar(value="20200101")
+        self.ths_adjust = tk.StringVar(value="qfq")
+        self.ths_cash = tk.StringVar(value="100000")
+        self.ths_fee = tk.StringVar(value="0.0003")
+        self.ths_risk = tk.StringVar(value="normal")
+        self.ths_horizon = tk.StringVar(value="short")
+        self.ths_strategy = tk.StringVar(value="ths_hybrid")
+        self.ths_shares = tk.StringVar(value="0")
+        self.ths_buy_price = tk.StringVar(value="")
+        self.ths_parallel_workers = tk.StringVar(value=str(THS_BATCH_PARALLEL_WORKERS))
+
+        self._labeled_entry(top, "股票", self.ths_symbol, 0, width=14)
+        self._labeled_entry(top, "开始日期", self.ths_start, 1, width=10)
+        self._labeled_combo(top, "复权", self.ths_adjust, ("qfq", "", "hfq"), 2)
+        self._labeled_entry(top, "资金", self.ths_cash, 3, width=10)
+        self._labeled_entry(top, "手续费", self.ths_fee, 4, width=10)
+        self._labeled_combo(top, "风险", self.ths_risk, ("normal", "tight", "loose"), 5)
+        self._labeled_combo(top, "周期", self.ths_horizon, ("short", "swing", "trend"), 6)
+        self._labeled_combo(
+            top,
+            "策略族",
+            self.ths_strategy,
+            ("ths_hybrid", "ths_auto", "ths_indicator", "ths_oscillator", "ths_volume_price", "ths_capital", "ths_lhb"),
+            7,
+        )
+        self._labeled_entry(top, "持股数", self.ths_shares, 8, width=8)
+        self._labeled_entry(top, "成本价", self.ths_buy_price, 9, width=8)
+        self._labeled_entry(top, "并行数", self.ths_parallel_workers, 10, width=7)
+        ttk.Button(top, text="开始同花顺策略回测", command=self.run_ths_backtest, style="Primary.TButton").grid(row=1, column=11, sticky="w", padx=(8, 0))
+        self.ths_stop_button = ttk.Button(top, text="终止回测", command=self.stop_backtest, state=tk.DISABLED)
+        self.ths_stop_button.grid(row=1, column=12, sticky="w", padx=(8, 0))
+
+        self.ths_summary_var = tk.StringVar(
+            value="同花顺策略页独立扫描常见指标、量价、资金、龙虎榜/机构和混合策略；默认优先跑混合策略。"
+        )
+        ttk.Label(self.ths_tab, textvariable=self.ths_summary_var, anchor="w").grid(row=1, column=0, sticky="ew", pady=(0, 8))
+
+        body = ttk.PanedWindow(self.ths_tab, orient=tk.HORIZONTAL)
+        body.grid(row=2, column=0, sticky="nsew")
+        left_frame = ttk.Frame(body)
+        right_frame = ttk.Frame(body)
+        body.add(left_frame, weight=1)
+        body.add(right_frame, weight=5)
+
+        left_frame.columnconfigure(0, weight=1)
+        left_frame.rowconfigure(1, weight=3)
+        left_frame.rowconfigure(3, weight=1)
+        input_box = ttk.LabelFrame(left_frame, text="批量股票代码")
+        input_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        input_box.columnconfigure(0, weight=1)
+        self.ths_batch_text = tk.Text(input_box, height=7, wrap="word", background="#ffffff", foreground="#14213d", relief=tk.FLAT, padx=8, pady=6)
+        self.ths_batch_text.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+        input_buttons = ttk.Frame(input_box)
+        input_buttons.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        input_buttons.columnconfigure(0, weight=1)
+        input_buttons.columnconfigure(1, weight=1)
+        ttk.Button(input_buttons, text="批量跑同花顺策略", command=self.run_ths_input_stock_backtests, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(input_buttons, text="清空代码", command=lambda: self.ths_batch_text.delete("1.0", tk.END)).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        history = ttk.LabelFrame(left_frame, text="已保存同花顺策略")
+        history.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        history.columnconfigure(0, weight=1)
+        history.rowconfigure(1, weight=1)
+        history_tools = ttk.Frame(history)
+        history_tools.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 4))
+        history_tools.columnconfigure(1, weight=1)
+        self.ths_history_search = tk.StringVar(value="")
+        self.ths_history_sort = tk.StringVar(value="最近回测")
+        ttk.Label(history_tools, text="搜索").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(
+            history_tools,
+            textvariable=self.ths_history_search,
+            width=18,
+        ).grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(history_tools, text="排序").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ths_sort_combo = ttk.Combobox(
+            history_tools,
+            textvariable=self.ths_history_sort,
+            values=("最近回测", "代码升序", "名称升序", "收益降序", "评分降序"),
+            state="readonly",
+            width=10,
+        )
+        ths_sort_combo.grid(row=0, column=3, sticky="e")
+        self.ths_history_search.trace_add(
+            "write", lambda *_args: self._schedule_ths_history_render()
+        )
+        ths_sort_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._render_ths_history()
+        )
+        self.ths_history_tree = ttk.Treeview(
+            history,
+            columns=("symbol", "name", "mode", "strategy", "date"),
+            show="tree headings",
+            height=10,
+            selectmode="extended",
+        )
+        self._setup_tree(
+            self.ths_history_tree,
+            {"symbol": "代码", "name": "名称", "mode": "模式", "strategy": "策略", "date": "日期"},
+            {"symbol": 72, "name": 90, "mode": 110, "strategy": 145, "date": 86},
+        )
+        self.ths_history_tree.heading("#0", text="股票/策略")
+        self.ths_history_tree.column("#0", width=170, minwidth=125, anchor="w", stretch=True)
+        self.ths_history_tree.grid(row=1, column=0, sticky="nsew")
+        ths_history_scroll = ttk.Scrollbar(history, orient=tk.VERTICAL, command=self.ths_history_tree.yview)
+        ths_history_scroll.grid(row=1, column=1, sticky="ns")
+        self.ths_history_tree.configure(yscrollcommand=ths_history_scroll.set)
+        self.ths_history_tree.bind("<Button-1>", self._on_ths_cache_tree_click)
+        self.ths_history_tree.bind("<<TreeviewSelect>>", self._on_ths_history_select)
+        self.ths_history_tree.bind("<Button-3>", self._show_ths_cache_context_menu)
+
+        ths_cache_buttons = ttk.Frame(left_frame)
+        ths_cache_buttons.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        for idx in range(5):
+            ths_cache_buttons.columnconfigure(idx, weight=1)
+        ttk.Button(ths_cache_buttons, text="回测勾选股票", command=self.run_checked_ths_stock_backtests).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(ths_cache_buttons, text="回测全部股票", command=self.run_all_ths_stock_backtests).grid(row=0, column=1, sticky="ew", padx=(0, 4))
+        ttk.Button(ths_cache_buttons, text="保存选中策略", command=self._save_selected_ths_strategy).grid(row=0, column=2, sticky="ew", padx=(0, 4))
+        ttk.Button(ths_cache_buttons, text="删除", command=self._delete_selected_ths_cache).grid(row=0, column=3, sticky="ew", padx=(0, 4))
+        ttk.Button(ths_cache_buttons, text="刷新", command=self._render_ths_history).grid(row=0, column=4, sticky="ew")
+
+        self.ths_stock_context_menu = tk.Menu(self, tearoff=0)
+        self.ths_stock_context_menu.add_command(label="勾选选中股票", command=lambda: self._set_selected_ths_stock_checks(True))
+        self.ths_stock_context_menu.add_command(label="取消勾选选中股票", command=lambda: self._set_selected_ths_stock_checks(False))
+        self.ths_stock_context_menu.add_command(label="回测这只股票", command=self.run_selected_ths_stock_backtest)
+        self.ths_stock_context_menu.add_separator()
+        self.ths_stock_context_menu.add_command(label="全部勾选", command=self._check_all_ths_stocks)
+        self.ths_stock_context_menu.add_command(label="全部取消勾选", command=self._uncheck_all_ths_stocks)
+        self.ths_stock_context_menu.add_separator()
+        self.ths_stock_context_menu.add_command(label="删除这只股票及全部同花顺策略", command=self._delete_selected_ths_cache)
+        self.ths_strategy_context_menu = tk.Menu(self, tearoff=0)
+        self.ths_strategy_context_menu.add_command(label="取消加星（后台历史保留）", command=self._delete_selected_ths_cache)
+
+        info = ttk.LabelFrame(left_frame, text="策略说明", padding=10)
+        info.grid(row=3, column=0, sticky="nsew")
+        info.columnconfigure(0, weight=1)
+        info.rowconfigure(0, weight=1)
+        self.ths_info_text = tk.Text(info, wrap="word", background="#ffffff", foreground="#14213d", relief=tk.FLAT, padx=10, pady=8, height=10)
+        self.ths_info_text.grid(row=0, column=0, sticky="nsew")
+        self.ths_info_text.insert(
+            "1.0",
+            "可实现的同花顺风格策略：MACD/KDJ/RSI、BOLL/WR/CCI/BIAS、量价突破、缩量回踩、资金确认、龙虎榜/机构确认和多因子混合。\n\n"
+            "说明：这里按公开指标定义生成可解释规则。回测后双击策略行，可查看买入条件、卖出条件、交易解读，并复制同花顺选股/回测/K线标注公式。\n\n"
+            "资金字段优先使用已有资金流/龙虎榜/机构字段；导出到同花顺时会明确标注是否使用 OBV 技术代理。建议优先跑 ths_hybrid，单一指标主要用来对照。"
+        )
+        self.ths_info_text.configure(state=tk.DISABLED)
+
+        right_frame.columnconfigure(0, weight=1)
+        right_frame.rowconfigure(0, weight=4)
+        right_frame.rowconfigure(1, weight=2)
+        chart_frame = ttk.Frame(right_frame)
+        table_frame = ttk.Frame(right_frame)
+        chart_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+        table_frame.grid(row=1, column=0, sticky="nsew")
+        chart_frame.columnconfigure(0, weight=1)
+        chart_frame.rowconfigure(1, weight=1)
+        chart_tools = ttk.Frame(chart_frame)
+        chart_tools.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Button(chart_tools, text="放大", command=lambda: self._zoom_ths_backtest(0.72)).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(chart_tools, text="缩小", command=lambda: self._zoom_ths_backtest(1.35)).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(chart_tools, text="重置缩放", command=self._reset_ths_backtest_zoom).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(chart_tools, text="全屏图", command=self._open_ths_backtest_fullscreen).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(chart_tools, text="左侧切换已回测股票；单击策略画曲线，双击查看并复制同花顺公式。", foreground="#607086").pack(side=tk.LEFT)
+        self.ths_canvas = tk.Canvas(chart_frame, height=360, background="#fbfdff", highlightthickness=1, highlightbackground="#d8e0ea")
+        self.ths_canvas.grid(row=1, column=0, sticky="nsew")
+        self.ths_canvas.bind("<Configure>", lambda _event: self._draw_backtest_payload_on_canvas(self.ths_canvas, self.ths_backtest_zoom, self.ths_backtest_chart_payload))
+        self.ths_canvas.bind("<MouseWheel>", lambda event: self._zoom_ths_backtest(0.82 if event.delta > 0 else 1.22))
+
+        columns = ("rank", "strategy", "params", "return", "drawdown", "sharpe", "trades", "final", "score")
+        self.ths_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=9)
+        headings = {
+            "rank": "排名",
+            "strategy": "策略",
+            "params": "参数",
+            "return": "收益%",
+            "drawdown": "回撤%",
+            "sharpe": "夏普",
+            "trades": "交易",
+            "final": "最终权益",
+            "score": "评分",
+        }
+        widths = {"rank": 60, "strategy": 180, "params": 90, "return": 90, "drawdown": 90, "sharpe": 80, "trades": 80, "final": 120, "score": 90}
+        self._setup_tree(self.ths_tree, headings, widths)
+        self.ths_tree.grid(row=0, column=0, sticky="nsew")
+        self.ths_tree.bind("<<TreeviewSelect>>", self._on_ths_rank_select)
+        self.ths_tree.bind("<Double-1>", lambda _event: self._show_ths_strategy_card_popup())
+        self.ths_tree.bind("<Button-3>", self._show_ths_context_menu)
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+        ths_vscroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.ths_tree.yview)
+        ths_vscroll.grid(row=0, column=1, sticky="ns")
+        self.ths_tree.configure(yscrollcommand=ths_vscroll.set)
+        self.ths_context_menu = tk.Menu(self, tearoff=0)
+        self.ths_context_menu.add_command(label="策略卡片 / 导出同花顺公式", command=self._show_ths_strategy_card_popup)
+        self.ths_context_menu.add_command(label="查看策略说明", command=self._show_ths_strategy_description_popup)
+        self.ths_context_menu.add_command(label="保存选中策略", command=self._save_selected_ths_strategy)
+        self.ths_context_menu.add_separator()
+        self.ths_context_menu.add_command(label="全屏查看曲线", command=self._open_ths_backtest_fullscreen)
+        self._render_ths_history()
 
     def _build_ml_policy_backtest_tab(self) -> None:
         tab = self.ml_policy_backtest_tab
@@ -2326,7 +2948,7 @@ class StrategyDesktopApp(tk.Tk):
                 progress_value, progress_stage = _monthly_training_progress(lines)
                 self._set_model_training_progress(progress_value, progress_stage)
                 progress_prefixes = (
-                    "[market ", "[external]", "[panel]", "[cross-section]", "[training ",
+                    "[gpu]", "[gpu-fit ", "[cpu-baseline]", "[market ", "[external]", "[panel]", "[cross-section]", "[training ",
                     "[policy]", "[refit", "[reports]", "[candidate]", "[backtest]", "[skip]",
                 )
                 progress_lines = [line.strip() for line in lines if line.strip().startswith(progress_prefixes)]
@@ -3176,10 +3798,20 @@ class StrategyDesktopApp(tk.Tk):
         record: dict[str, Any],
         strategy_filter: str | None = None,
         exclude_strategy_type: str | None = None,
+        include_selected_ths: bool = False,
     ) -> bool:
         strategy_type = self._record_strategy_type(record)
-        if strategy_filter is not None and strategy_type != strategy_filter:
-            return False
+        # 同花顺策略拥有独立页面和状态；旧版本写入公共缓存的记录也不再
+        # 混入传统回测、盘中监控或 ML 股票来源。
+        if strategy_filter is None and strategy_type.startswith("ths_"):
+            if not include_selected_ths or not bool(record.get("ths_selected")):
+                return False
+        if strategy_filter is not None:
+            if strategy_filter == "ths":
+                if not strategy_type.startswith("ths_"):
+                    return False
+            elif strategy_type != strategy_filter:
+                return False
         if exclude_strategy_type is not None and strategy_type == exclude_strategy_type:
             return False
         return True
@@ -3189,14 +3821,23 @@ class StrategyDesktopApp(tk.Tk):
         strategy_filter: str | None = None,
         exclude_strategy_type: str | None = None,
         selected_for_left_only: bool = False,
+        include_selected_ths: bool = False,
     ) -> list[dict[str, Any]]:
         stocks: dict[str, dict[str, Any]] = {}
         for record in engine.load_persistent_strategy_cache().values():
             if not isinstance(record, dict):
                 continue
-            if not self._record_matches_strategy_filter(record, strategy_filter, exclude_strategy_type):
+            if not self._record_matches_strategy_filter(
+                record,
+                strategy_filter,
+                exclude_strategy_type,
+                include_selected_ths=include_selected_ths,
+            ):
                 continue
-            if selected_for_left_only and not bool(record.get("selected_for_left")):
+            if selected_for_left_only and not (
+                bool(record.get("selected_for_left"))
+                or (include_selected_ths and bool(record.get("ths_selected")))
+            ):
                 continue
             symbol = str(record.get("symbol", "")).strip()
             if not symbol:
@@ -3233,7 +3874,7 @@ class StrategyDesktopApp(tk.Tk):
         item = self.monitor_items.get(code)
         if isinstance(item, dict) and item.get("name"):
             return str(item["name"])
-        for _key_text, record in self._saved_records_for_symbol(code):
+        for _key_text, record in self._saved_records_for_symbol(code, include_selected_ths=True):
             name = str(record.get("name") or "")
             if name:
                 return name
@@ -3244,6 +3885,7 @@ class StrategyDesktopApp(tk.Tk):
         symbol: str,
         strategy_filter: str | None = None,
         exclude_strategy_type: str | None = None,
+        include_selected_ths: bool = False,
     ) -> list[tuple[str, dict[str, Any]]]:
         try:
             code = engine.normalize_symbol(symbol)
@@ -3259,7 +3901,12 @@ class StrategyDesktopApp(tk.Tk):
                 record_code = str(record.get("symbol", ""))
             if record_code != code:
                 continue
-            if not self._record_matches_strategy_filter(record, strategy_filter, exclude_strategy_type):
+            if not self._record_matches_strategy_filter(
+                record,
+                strategy_filter,
+                exclude_strategy_type,
+                include_selected_ths=include_selected_ths,
+            ):
                 continue
             rows.append((key_text, record))
         rows.sort(key=lambda item: str(item[1].get("saved_at", "")), reverse=True)
@@ -3314,7 +3961,11 @@ class StrategyDesktopApp(tk.Tk):
         return str(tags[0]) if tags else ""
 
     def _stock_position(self, symbol: str) -> dict[str, Any]:
-        rows = self._saved_records_for_symbol(symbol, exclude_strategy_type="ml")
+        rows = self._saved_records_for_symbol(
+            symbol,
+            exclude_strategy_type="ml",
+            include_selected_ths=True,
+        )
         for _key_text, record in rows:
             position = record.get("position")
             if isinstance(position, dict):
@@ -3332,7 +3983,11 @@ class StrategyDesktopApp(tk.Tk):
         cost: str | None = None,
         monitor_enabled: bool | None = None,
     ) -> None:
-        rows = self._saved_records_for_symbol(symbol, exclude_strategy_type="ml")
+        rows = self._saved_records_for_symbol(
+            symbol,
+            exclude_strategy_type="ml",
+            include_selected_ths=True,
+        )
         if not rows:
             return
         cache = engine.load_persistent_strategy_cache()
@@ -3353,18 +4008,25 @@ class StrategyDesktopApp(tk.Tk):
         engine.save_persistent_strategy_cache()
 
     def _latest_strategy_label_for_symbol(self, symbol: str) -> str:
-        rows = self._saved_strategy_rows_for_symbol(symbol, exclude_strategy_type="ml")
+        rows = self._saved_strategy_rows_for_symbol(
+            symbol,
+            exclude_strategy_type="ml",
+            include_selected_ths=True,
+        )
         if not rows:
             return ""
         return str(rows[0][1][0]).lstrip("★ ").strip()
 
     def _monitor_enabled_symbols(self) -> list[str]:
-        rows = self._saved_stock_rows(exclude_strategy_type="ml")
+        rows = self._saved_stock_rows(exclude_strategy_type="ml", include_selected_ths=True)
         return [str(row["symbol"]) for row in rows if self._stock_position(str(row["symbol"])).get("monitor_enabled")]
 
     def _render_saved_stock_picker(self) -> None:
         tree_rows = {
-            "saved_stock_tree": self._saved_stock_rows(exclude_strategy_type="ml"),
+            "saved_stock_tree": self._saved_stock_rows(
+                exclude_strategy_type="ml",
+                include_selected_ths=True,
+            ),
             "ml_saved_stock_tree": self._ml_stock_pool_rows(),
             "ml_monitor_saved_stock_tree": self._saved_stock_rows(strategy_filter="ml"),
         }
@@ -3416,7 +4078,7 @@ class StrategyDesktopApp(tk.Tk):
             return 0
 
     def _selected_or_all_saved_symbols(self) -> list[str]:
-        rows = self._saved_stock_rows(exclude_strategy_type="ml")
+        rows = self._saved_stock_rows(exclude_strategy_type="ml", include_selected_ths=True)
         all_symbols = [str(row["symbol"]) for row in rows]
         if hasattr(self, "saved_stock_tree"):
             selected = [symbol for symbol in self.saved_stock_tree.selection() if symbol in all_symbols]
@@ -4240,6 +4902,7 @@ class StrategyDesktopApp(tk.Tk):
         symbol: str | None,
         strategy_filter: str | None = None,
         exclude_strategy_type: str | None = None,
+        include_selected_ths: bool = False,
     ) -> list[tuple[str, tuple[str, str, str]]]:
         if not symbol:
             return []
@@ -4253,9 +4916,17 @@ class StrategyDesktopApp(tk.Tk):
                 continue
             if engine.normalize_symbol(str(record.get("symbol", ""))) != code:
                 continue
-            if not self._record_matches_strategy_filter(record, strategy_filter, exclude_strategy_type):
+            if not self._record_matches_strategy_filter(
+                record,
+                strategy_filter,
+                exclude_strategy_type,
+                include_selected_ths=include_selected_ths,
+            ):
                 continue
-            if not bool(record.get("selected_for_left")):
+            if not (
+                bool(record.get("selected_for_left"))
+                or (include_selected_ths and bool(record.get("ths_selected")))
+            ):
                 continue
             result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
             signal = result.get("daily_signal", {}) if isinstance(result.get("daily_signal"), dict) else {}
@@ -4271,7 +4942,9 @@ class StrategyDesktopApp(tk.Tk):
             signal = result.get("daily_signal", {}) if isinstance(result.get("daily_signal"), dict) else {}
             params = record.get("params", {}) if isinstance(record.get("params"), dict) else {}
             strategy = f"{signal.get('strategy_label', result.get('strategy_label', ''))} {signal.get('fast', '')}/{signal.get('slow', '')}".strip()
-            if bool(record.get("active_for_trading")):
+            if bool(record.get("active_for_trading")) or (
+                include_selected_ths and bool(record.get("ths_selected"))
+            ):
                 strategy = f"★ {strategy}"
             output.append((key_text, (strategy, str(params.get("mode", "")), str(record.get("saved_at", "")))))
         return output
@@ -4283,7 +4956,11 @@ class StrategyDesktopApp(tk.Tk):
             symbol = self.selected_monitor_symbol
         for iid in self.monitor_strategy_tree.get_children():
             self.monitor_strategy_tree.delete(iid)
-        rows = self._saved_strategy_rows_for_symbol(symbol, exclude_strategy_type="ml")
+        rows = self._saved_strategy_rows_for_symbol(
+            symbol,
+            exclude_strategy_type="ml",
+            include_selected_ths=True,
+        )
         if not rows:
             return
         code = engine.normalize_symbol(str(symbol))
@@ -4628,7 +5305,11 @@ class StrategyDesktopApp(tk.Tk):
                 code = str(symbol)
             strategy_key = self.monitor_strategy_keys.get(code, "")
             if not strategy_key:
-                rows = self._saved_strategy_rows_for_symbol(code, exclude_strategy_type="ml")
+                rows = self._saved_strategy_rows_for_symbol(
+                    code,
+                    exclude_strategy_type="ml",
+                    include_selected_ths=True,
+                )
                 if rows:
                     strategy_key = rows[0][0]
                     self.monitor_strategy_keys[code] = strategy_key
@@ -4645,6 +5326,283 @@ class StrategyDesktopApp(tk.Tk):
                 }
             )
         return tasks
+
+    def _ths_monitor_records(self) -> list[tuple[str, dict[str, Any]]]:
+        rows = [
+            (key_text, record)
+            for key_text, record in self._ths_saved_records()
+            if bool(record.get("ths_selected")) and bool(record.get("selected_for_left"))
+        ]
+        rows.sort(key=lambda item: str(item[1].get("saved_at", "")), reverse=True)
+        return rows
+
+    def _ths_monitor_interval_seconds(self) -> int:
+        try:
+            return max(10, int(float(self.ths_monitor_interval.get() or 30)))
+        except ValueError:
+            return 30
+
+    def _build_ths_monitor_tasks(self) -> list[dict[str, str]]:
+        period = str(self.ths_monitor_period.get() or "5")
+        tasks: list[dict[str, str]] = []
+        for key_text, record in self._ths_monitor_records():
+            position = record.get("position", {}) if isinstance(record.get("position"), dict) else {}
+            tasks.append(
+                {
+                    "symbol": engine.normalize_symbol(str(record.get("symbol", ""))),
+                    "period": period,
+                    "shares": str(position.get("shares", "")),
+                    "cost": str(position.get("cost", "")),
+                    "strategy_key": key_text,
+                }
+            )
+        return tasks
+
+    def toggle_ths_monitor(self) -> None:
+        self.ths_monitor_running = not self.ths_monitor_running
+        self.ths_monitor_start_button.configure(
+            text="停止自动监控" if self.ths_monitor_running else "开始自动监控"
+        )
+        self.ths_monitor_schedule.set(
+            "自动监控运行中" if self.ths_monitor_running else "自动监控未启动"
+        )
+        if self.ths_monitor_running:
+            self._start_ths_monitor_worker(loop=True)
+
+    def refresh_ths_monitor_once(self) -> None:
+        self._start_ths_monitor_worker(loop=False)
+
+    def _start_ths_monitor_worker(self, loop: bool) -> None:
+        if self.ths_monitor_worker and self.ths_monitor_worker.is_alive():
+            self.status_var.set("上一轮同花顺盘中监控尚未完成")
+            return
+        tasks = self._build_ths_monitor_tasks()
+        if not tasks:
+            self.status_var.set("同花顺页尚未加星任何策略")
+            return
+        interval = self._ths_monitor_interval_seconds()
+        self.ths_monitor_schedule.set(f"准备刷新 {len(tasks)} 条同花顺策略")
+        self.ths_monitor_worker = threading.Thread(
+            target=self._ths_monitor_worker_loop,
+            args=(loop, tasks, interval),
+            daemon=True,
+        )
+        self.ths_monitor_worker.start()
+
+    def _ths_monitor_worker_loop(
+        self, loop: bool, tasks: list[dict[str, str]], interval: int
+    ) -> None:
+        while True:
+            results: list[dict[str, Any]] = []
+            errors: list[str] = []
+            worker_count = min(4, len(tasks))
+            with ThreadPoolExecutor(
+                max_workers=max(1, worker_count), thread_name_prefix="ths-monitor"
+            ) as executor:
+                future_tasks = {
+                    executor.submit(_build_ths_monitor_item, task): task for task in tasks
+                }
+                for future in as_completed(future_tasks):
+                    task = future_tasks[future]
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:
+                        errors.append(
+                            f"{task.get('symbol', '')}: {_short_error_text(exc)}"
+                        )
+            self.queue.put(
+                WorkerMessage(
+                    "ths_monitor",
+                    payload={"results": results, "errors": errors},
+                )
+            )
+            if not loop or not self.ths_monitor_running:
+                break
+            time.sleep(interval)
+
+    def _apply_ths_monitor_results(self, payload: dict[str, Any]) -> None:
+        results = payload.get("results", []) if isinstance(payload, dict) else []
+        errors = payload.get("errors", []) if isinstance(payload, dict) else []
+        new_alert = False
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            key_text = str(item.get("strategy_key", ""))
+            if not key_text:
+                continue
+            action_code = str(item.get("action_code", ""))
+            if (
+                action_code in {"buy", "sell"}
+                and self.ths_monitor_alert_state.get(key_text) != action_code
+            ):
+                new_alert = True
+            self.ths_monitor_alert_state[key_text] = action_code
+            self.ths_monitor_items[key_text] = item
+        self._render_ths_monitor_table()
+        if self.ths_monitor_selected_key not in self.ths_monitor_items and results:
+            self.ths_monitor_selected_key = str(results[0].get("strategy_key", ""))
+        selected = self.ths_monitor_items.get(str(self.ths_monitor_selected_key or ""))
+        self._render_ths_monitor_detail(selected)
+        self._draw_selected_ths_monitor_charts()
+        if new_alert:
+            try:
+                self.bell()
+            except Exception:
+                pass
+        suffix = f"，失败 {len(errors)}" if errors else ""
+        self.ths_monitor_schedule.set(
+            f"最近刷新 {time.strftime('%H:%M:%S')}，成功 {len(results)}{suffix}"
+        )
+        self.status_var.set(f"同花顺盘中监控刷新完成：{len(results)} 条策略{suffix}")
+
+    def _render_ths_monitor_table(self) -> None:
+        if not hasattr(self, "ths_monitor_tree"):
+            return
+        selected = self.ths_monitor_selected_key
+        for iid in self.ths_monitor_tree.get_children():
+            self.ths_monitor_tree.delete(iid)
+
+        rows: list[tuple[int, str, dict[str, Any], dict[str, Any]]] = []
+        for key_text, record in self._ths_monitor_records():
+            item = self.ths_monitor_items.get(key_text, {})
+            action_code = str(item.get("action_code", ""))
+            priority = {"sell": 0, "buy": 1, "hold": 2, "watch": 3}.get(action_code, 4)
+            rows.append((priority, key_text, record, item))
+        rows.sort(
+            key=lambda row: (
+                row[0],
+                str(row[3].get("updated", "")),
+                str(row[2].get("saved_at", "")),
+            ),
+            reverse=False,
+        )
+        for _priority, key_text, record, item in rows:
+            symbol = engine.normalize_symbol(str(record.get("symbol", "")))
+            position = record.get("position", {}) if isinstance(record.get("position"), dict) else {}
+            name = str(item.get("name") or record.get("name") or engine.stock_display_name(symbol))
+            action_code = str(item.get("action_code", ""))
+            tags = ("alert_sell",) if action_code == "sell" else ("alert_buy",) if action_code == "buy" else ()
+            self.ths_monitor_tree.insert(
+                "",
+                "end",
+                iid=key_text,
+                values=(
+                    symbol,
+                    name,
+                    item.get("action", "待刷新"),
+                    item.get("price", "-"),
+                    position.get("shares", ""),
+                    position.get("cost", ""),
+                    self._strategy_display_name(record),
+                ),
+                tags=tags,
+            )
+        if selected and self.ths_monitor_tree.exists(selected):
+            self.ths_monitor_tree.selection_set(selected)
+            self.ths_monitor_tree.focus(selected)
+
+    def _on_ths_monitor_select(self, _event: object | None = None) -> None:
+        selection = self.ths_monitor_tree.selection()
+        if not selection:
+            return
+        key_text = str(selection[0])
+        self.ths_monitor_selected_key = key_text
+        record = engine.load_persistent_strategy_cache().get(key_text, {})
+        position = record.get("position", {}) if isinstance(record, dict) and isinstance(record.get("position"), dict) else {}
+        self.ths_monitor_shares.set(str(position.get("shares", "")))
+        self.ths_monitor_cost.set(str(position.get("cost", "")))
+        item = self.ths_monitor_items.get(key_text)
+        self._render_ths_monitor_detail(item)
+        self._draw_selected_ths_monitor_charts()
+
+    def _save_selected_ths_monitor_position(self) -> None:
+        key_text = str(self.ths_monitor_selected_key or "")
+        cache = engine.load_persistent_strategy_cache()
+        selected_record = cache.get(key_text)
+        if not isinstance(selected_record, dict):
+            messagebox.showwarning("未选择策略", "请先选择左侧一条同花顺加星策略。")
+            return
+        shares_text = self.ths_monitor_shares.get().strip()
+        cost_text = self.ths_monitor_cost.get().strip()
+        try:
+            shares = int(float(shares_text or 0))
+            cost = float(cost_text) if cost_text else 0.0
+            if shares < 0 or cost < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("持仓格式不对", "持股数和成本价必须是不小于0的数字。")
+            return
+        symbol = engine.normalize_symbol(str(selected_record.get("symbol", "")))
+        for _other_key, record in cache.items():
+            if not isinstance(record, dict) or not _record_is_ths_strategy(record):
+                continue
+            if not bool(record.get("ths_selected")):
+                continue
+            if engine.normalize_symbol(str(record.get("symbol", ""))) != symbol:
+                continue
+            position = record.get("position")
+            if not isinstance(position, dict):
+                position = {}
+                record["position"] = position
+            position["shares"] = str(shares) if shares else ""
+            position["cost"] = f"{cost:g}" if cost else ""
+        engine.save_persistent_strategy_cache()
+        self._render_ths_monitor_table()
+        self.status_var.set(
+            f"{symbol} 同花顺监控持仓已保存；{'开始监控卖出信号' if shares else '按空仓监控买入信号'}"
+        )
+        self.refresh_ths_monitor_once()
+
+    def _render_ths_monitor_detail(self, item: dict[str, Any] | None) -> None:
+        if not hasattr(self, "ths_monitor_detail"):
+            return
+        self.ths_monitor_detail.configure(state=tk.NORMAL)
+        self.ths_monitor_detail.delete("1.0", "end")
+        if not item:
+            text = "点击“刷新全部”后显示同花顺策略的日线闸门、盘中确认和买卖提醒。"
+        else:
+            reasons = item.get("reasons", []) if isinstance(item.get("reasons"), list) else []
+            text = (
+                f"{item.get('symbol', '')} {item.get('name', '')} | "
+                f"{item.get('action', '')} | 价格 {item.get('price', '-')} | "
+                f"{item.get('daily_gate', '-')} | {item.get('updated', '-')}\n"
+                + "\n".join(f"- {reason}" for reason in reasons)
+            )
+        self.ths_monitor_detail.insert("1.0", text)
+        self.ths_monitor_detail.configure(state=tk.DISABLED)
+
+    def _draw_selected_ths_monitor_charts(self) -> None:
+        if not hasattr(self, "ths_monitor_daily_canvas"):
+            return
+        item = self.ths_monitor_items.get(str(self.ths_monitor_selected_key or ""))
+        if not item:
+            self._draw_backtest_canvas(
+                [], [], [], "刷新后显示日线买卖点", canvas=self.ths_monitor_daily_canvas
+            )
+            self._draw_line_chart(
+                self.ths_monitor_minute_canvas, [], title="刷新后显示盘中曲线"
+            )
+            return
+        daily = item.get("daily_chart", {}) if isinstance(item.get("daily_chart"), dict) else {}
+        self._draw_backtest_canvas(
+            daily.get("points", []),
+            daily.get("buys", []),
+            daily.get("sells", []),
+            str(daily.get("title", "同花顺日线买卖点")),
+            canvas=self.ths_monitor_daily_canvas,
+        )
+        self._draw_line_chart(
+            self.ths_monitor_minute_canvas,
+            item.get("chart_points", []),
+            title=(
+                f"{item.get('symbol', '')} {item.get('name', '')} "
+                f"{item.get('action', '')} {item.get('chart_strategy_label', '')}"
+            ),
+            stop_value=item.get("stop_value"),
+            stop_label=str(item.get("stop_line", "")),
+            action_code=str(item.get("action_code", "")),
+            strategy_type=str(item.get("chart_strategy_type", "")),
+        )
 
     def _run_pending_monitor_refresh(self) -> None:
         if not self.monitor_refresh_pending:
@@ -5050,6 +6008,8 @@ class StrategyDesktopApp(tk.Tk):
     def _set_backtest_running(self, running: bool) -> None:
         if hasattr(self, "stop_backtest_button"):
             self.stop_backtest_button.configure(state=tk.NORMAL if running else tk.DISABLED)
+        if hasattr(self, "ths_stop_button"):
+            self.ths_stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
         if hasattr(self, "ml_stop_backtest_button"):
             self.ml_stop_backtest_button.configure(state=tk.NORMAL if running else tk.DISABLED)
 
@@ -5136,6 +6096,102 @@ class StrategyDesktopApp(tk.Tk):
                 self.queue.put(WorkerMessage("backtest_cancelled"))
             except Exception as exc:
                 self.queue.put(WorkerMessage("backtest_error", error=_short_error_text(exc)))
+            return
+
+        if target == "ths" and len(symbols) > 1:
+            try:
+                requested_workers = int(float(base_form.get("_parallel_workers") or THS_BATCH_PARALLEL_WORKERS))
+            except (TypeError, ValueError):
+                requested_workers = THS_BATCH_PARALLEL_WORKERS
+            worker_count = min(max(1, requested_workers), 12, len(symbols))
+            completed = 0
+            self.queue.put(
+                WorkerMessage(
+                    "status",
+                    payload=f"同花顺批量回测：{len(symbols)} 只股票，{worker_count} 路并行",
+                )
+            )
+            executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="ths-backtest")
+            futures: dict[Any, tuple[str, dict[str, Any]]] = {}
+            try:
+                for symbol in symbols:
+                    if self.backtest_stop_event.is_set():
+                        cancelled = True
+                        break
+                    form = build_symbol_form(symbol)
+                    # Child processes calculate only. Persisting from several processes at
+                    # once can overwrite the shared JSON strategy cache.
+                    form["_defer_process_cache_write"] = "1"
+                    futures[executor.submit(self._run_backtest_process, form)] = (symbol, form)
+
+                for future in as_completed(futures):
+                    symbol, _worker_form = futures[future]
+                    if self.backtest_stop_event.is_set():
+                        cancelled = True
+                        for pending in futures:
+                            pending.cancel()
+                        break
+                    completed += 1
+                    try:
+                        result = future.result()
+                        # Merge this stock's completed strategies in the coordinator
+                        # process. A failed stock never touches successful stock results.
+                        persist_form = base_form.copy()
+                        persist_form["symbol"] = symbol
+                        persist_form["_defer_process_cache_write"] = "1"
+                        _save_all_scan_strategies_from_payload(
+                            persist_form,
+                            engine.normalize_symbol(str(result["symbol"])),
+                            result["data"],
+                            result["scan"],
+                            str(result.get("horizon") or persist_form.get("horizon") or "short"),
+                            result["scan"].index[0] if not result["scan"].empty else None,
+                        )
+                        results.append(result)
+                    except BacktestCancelled as exc:
+                        if self.backtest_stop_event.is_set():
+                            cancelled = True
+                            for pending in futures:
+                                pending.cancel()
+                            break
+                        errors.append(f"{symbol}: {_short_error_text(exc)}")
+                    except BaseException as exc:
+                        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                            raise
+                        errors.append(f"{symbol}: {_short_error_text(exc)}")
+                    self.queue.put(
+                        WorkerMessage(
+                            "status",
+                            payload=(
+                                f"同花顺并行回测进度 {completed}/{len(symbols)}："
+                                f"成功 {len(results)}，失败 {len(errors)}"
+                            ),
+                        )
+                    )
+                if results:
+                    engine.save_persistent_strategy_cache()
+            finally:
+                if cancelled:
+                    for future in futures:
+                        future.cancel()
+                executor.shutdown(wait=True, cancel_futures=cancelled)
+
+            _ui_debug(
+                f"ths_parallel_batch_done results={len(results)} errors={len(errors)} "
+                f"cancelled={cancelled} workers={worker_count}"
+            )
+            self.queue.put(
+                WorkerMessage(
+                    "backtest_batch",
+                    payload={
+                        "target": target,
+                        "results": results,
+                        "errors": errors,
+                        "total": len(symbols),
+                        "cancelled": cancelled,
+                    },
+                )
+            )
             return
 
         for idx, symbol in enumerate(symbols, start=1):
@@ -5259,6 +6315,77 @@ class StrategyDesktopApp(tk.Tk):
             "batch_symbols": "",
         }
 
+    def _ths_backtest_form(self) -> dict[str, str]:
+        return {
+            "symbol": self.ths_symbol.get().strip(),
+            "start": self.ths_start.get().strip() or "20200101",
+            "adjust": self.ths_adjust.get(),
+            "cash": self.ths_cash.get().strip() or "100000",
+            "fee": self.ths_fee.get().strip() or "0.0003",
+            "risk": self.ths_risk.get(),
+            "horizon": self.ths_horizon.get(),
+            "strategy_type": self.ths_strategy.get(),
+            "shares": self.ths_shares.get().strip() or "0",
+            "buy_price": self.ths_buy_price.get().strip(),
+            "_parallel_workers": self.ths_parallel_workers.get().strip() or str(THS_BATCH_PARALLEL_WORKERS),
+            "buy_date": "",
+            "batch_symbols": "",
+            "_isolated_workflow": "ths",
+        }
+
+    def _validate_ths_parallel_workers(self) -> int | None:
+        try:
+            workers = int(float(self.ths_parallel_workers.get().strip() or THS_BATCH_PARALLEL_WORKERS))
+        except ValueError:
+            messagebox.showwarning("并行数格式不对", "并行数请输入1到12之间的整数。")
+            return None
+        if not 1 <= workers <= 12:
+            messagebox.showwarning("并行数超出范围", "并行数必须在1到12之间。")
+            return None
+        self.ths_parallel_workers.set(str(workers))
+        return workers
+
+    def _ths_batch_input_symbols(self) -> list[str]:
+        if not hasattr(self, "ths_batch_text"):
+            return []
+        return _parse_batch_symbols(self.ths_batch_text.get("1.0", tk.END))
+
+    def run_ths_backtest(self) -> None:
+        if self.backtest_worker and self.backtest_worker.is_alive():
+            self.status_var.set("同花顺策略回测仍在运行，请稍等")
+            return
+        self.backtest_stop_event.clear()
+        self.backtest_target = "ths"
+        self.pending_backtest_form = self._ths_backtest_form()
+        self.pending_backtest_form["_save_all_strategies"] = "1"
+        self._set_backtest_running(True)
+        self.ths_summary_var.set("同花顺策略回测中：正在扫描指标、量价、资金与混合策略...")
+        self.status_var.set("同花顺策略回测运行中，请稍等")
+        self.backtest_worker = threading.Thread(target=self._backtest_worker, daemon=True)
+        self.backtest_worker.start()
+
+    def run_ths_input_stock_backtests(self) -> None:
+        if self.backtest_worker and self.backtest_worker.is_alive():
+            self.status_var.set("同花顺策略回测仍在运行，请稍等")
+            return
+        symbols = self._ths_batch_input_symbols()
+        if not symbols:
+            self.status_var.set("请先在同花顺策略页输入股票代码或名称")
+            return
+        if self._validate_ths_parallel_workers() is None:
+            return
+        self.backtest_stop_event.clear()
+        self.backtest_target = "ths"
+        form = self._ths_backtest_form()
+        form["batch_symbols"] = " ".join(symbols)
+        form["_save_all_strategies"] = "1"
+        self.pending_backtest_form = form
+        self._set_backtest_running(True)
+        self.ths_summary_var.set(f"同花顺批量回测中：准备回测 {len(symbols)} 只股票，结果将保留在本页左侧...")
+        self.status_var.set("同花顺批量策略回测运行中，请稍等")
+        self.backtest_worker = threading.Thread(target=self._backtest_batch_worker, args=(symbols,), daemon=True)
+        self.backtest_worker.start()
+
     def _compute_backtest(self, form: dict[str, str]) -> dict[str, Any]:
         return _compute_backtest_payload(form)
 
@@ -5329,13 +6456,30 @@ class StrategyDesktopApp(tk.Tk):
             },
         }
         engine.attach_ml_risk_snapshot(result, data, fast, slow, strategy_type, stop_line)
-        engine.DAILY_GATE_CACHE[cache_key] = result
+        isolated_workflow = str(form.get("_isolated_workflow", "")).strip().lower()
+        if not isolated_workflow:
+            engine.DAILY_GATE_CACHE[cache_key] = result
         if save_strategy:
-            if active_strategy:
-                result["_active_for_trading"] = True
-            if selected_for_left or active_strategy:
-                result["_selected_for_left"] = True
+            if not isolated_workflow:
+                if active_strategy:
+                    result["_active_for_trading"] = True
+                if selected_for_left or active_strategy:
+                    result["_selected_for_left"] = True
+            key_text = engine.strategy_cache_key_text(cache_key)
+            old_record = engine.load_persistent_strategy_cache().get(key_text)
+            ths_selected = bool(old_record.get("ths_selected")) if isinstance(old_record, dict) else False
+            ths_active = bool(old_record.get("active_for_trading")) if isinstance(old_record, dict) else False
             engine.save_daily_gate(cache_key, result)
+            if isolated_workflow == "ths":
+                cache = engine.load_persistent_strategy_cache()
+                select_ths = ths_selected or selected_for_left or active_strategy
+                _set_ths_record_state(
+                    cache,
+                    key_text,
+                    selected=select_ths,
+                    active=True if active_strategy else (ths_active if select_ths else False),
+                )
+                engine.save_persistent_strategy_cache()
         return result
 
     def _poll_queue(self) -> None:
@@ -5350,6 +6494,9 @@ class StrategyDesktopApp(tk.Tk):
                     self.status_var.set(error_text)
                     self._show_monitor_error(error_text)
                     self.after(200, self._run_pending_monitor_refresh)
+                elif message.kind == "ths_monitor":
+                    payload = message.payload if isinstance(message.payload, dict) else {}
+                    self._apply_ths_monitor_results(payload)
                 elif message.kind == "ml_monitor":
                     self._apply_ml_monitor_results(message.payload)
                 elif message.kind == "ml_monitor_error":
@@ -5366,6 +6513,8 @@ class StrategyDesktopApp(tk.Tk):
                             self._apply_ml_backtest_batch_result(result)
                         else:
                             self._apply_ml_backtest_result(result)
+                    elif target == "ths":
+                        self._apply_ths_backtest_result(result)
                     else:
                         self._apply_backtest_result(result)
                 elif message.kind == "backtest_batch":
@@ -5373,6 +6522,8 @@ class StrategyDesktopApp(tk.Tk):
                     self._set_backtest_running(False)
                     if isinstance(message.payload, dict) and message.payload.get("target") == "ml":
                         self._apply_ml_backtest_batch_result(message.payload)
+                    elif isinstance(message.payload, dict) and message.payload.get("target") == "ths":
+                        self._apply_ths_backtest_batch_result(message.payload)
                     else:
                         self._apply_backtest_batch_result(message.payload)
                     _ui_debug("poll_backtest_batch_done")
@@ -5382,6 +6533,10 @@ class StrategyDesktopApp(tk.Tk):
                         self.ml_summary_var.set("ML持仓决策失败")
                         self.status_var.set("ML持仓决策失败，详情已弹出")
                         messagebox.showerror("ML持仓决策失败", message.error or "")
+                    elif self.backtest_target == "ths" and hasattr(self, "ths_summary_var"):
+                        self.ths_summary_var.set("同花顺策略回测失败")
+                        self.status_var.set("同花顺策略回测失败，详情已弹出")
+                        messagebox.showerror("同花顺策略回测失败", message.error or "")
                     else:
                         self.summary_var.set("回测失败")
                         self.status_var.set("回测失败，详情已弹出")
@@ -5391,6 +6546,9 @@ class StrategyDesktopApp(tk.Tk):
                     if self.backtest_target == "ml" and hasattr(self, "ml_summary_var"):
                         self.ml_summary_var.set("ML持仓决策已终止")
                         self.status_var.set("ML持仓决策已终止，子进程已停止")
+                    elif self.backtest_target == "ths" and hasattr(self, "ths_summary_var"):
+                        self.ths_summary_var.set("同花顺策略回测已终止")
+                        self.status_var.set("同花顺策略回测已终止，子进程已停止")
                     else:
                         self.summary_var.set("回测已终止")
                         self.status_var.set("回测已终止，子进程已停止")
@@ -5408,6 +6566,13 @@ class StrategyDesktopApp(tk.Tk):
                         if payload.get("key_text") == self.pending_saved_description_key:
                             self.pending_saved_description_key = None
                         self.status_var.set(message.error or "保存策略预览失败")
+                elif message.kind == "ths_cache_preview":
+                    payload = message.payload if isinstance(message.payload, dict) else {}
+                    self._apply_saved_ths_strategy_preview(payload)
+                elif message.kind == "ths_cache_preview_error":
+                    payload = message.payload if isinstance(message.payload, dict) else {}
+                    if payload.get("key_text") == self.ths_cache_preview_key:
+                        self.status_var.set(message.error or "同花顺策略曲线加载失败")
                 elif message.kind == "strategy_saved":
                     self._apply_saved_strategy_result(message.payload)
                 elif message.kind == "strategy_save_error":
@@ -5547,6 +6712,770 @@ class StrategyDesktopApp(tk.Tk):
         except Exception as exc:
             self.status_var.set(f"回测完成，但画图失败：{exc}")
             messagebox.showerror("画图失败", traceback.format_exc())
+
+    def _apply_ths_backtest_result(self, result: dict[str, Any]) -> None:
+        symbol = engine.normalize_symbol(str(result.get("symbol", "")))
+        self.ths_backtest_results[symbol] = result
+        self._render_ths_history()
+        self._show_ths_result(symbol)
+
+    @staticmethod
+    def _ths_stock_iid(symbol: str) -> str:
+        return f"ths-stock:{engine.normalize_symbol(symbol)}"
+
+    @staticmethod
+    def _ths_symbol_from_iid(iid: str) -> str:
+        return iid.split(":", 1)[1] if iid.startswith("ths-stock:") else ""
+
+    def _ths_saved_records(self, symbol: str | None = None) -> list[tuple[str, dict[str, Any]]]:
+        code = engine.normalize_symbol(symbol) if symbol else ""
+        rows: list[tuple[str, dict[str, Any]]] = []
+        for key_text, record in engine.load_persistent_strategy_cache().items():
+            if not isinstance(record, dict) or not self._record_matches_strategy_filter(record, strategy_filter="ths"):
+                continue
+            record_symbol = engine.normalize_symbol(str(record.get("symbol", "")))
+            if code and record_symbol != code:
+                continue
+            rows.append((key_text, record))
+        rows.sort(key=lambda item: str(item[1].get("saved_at", "")), reverse=True)
+        return rows
+
+    def _show_saved_ths_stock_strategies(self, symbol: str) -> None:
+        code = engine.normalize_symbol(symbol)
+        rows = self._ths_saved_records(code)
+        rows.sort(
+            key=lambda item: float(
+                (
+                    item[1].get("result", {}).get("best", {})
+                    if isinstance(item[1].get("result"), dict)
+                    else {}
+                ).get("score", float("-inf"))
+            ),
+            reverse=True,
+        )
+        scan_rows: list[dict[str, Any]] = []
+        self.ths_saved_scan_keys = {}
+        for key_text, record in rows:
+            result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
+            best = result.get("best", {}) if isinstance(result.get("best"), dict) else {}
+            required = {
+                "strategy_type",
+                "fast",
+                "slow",
+                "total_return_pct",
+                "max_drawdown_pct",
+                "trades",
+                "final_value",
+                "score",
+            }
+            if not required.issubset(best):
+                continue
+            rank = len(scan_rows)
+            scan_rows.append(dict(best))
+            self.ths_saved_scan_keys[rank] = key_text
+        if not scan_rows:
+            self.ths_summary_var.set(f"{code} 的历史同花顺策略缺少完整回测指标，请重新回测")
+            self.status_var.set("重新回测后会保存完整收益、回撤、夏普和交易信息")
+            return
+        scan = pd.DataFrame(scan_rows)
+        scan.index = list(range(len(scan)))
+        self._render_result_table(self.ths_tree, scan)
+        name = str(rows[0][1].get("name") or engine.stock_display_name(code))
+        selected_count = sum(bool(record.get("ths_selected")) for _key, record in rows)
+        self.ths_selected_symbol = code
+        self.ths_symbol.set(code)
+        self.ths_backtest_result = None
+        self.ths_summary_var.set(
+            f"{code} {name} | 后台历史 {len(scan)} 条 | 已加星 {selected_count} 条；"
+            "点击右侧策略可加载对应曲线"
+        )
+        self.status_var.set("已载入全部同花顺策略指标；只有加星策略进入盘中监控")
+
+    def _start_saved_ths_strategy_preview(self, key_text: str) -> None:
+        if (
+            key_text == self.ths_cache_preview_key
+            and self.ths_cache_preview_worker
+            and self.ths_cache_preview_worker.is_alive()
+        ):
+            return
+        self.ths_cache_preview_key = key_text
+        self.status_var.set("正在加载已保存同花顺策略曲线...")
+        self.ths_cache_preview_worker = threading.Thread(
+            target=self._saved_ths_strategy_preview_worker,
+            args=(key_text,),
+            daemon=True,
+        )
+        self.ths_cache_preview_worker.start()
+
+    def _saved_ths_strategy_preview_worker(self, key_text: str) -> None:
+        try:
+            result = _compute_saved_strategy_preview_payload(key_text)
+            self.queue.put(
+                WorkerMessage(
+                    "ths_cache_preview",
+                    payload={"key_text": key_text, "result": result},
+                )
+            )
+        except Exception:
+            self.queue.put(
+                WorkerMessage(
+                    "ths_cache_preview_error",
+                    payload={"key_text": key_text},
+                    error=traceback.format_exc(),
+                )
+            )
+
+    def _apply_saved_ths_strategy_preview(self, payload: dict[str, Any]) -> None:
+        key_text = str(payload.get("key_text", ""))
+        if key_text != self.ths_cache_preview_key:
+            return
+        result = payload["result"]
+        symbol = engine.normalize_symbol(str(result.get("symbol", "")))
+        self.ths_selected_symbol = symbol
+        self.ths_backtest_result = result
+        row = result["best"]
+        strategy_type = str(row.get("strategy_type", ""))
+        label = engine.STRATEGY_TYPES.get(strategy_type, strategy_type)
+        self.ths_summary_var.set(
+            f"{symbol} {result.get('name', '')} | {label} {int(row['fast'])}/{int(row['slow'])} | "
+            f"收益 {float(row['total_return_pct']):.2f}% | 回撤 {float(row['max_drawdown_pct']):.2f}% | "
+            f"夏普 {float(row['sharpe']):.2f} | 交易 {int(row['trades'])} 次"
+        )
+        self._draw_backtest_chart(result, None, target="ths")
+        self.status_var.set("已加载所选同花顺策略完整曲线；右侧历史列表保持不变")
+
+    def _schedule_ths_history_render(self) -> None:
+        if self.ths_history_search_job is not None:
+            try:
+                self.after_cancel(self.ths_history_search_job)
+            except Exception:
+                pass
+        self.ths_history_search_job = self.after(180, self._run_scheduled_ths_history_render)
+
+    def _run_scheduled_ths_history_render(self) -> None:
+        self.ths_history_search_job = None
+        self._render_ths_history()
+
+    def _render_ths_history(self) -> None:
+        if not hasattr(self, "ths_history_tree"):
+            return
+        _ui_debug("render_ths_history_enter")
+        engine.PERSISTENT_STRATEGY_CACHE = None
+        cache = engine.load_persistent_strategy_cache()
+        cache_changed = _ensure_ths_best_selected(cache)
+        if cache_changed:
+            engine.save_persistent_strategy_cache()
+        selected_iids = list(self.ths_history_tree.selection())
+        focused = self.ths_history_tree.focus()
+        for iid in self.ths_history_tree.get_children():
+            self.ths_history_tree.delete(iid)
+        grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for key_text, record in self._ths_saved_records():
+            symbol = engine.normalize_symbol(str(record.get("symbol", "")))
+            grouped.setdefault(symbol, []).append((key_text, record))
+        existing_symbols = set(grouped)
+        self.ths_checked_symbols.intersection_update(existing_symbols)
+
+        def row_metric(record: dict[str, Any], field: str) -> float:
+            result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
+            best = result.get("best", {}) if isinstance(result.get("best"), dict) else {}
+            try:
+                return float(best.get(field, float("-inf")))
+            except (TypeError, ValueError):
+                return float("-inf")
+
+        query = (
+            self.ths_history_search.get().strip().casefold()
+            if hasattr(self, "ths_history_search")
+            else ""
+        )
+        sort_mode = (
+            self.ths_history_sort.get()
+            if hasattr(self, "ths_history_sort")
+            else "最近回测"
+        )
+        display_groups: list[
+            tuple[str, list[tuple[str, dict[str, Any]]], str, str, float, float]
+        ] = []
+        for symbol, rows in grouped.items():
+            selected_rows = [
+                (key, record)
+                for key, record in rows
+                if bool(record.get("ths_selected")) and bool(record.get("selected_for_left"))
+            ]
+            current_record = selected_rows[0][1] if selected_rows else rows[0][1]
+            name = str(current_record.get("name") or engine.stock_display_name(symbol))
+            latest = max((str(record.get("saved_at", "")) for _key, record in rows), default="")
+            strategy_names = " ".join(
+                self._strategy_display_name(record) for _key, record in selected_rows
+            )
+            if query and query not in f"{symbol} {name} {strategy_names}".casefold():
+                continue
+            best_return = max(
+                (row_metric(record, "total_return_pct") for _key, record in rows),
+                default=float("-inf"),
+            )
+            best_score = max(
+                (row_metric(record, "score") for _key, record in rows),
+                default=float("-inf"),
+            )
+            display_groups.append((symbol, rows, name, latest, best_return, best_score))
+
+        if sort_mode == "代码升序":
+            display_groups.sort(key=lambda item: item[0])
+        elif sort_mode == "名称升序":
+            display_groups.sort(key=lambda item: (item[2].casefold(), item[0]))
+        elif sort_mode == "收益降序":
+            display_groups.sort(key=lambda item: (item[4], item[3]), reverse=True)
+        elif sort_mode == "评分降序":
+            display_groups.sort(key=lambda item: (item[5], item[3]), reverse=True)
+        else:
+            display_groups.sort(key=lambda item: item[3], reverse=True)
+
+        for symbol, rows, name, latest, _best_return, _best_score in display_groups:
+            selected_rows = [
+                (key, record)
+                for key, record in rows
+                if bool(record.get("ths_selected")) and bool(record.get("selected_for_left"))
+            ]
+            strategy_name = self._strategy_display_name(selected_rows[0][1]) if selected_rows else ""
+            parent_iid = self._ths_stock_iid(symbol)
+            check = "☑" if symbol in self.ths_checked_symbols else "☐"
+            self.ths_history_tree.insert(
+                "",
+                "end",
+                iid=parent_iid,
+                text=f"{check} {symbol} {name}".strip(),
+                values=(
+                    symbol,
+                    name,
+                    f"已选 {len(selected_rows)} / 全部 {len(rows)}",
+                    strategy_name,
+                    latest[:10],
+                ),
+                open=False,
+            )
+            for key_text, record in selected_rows:
+                params = record.get("params", {}) if isinstance(record.get("params"), dict) else {}
+                saved_at = str(record.get("saved_at", ""))
+                strategy_name = self._strategy_display_name(record)
+                self.ths_history_tree.insert(
+                    parent_iid,
+                    "end",
+                    iid=key_text,
+                    text=f"★ {strategy_name}",
+                    values=("", "", str(params.get("mode", "")), strategy_name, saved_at[:10]),
+                )
+        keep_selected = [iid for iid in selected_iids if self.ths_history_tree.exists(iid)]
+        if keep_selected:
+            self.ths_history_tree.selection_set(keep_selected)
+        elif self.ths_selected_symbol:
+            parent_iid = self._ths_stock_iid(self.ths_selected_symbol)
+            if self.ths_history_tree.exists(parent_iid):
+                self.ths_history_tree.selection_set(parent_iid)
+        if focused and self.ths_history_tree.exists(focused):
+            self.ths_history_tree.focus(focused)
+        if hasattr(self, "ths_monitor_tree"):
+            self._render_ths_monitor_table()
+        _ui_debug("render_ths_history_done")
+
+    def _on_ths_history_select(self, _event: object | None = None) -> None:
+        if getattr(self, "_handling_ths_history_select", False):
+            return
+        selection = self.ths_history_tree.selection() if hasattr(self, "ths_history_tree") else ()
+        if not selection:
+            return
+        iid = str(selection[0])
+        symbol = self._ths_symbol_from_iid(iid)
+        if not symbol:
+            parent = self.ths_history_tree.parent(iid)
+            symbol = self._ths_symbol_from_iid(str(parent))
+        if not symbol:
+            return
+        normalized_symbol = engine.normalize_symbol(symbol)
+        if not iid.startswith("ths-stock:") and iid in engine.load_persistent_strategy_cache():
+            if normalized_symbol not in self.ths_backtest_results:
+                self._show_saved_ths_stock_strategies(normalized_symbol)
+            self._start_saved_ths_strategy_preview(iid)
+            return
+        current_result = self.ths_backtest_results.get(normalized_symbol)
+        if current_result is not None:
+            if (
+                self.ths_selected_symbol == normalized_symbol
+                and self.ths_backtest_result is current_result
+            ):
+                return
+            self._handling_ths_history_select = True
+            try:
+                self._show_ths_result(normalized_symbol)
+            finally:
+                self._handling_ths_history_select = False
+            return
+        self._show_saved_ths_stock_strategies(normalized_symbol)
+
+    def _on_ths_cache_tree_click(self, event: tk.Event) -> str | None:
+        row_id = self.ths_history_tree.identify_row(event.y)
+        if not row_id or not row_id.startswith("ths-stock:"):
+            return None
+        if self.ths_history_tree.identify_column(event.x) != "#0":
+            return None
+        element = str(self.ths_history_tree.identify_element(event.x, event.y)).lower()
+        if "indicator" in element:
+            return None
+        bbox = self.ths_history_tree.bbox(row_id, "#0")
+        if bbox and bbox[0] + 18 <= event.x <= bbox[0] + 48:
+            symbol = self._ths_symbol_from_iid(row_id)
+            if symbol in self.ths_checked_symbols:
+                self.ths_checked_symbols.remove(symbol)
+            else:
+                self.ths_checked_symbols.add(symbol)
+            self._render_ths_history()
+            if self.ths_history_tree.exists(row_id):
+                self.ths_history_tree.selection_set(row_id)
+                self.ths_history_tree.focus(row_id)
+            return "break"
+        return None
+
+    def _ths_selected_symbols(self) -> list[str]:
+        symbols: list[str] = []
+        for iid in self.ths_history_tree.selection():
+            row_id = str(iid)
+            symbol = self._ths_symbol_from_iid(row_id)
+            if not symbol:
+                symbol = self._ths_symbol_from_iid(str(self.ths_history_tree.parent(row_id)))
+            if symbol and symbol not in symbols:
+                symbols.append(symbol)
+        return symbols
+
+    def _set_selected_ths_stock_checks(self, checked: bool) -> None:
+        symbols = self._ths_selected_symbols()
+        if not symbols:
+            self.status_var.set("请先在同花顺左侧选中一只或多只股票")
+            return
+        if checked:
+            self.ths_checked_symbols.update(symbols)
+        else:
+            self.ths_checked_symbols.difference_update(symbols)
+        self._render_ths_history()
+        self.status_var.set(f"已{'勾选' if checked else '取消勾选'} {len(symbols)} 只同花顺股票")
+
+    def _check_all_ths_stocks(self) -> None:
+        self.ths_checked_symbols = {
+            engine.normalize_symbol(str(record.get("symbol", "")))
+            for _key, record in self._ths_saved_records()
+        }
+        self._render_ths_history()
+        self.status_var.set(f"已勾选全部 {len(self.ths_checked_symbols)} 只同花顺股票")
+
+    def _uncheck_all_ths_stocks(self) -> None:
+        self.ths_checked_symbols.clear()
+        self._render_ths_history()
+        self.status_var.set("已取消全部同花顺股票勾选")
+
+    def _show_ths_cache_context_menu(self, event: tk.Event) -> None:
+        row_id = self.ths_history_tree.identify_row(event.y)
+        if not row_id:
+            return
+        if row_id not in self.ths_history_tree.selection():
+            self.ths_history_tree.selection_set(row_id)
+        self.ths_history_tree.focus(row_id)
+        menu = self.ths_stock_context_menu if row_id.startswith("ths-stock:") else self.ths_strategy_context_menu
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _delete_selected_ths_cache(self) -> None:
+        selection = list(self.ths_history_tree.selection()) if hasattr(self, "ths_history_tree") else []
+        if not selection:
+            self.status_var.set("请先选择要删除的同花顺股票或策略")
+            return
+        cache = engine.load_persistent_strategy_cache()
+        keys_to_delete: set[str] = set()
+        keys_to_unstar: set[str] = set()
+        stock_symbols: set[str] = set()
+        for iid in selection:
+            row_id = str(iid)
+            if row_id.startswith("ths-stock:"):
+                symbol = self._ths_symbol_from_iid(row_id)
+                stock_symbols.add(symbol)
+                keys_to_delete.update(key for key, _record in self._ths_saved_records(symbol))
+            elif row_id in cache and self._record_matches_strategy_filter(cache[row_id], strategy_filter="ths"):
+                keys_to_unstar.add(row_id)
+        if not keys_to_delete and not keys_to_unstar:
+            self.status_var.set("没有可删除的同花顺策略")
+            return
+        prompt = (
+            f"整股后台删除 {len(keys_to_delete)} 条；"
+            f"单条策略取消加星 {len(keys_to_unstar)} 条。是否继续？"
+        )
+        if not messagebox.askyesno("删除同花顺策略", prompt):
+            return
+        for key_text in keys_to_delete:
+            cache.pop(key_text, None)
+        for key_text in keys_to_unstar:
+            record = cache.get(key_text)
+            if isinstance(record, dict):
+                _set_ths_record_state(cache, key_text, selected=False, active=False)
+        engine.save_persistent_strategy_cache()
+        for symbol in stock_symbols:
+            self.ths_backtest_results.pop(symbol, None)
+            self.ths_checked_symbols.discard(symbol)
+        self._render_ths_history()
+        self._render_saved_stock_picker()
+        self._render_monitor_strategy_list()
+        self.status_var.set(
+            f"已删除后台 {len(keys_to_delete)} 条，取消加星 {len(keys_to_unstar)} 条；"
+            "未加星历史策略仍保留在后台"
+        )
+
+    def _start_saved_ths_backtests(self, symbols: list[str], source_label: str) -> None:
+        if self.backtest_worker and self.backtest_worker.is_alive():
+            self.status_var.set("同花顺策略回测仍在运行，请稍等")
+            return
+        if not symbols:
+            self.status_var.set("没有可回测的同花顺股票")
+            return
+        if len(symbols) > 1 and self._validate_ths_parallel_workers() is None:
+            return
+        self.backtest_stop_event.clear()
+        self.backtest_target = "ths"
+        form = self._ths_backtest_form()
+        form["batch_symbols"] = " ".join(symbols)
+        form["_save_all_strategies"] = "1"
+        self.pending_backtest_form = form
+        self._set_backtest_running(True)
+        self.ths_summary_var.set(f"{source_label}：准备回测 {len(symbols)} 只股票...")
+        self.status_var.set("同花顺批量回测运行中，请稍等")
+        self.backtest_worker = threading.Thread(target=self._backtest_batch_worker, args=(symbols,), daemon=True)
+        self.backtest_worker.start()
+
+    def run_checked_ths_stock_backtests(self) -> None:
+        symbols = sorted(self.ths_checked_symbols)
+        if not symbols:
+            self.status_var.set("请先在同花顺股票名前勾选要回测的股票")
+            return
+        self._start_saved_ths_backtests(symbols, "同花顺勾选股票回测")
+
+    def run_all_ths_stock_backtests(self) -> None:
+        symbols = sorted({
+            engine.normalize_symbol(str(record.get("symbol", "")))
+            for _key, record in self._ths_saved_records()
+        })
+        self._start_saved_ths_backtests(symbols, "同花顺全部股票回测")
+
+    def run_selected_ths_stock_backtest(self) -> None:
+        symbols = self._ths_selected_symbols()
+        if not symbols:
+            self.status_var.set("请先选择一只同花顺股票")
+            return
+        self._start_saved_ths_backtests([symbols[0]], f"{symbols[0]} 同花顺单股回测")
+
+    def _show_ths_result(self, symbol: str, *, defer_chart: bool = False) -> None:
+        result = self.ths_backtest_results.get(engine.normalize_symbol(symbol))
+        if not result or not hasattr(self, "ths_tree"):
+            return
+        self.ths_selected_symbol = engine.normalize_symbol(symbol)
+        self.ths_backtest_result = result
+        self.ths_selected_scan_rank = 0
+        self.ths_saved_scan_keys = {}
+        self._render_result_table(self.ths_tree, result["scan"])
+        best = result["best"]
+        strategy_label = engine.STRATEGY_TYPES.get(str(best.get("strategy_type", "")), str(best.get("strategy_type", "")))
+        self.ths_summary_var.set(
+            f"{result['symbol']} {result['name']} | 同花顺最优 {strategy_label} {int(best['fast'])}/{int(best['slow'])} | "
+            f"收益 {float(best['total_return_pct']):.2f}% | 最大回撤 {float(best['max_drawdown_pct']):.2f}% | "
+            f"交易 {int(best['trades'])} 次 | 评分 {float(best['score']):.2f}"
+        )
+        children = self.ths_tree.get_children()
+        if children:
+            self.ths_tree.selection_set(children[0])
+            self.ths_tree.focus(children[0])
+            if defer_chart:
+                selected_symbol = self.ths_selected_symbol
+                self.after(30, lambda: self._draw_initial_ths_chart(selected_symbol))
+            else:
+                self._on_ths_rank_select()
+        parent_iid = self._ths_stock_iid(self.ths_selected_symbol)
+        if hasattr(self, "ths_history_tree") and self.ths_history_tree.exists(parent_iid):
+            if tuple(self.ths_history_tree.selection()) != (parent_iid,):
+                self.ths_history_tree.selection_set(parent_iid)
+                self.ths_history_tree.focus(parent_iid)
+
+    def _draw_initial_ths_chart(self, symbol: str) -> None:
+        if self.ths_selected_symbol != symbol:
+            return
+        result = self.ths_backtest_results.get(symbol)
+        if not result:
+            return
+        try:
+            # The worker already calculated the best strategy's signals and trades.
+            # Reuse them here instead of running the portfolio again on Tk's UI thread.
+            self._draw_backtest_chart(result, None, target="ths")
+        except Exception as exc:
+            self.status_var.set(f"同花顺策略画图失败：{exc}")
+
+    def _apply_ths_backtest_batch_result(self, payload: dict[str, Any]) -> None:
+        results: list[dict[str, Any]] = list(payload.get("results") or [])
+        errors: list[str] = list(payload.get("errors") or [])
+        total = int(payload.get("total") or (len(results) + len(errors)))
+        cancelled = bool(payload.get("cancelled"))
+        if results:
+            for result in results:
+                symbol = engine.normalize_symbol(str(result.get("symbol", "")))
+                self.ths_backtest_results[symbol] = result
+            first_symbol = engine.normalize_symbol(str(results[0].get("symbol", "")))
+            prefix = "同花顺批量回测已终止" if cancelled else "同花顺批量回测完成"
+            final_summary = f"{prefix}：成功 {len(results)}/{total}，当前展示 {results[0]['symbol']} {results[0]['name']}"
+            final_status = f"{prefix}：成功 {len(results)} 只，失败 {len(errors)} 只；点击本页左侧股票即可切换"
+            self.ths_summary_var.set(f"{prefix}：计算完成，正在刷新策略列表...")
+            self.status_var.set(f"{prefix}：正在分步刷新界面")
+            self.after(
+                20,
+                lambda: self._finish_ths_batch_result_ui(
+                    first_symbol,
+                    final_summary,
+                    final_status,
+                    errors,
+                ),
+            )
+            return
+        elif cancelled:
+            self.ths_summary_var.set("同花顺批量回测已终止")
+            self.status_var.set("同花顺批量回测已终止，未产生新结果")
+        else:
+            self.ths_summary_var.set("同花顺批量回测失败")
+            self.status_var.set("同花顺批量回测没有成功结果")
+        if errors:
+            messagebox.showwarning("部分同花顺策略回测失败", "\n".join(errors[:8]))
+
+    def _finish_ths_batch_result_ui(
+        self,
+        first_symbol: str,
+        final_summary: str,
+        final_status: str,
+        errors: list[str],
+    ) -> None:
+        _ui_debug("finish_ths_batch_result_ui_enter")
+        try:
+            self._render_ths_history()
+            self.ths_summary_var.set("策略列表已刷新，正在显示回测结果...")
+            self.after(
+                20,
+                lambda: self._finish_ths_batch_result_chart(
+                    first_symbol,
+                    final_summary,
+                    final_status,
+                    errors,
+                ),
+            )
+            _ui_debug("finish_ths_batch_result_ui_done")
+        except Exception as exc:
+            _ui_debug(f"finish_ths_batch_result_ui_error error={exc!r}")
+            self.ths_summary_var.set("同花顺结果刷新失败")
+            self.status_var.set(f"同花顺结果刷新失败：{_short_error_text(exc)}")
+
+    def _finish_ths_batch_result_chart(
+        self,
+        first_symbol: str,
+        final_summary: str,
+        final_status: str,
+        errors: list[str],
+    ) -> None:
+        _ui_debug("finish_ths_batch_result_chart_enter")
+        try:
+            self._show_ths_result(first_symbol, defer_chart=True)
+            self.ths_summary_var.set(final_summary)
+            self.status_var.set(final_status)
+            _ui_debug("finish_ths_batch_result_chart_done")
+            if errors:
+                _ui_debug(f"ths_batch_partial_errors count={len(errors)} first={errors[:3]!r}")
+        except Exception as exc:
+            _ui_debug(f"finish_ths_batch_result_chart_error error={exc!r}")
+            self.ths_summary_var.set("同花顺结果展示失败")
+            self.status_var.set(f"同花顺结果展示失败：{_short_error_text(exc)}")
+
+    def _selected_ths_scan_row(self) -> pd.Series | None:
+        result = self.ths_backtest_result
+        if not result or not hasattr(self, "ths_tree"):
+            return None
+        scan: pd.DataFrame = result["scan"]
+        selection = self.ths_tree.selection()
+        if selection:
+            try:
+                return scan.loc[int(selection[0])]
+            except Exception:
+                return None
+        if scan.empty:
+            return None
+        return scan.iloc[0]
+
+    def _on_ths_rank_select(self, _event: object | None = None) -> None:
+        selection = self.ths_tree.selection() if hasattr(self, "ths_tree") else ()
+        if selection:
+            try:
+                saved_rank = int(selection[0])
+            except (TypeError, ValueError):
+                saved_rank = -1
+            saved_key = self.ths_saved_scan_keys.get(saved_rank)
+            if saved_key:
+                self._start_saved_ths_strategy_preview(saved_key)
+                return
+        row = self._selected_ths_scan_row()
+        result = self.ths_backtest_result
+        if row is None or not result:
+            return
+        try:
+            self.ths_selected_scan_rank = int(row.name)
+        except Exception:
+            self.ths_selected_scan_rank = 0
+        strategy_type = str(row.get("strategy_type", ""))
+        strategy_label = engine.STRATEGY_TYPES.get(strategy_type, strategy_type)
+        self.ths_summary_var.set(
+            f"{result['symbol']} {result['name']} | 当前同花顺策略 {strategy_label} {int(row['fast'])}/{int(row['slow'])} | "
+            f"收益 {float(row['total_return_pct']):.2f}% | 最大回撤 {float(row['max_drawdown_pct']):.2f}% | "
+            f"交易 {int(row['trades'])} 次 | 评分 {float(row['score']):.2f}"
+        )
+        try:
+            self._draw_backtest_chart(result, row, target="ths")
+        except Exception as exc:
+            self.status_var.set(f"同花顺策略画图失败：{exc}")
+
+    def _show_ths_context_menu(self, event: tk.Event) -> None:
+        row_id = self.ths_tree.identify_row(event.y)
+        if row_id:
+            self.ths_tree.selection_set(row_id)
+            self.ths_tree.focus(row_id)
+            self._on_ths_rank_select()
+        if not self.ths_tree.selection():
+            self.status_var.set("请先在同花顺策略表里选择一条策略")
+            return
+        try:
+            self.ths_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.ths_context_menu.grab_release()
+
+    def _show_ths_strategy_card_popup(self) -> None:
+        row = self._selected_ths_scan_row()
+        if row is None:
+            self.status_var.set("请先在同花顺策略表里选择一条策略")
+            return
+        strategy_type = str(row.get("strategy_type", ""))
+        card = build_ths_strategy_card(strategy_type, int(row["fast"]), int(row["slow"]))
+
+        window = tk.Toplevel(self)
+        window.title(f"同花顺策略卡片 - {card.name}")
+        window.geometry("980x760")
+        window.minsize(760, 560)
+        window.configure(background="#eef3f8")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(2, weight=1)
+
+        title_box = ttk.Frame(window, padding=(18, 14, 18, 8))
+        title_box.grid(row=0, column=0, sticky="ew")
+        title_box.columnconfigure(0, weight=1)
+        ttk.Label(title_box, text=card.name, font=("Microsoft YaHei UI", 18, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            title_box,
+            text=f"{card.tagline}    参数 {int(row['fast'])}/{int(row['slow'])}",
+            foreground="#607086",
+        ).grid(row=1, column=0, sticky="w", pady=(5, 0))
+
+        rules = ttk.LabelFrame(window, text="同花顺可执行交易条件", padding=14)
+        rules.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+        rules.columnconfigure(1, weight=1)
+        tk.Label(rules, text="买入公式", foreground="#d9363e", background="#eef3f8", font=("Microsoft YaHei UI", 10, "bold")).grid(row=0, column=0, sticky="nw", padx=(0, 18))
+        ttk.Label(rules, text=card.buy_condition, wraplength=760, justify=tk.LEFT).grid(row=0, column=1, sticky="ew")
+        tk.Label(rules, text="卖出公式", foreground="#0f8f61", background="#eef3f8", font=("Microsoft YaHei UI", 10, "bold")).grid(row=1, column=0, sticky="nw", padx=(0, 18), pady=(10, 0))
+        ttk.Label(rules, text=card.sell_condition, wraplength=760, justify=tk.LEFT).grid(row=1, column=1, sticky="ew", pady=(10, 0))
+
+        notebook = ttk.Notebook(window)
+        notebook.grid(row=2, column=0, sticky="nsew", padx=16)
+        tab_specs: list[tuple[str, str, str]] = [
+            (
+                "交易解读",
+                "\n".join(
+                    [
+                        *(f"{index}. {line}" for index, line in enumerate(card.interpretation, 1)),
+                        "",
+                        f"优化建议：{card.optimization}",
+                        "",
+                        f"公式兼容性：{card.compatibility_note}",
+                        "",
+                        "说明：公式信号按日线收盘数据计算；用于实盘前请先在同花顺中编译并核对历史箭头。",
+                    ]
+                ),
+                "Microsoft YaHei UI",
+            ),
+            ("买入选股公式", card.selection_formula, "Consolas"),
+            ("同花顺回测公式", card.backtest_formula, "Consolas"),
+            ("交易系统公式", card.trading_formula, "Consolas"),
+            ("K线标注公式", card.overlay_formula, "Consolas"),
+        ]
+        tab_text_widgets: list[tk.Text] = []
+        for tab_name, content, font_name in tab_specs:
+            frame = ttk.Frame(notebook, padding=8)
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(0, weight=1)
+            text_box = tk.Text(
+                frame,
+                wrap="none" if font_name == "Consolas" else "word",
+                background="#ffffff",
+                foreground="#14213d",
+                relief=tk.FLAT,
+                padx=14,
+                pady=12,
+                font=(font_name, 10),
+            )
+            yscroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text_box.yview)
+            xscroll = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=text_box.xview)
+            text_box.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+            text_box.grid(row=0, column=0, sticky="nsew")
+            yscroll.grid(row=0, column=1, sticky="ns")
+            xscroll.grid(row=1, column=0, sticky="ew")
+            text_box.insert("1.0", content)
+            text_box.configure(state=tk.DISABLED)
+            notebook.add(frame, text=tab_name)
+            tab_text_widgets.append(text_box)
+
+        def current_text() -> str:
+            try:
+                index = notebook.index(notebook.select())
+            except Exception:
+                index = 0
+            return tab_text_widgets[index].get("1.0", tk.END).strip()
+
+        def copy_text(text: str, label: str) -> None:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update_idletasks()
+            self.status_var.set(f"已复制{label}，可粘贴到同花顺公式编辑器")
+
+        def export_all() -> None:
+            export_dir = engine.ROOT / "exports" / "ths_formulas"
+            export_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "_", card.name)
+            path = export_dir / f"{safe_name}_{int(row['fast'])}_{int(row['slow'])}.txt"
+            payload = (
+                f"策略：{card.name}\n买入条件：{card.buy_condition}\n卖出条件：{card.sell_condition}\n"
+                f"兼容性：{card.compatibility_note}\n\n[买入选股公式]\n{card.selection_formula}\n\n"
+                f"[同花顺回测公式]\n{card.backtest_formula}\n\n"
+                f"[交易系统公式]\n{card.trading_formula}\n\n[K线标注公式]\n{card.overlay_formula}\n"
+            )
+            path.write_text(payload, encoding="utf-8")
+            self.status_var.set(f"同花顺公式已导出：{path}")
+
+        buttons = ttk.Frame(window, padding=(16, 10, 16, 14))
+        buttons.grid(row=3, column=0, sticky="ew")
+        ttk.Button(buttons, text="复制当前页", command=lambda: copy_text(current_text(), "当前页")).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="复制同花顺回测公式", command=lambda: copy_text(card.backtest_formula, "同花顺回测公式"), style="Primary.TButton").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(buttons, text="导出全部公式", command=export_all).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(buttons, text="关闭", command=window.destroy).pack(side=tk.RIGHT)
+        window.transient(self)
+        window.lift()
+
+    def _show_ths_strategy_description_popup(self) -> None:
+        self._show_ths_strategy_card_popup()
 
     def _apply_saved_strategy_preview_chart(self, result: dict[str, Any]) -> None:
         self.backtest_result = result
@@ -6369,7 +8298,31 @@ class StrategyDesktopApp(tk.Tk):
         worker = threading.Thread(target=self._save_selected_rank_strategy_worker, args=(result, row.copy(), form), daemon=True)
         worker.start()
 
-    def _save_selected_rank_strategy_worker(self, result: dict[str, Any], row: pd.Series, form: dict[str, str]) -> None:
+    def _save_selected_ths_strategy(self) -> None:
+        result = self.ths_backtest_result
+        row = self._selected_ths_scan_row()
+        if not result or row is None:
+            self.status_var.set("请先完成同花顺回测并在右侧选择一条策略")
+            return
+        form = self._ths_backtest_form()
+        form["_save_strategy"] = "1"
+        form["_active_strategy"] = "1"
+        form["_selected_for_left"] = "1"
+        self.status_var.set("正在后台保存选中的同花顺策略...")
+        worker = threading.Thread(
+            target=self._save_selected_rank_strategy_worker,
+            args=(result, row.copy(), form, "ths"),
+            daemon=True,
+        )
+        worker.start()
+
+    def _save_selected_rank_strategy_worker(
+        self,
+        result: dict[str, Any],
+        row: pd.Series,
+        form: dict[str, str],
+        target: str = "traditional",
+    ) -> None:
         try:
             data: pd.DataFrame = result["data"]
             horizon = str(result.get("horizon") or form.get("horizon", "short"))
@@ -6389,10 +8342,30 @@ class StrategyDesktopApp(tk.Tk):
                 horizon,
                 str(result.get("name") or ""),
             )
+            saved_key_text = ""
+            if target == "ths":
+                cache_key = engine.strategy_cache_key(
+                    str(result["symbol"]),
+                    form.get("start", "20200101"),
+                    form.get("adjust", "qfq"),
+                    float(form.get("cash") or 100000),
+                    float(form.get("fee") or 0.0003),
+                    horizon,
+                    f"{strategy_type}_{fast}_{slow}",
+                    form.get("risk", "normal"),
+                )
+                saved_key_text = engine.strategy_cache_key_text(cache_key)
+                cache = engine.load_persistent_strategy_cache()
+                record = cache.get(saved_key_text)
+                if isinstance(record, dict):
+                    _set_ths_record_state(cache, saved_key_text, selected=True, active=True)
+                    engine.save_persistent_strategy_cache()
             self.queue.put(
                 WorkerMessage(
                     "strategy_saved",
                     payload={
+                        "target": target,
+                        "key_text": saved_key_text,
                         "result": result,
                         "row": row,
                         "gate": gate,
@@ -6413,6 +8386,24 @@ class StrategyDesktopApp(tk.Tk):
         result["best"] = payload["row"]
         result["fast_line"] = payload["fast_line"]
         result["slow_line"] = payload["slow_line"]
+        if str(payload.get("target", "")) == "ths":
+            symbol = engine.normalize_symbol(str(result.get("symbol", "")))
+            self.ths_backtest_results[symbol] = result
+            self.ths_backtest_result = result
+            self._render_ths_history()
+            parent_iid = self._ths_stock_iid(symbol)
+            key_text = str(payload.get("key_text", ""))
+            if self.ths_history_tree.exists(parent_iid):
+                self.ths_history_tree.item(parent_iid, open=True)
+            if key_text and self.ths_history_tree.exists(key_text):
+                self.ths_history_tree.selection_set(key_text)
+                self.ths_history_tree.focus(key_text)
+            strategy_type = str(payload["strategy_type"])
+            label = engine.STRATEGY_TYPES.get(strategy_type, strategy_type)
+            self.status_var.set(
+                f"已保存同花顺策略：{symbol} {label} {payload['fast']}/{payload['slow']}；可继续保存多条"
+            )
+            return
         self._render_strategy_cache_list()
         strategy_type = str(payload["strategy_type"])
         label = engine.STRATEGY_TYPES.get(strategy_type, strategy_type)
@@ -6433,6 +8424,21 @@ class StrategyDesktopApp(tk.Tk):
         self.backtest_zoom = (new_start, new_start + new_len)
         self._draw_backtest_payload()
 
+    def _zoom_ths_backtest(self, factor: float) -> None:
+        payload = self.ths_backtest_chart_payload
+        if not payload or not hasattr(self, "ths_canvas"):
+            return
+        total = len(payload.get("points", []))
+        if total <= 2:
+            return
+        start, end = self.ths_backtest_zoom or (0, total)
+        current = max(2, end - start)
+        new_len = max(30, min(total, int(current * factor)))
+        center = start + current // 2
+        new_start = max(0, min(total - new_len, center - new_len // 2))
+        self.ths_backtest_zoom = (new_start, new_start + new_len)
+        self._draw_backtest_payload_on_canvas(self.ths_canvas, self.ths_backtest_zoom, payload)
+
     def _reset_backtest_zoom(self) -> None:
         self.backtest_zoom = None
         self.backtest_drag_start_x = None
@@ -6443,23 +8449,43 @@ class StrategyDesktopApp(tk.Tk):
             self.backtest_drag_rect = None
         self._draw_backtest_payload()
 
-    def _open_backtest_fullscreen(self) -> None:
-        if not self.backtest_chart_payload:
+    def _reset_ths_backtest_zoom(self) -> None:
+        self.ths_backtest_zoom = None
+        if hasattr(self, "ths_canvas"):
+            self._draw_backtest_payload_on_canvas(self.ths_canvas, self.ths_backtest_zoom, self.ths_backtest_chart_payload)
+
+    def _open_ths_backtest_fullscreen(self) -> None:
+        self._open_backtest_fullscreen(
+            payload=self.ths_backtest_chart_payload,
+            initial_zoom=self.ths_backtest_zoom,
+            title="同花顺策略回测曲线全屏",
+        )
+
+    def _open_backtest_fullscreen(
+        self,
+        payload: dict[str, Any] | None = None,
+        initial_zoom: tuple[int, int] | None = None,
+        title: str = "传统回测曲线全屏",
+    ) -> None:
+        selected_payload = payload if payload is not None else self.backtest_chart_payload
+        if not selected_payload:
             self.status_var.set("还没有回测曲线，先跑一次回测")
             return
+        self.backtest_fullscreen_payload = selected_payload
+        self.backtest_fullscreen_zoom = initial_zoom if payload is not None else self.backtest_zoom
         if self.backtest_fullscreen_window is not None and self.backtest_fullscreen_window.winfo_exists():
+            self.backtest_fullscreen_window.title(title)
             self.backtest_fullscreen_window.lift()
             self.backtest_fullscreen_window.focus_force()
             self._draw_backtest_fullscreen_payload()
             return
 
         window = tk.Toplevel(self)
-        window.title("回测曲线全屏")
+        window.title(title)
         window.configure(background="#eef3f8")
         window.columnconfigure(0, weight=1)
         window.rowconfigure(1, weight=1)
         self.backtest_fullscreen_window = window
-        self.backtest_fullscreen_zoom = self.backtest_zoom
 
         toolbar = ttk.Frame(window, padding=(12, 10, 12, 8))
         toolbar.grid(row=0, column=0, sticky="ew")
@@ -6498,6 +8524,7 @@ class StrategyDesktopApp(tk.Tk):
         window = self.backtest_fullscreen_window
         self.backtest_fullscreen_window = None
         self.backtest_fullscreen_canvas = None
+        self.backtest_fullscreen_payload = None
         self.backtest_fullscreen_drag_start_x = None
         self.backtest_fullscreen_drag_rect = None
         self.backtest_fullscreen_pan_start_x = None
@@ -6506,7 +8533,7 @@ class StrategyDesktopApp(tk.Tk):
             window.destroy()
 
     def _zoom_backtest_fullscreen(self, factor: float) -> None:
-        payload = self.backtest_chart_payload
+        payload = self.backtest_fullscreen_payload
         if not payload:
             return
         total = len(payload.get("points", []))
@@ -6533,10 +8560,10 @@ class StrategyDesktopApp(tk.Tk):
         canvas = self.backtest_fullscreen_canvas
         if canvas is None or not canvas.winfo_exists():
             return
-        self._draw_backtest_payload_on_canvas(canvas, self.backtest_fullscreen_zoom)
+        self._draw_backtest_payload_on_canvas(canvas, self.backtest_fullscreen_zoom, self.backtest_fullscreen_payload)
 
     def _schedule_backtest_fullscreen_redraw(self, _event: tk.Event | None = None) -> None:
-        if not self.backtest_chart_payload or self.backtest_fullscreen_canvas is None:
+        if not self.backtest_fullscreen_payload or self.backtest_fullscreen_canvas is None:
             return
         if self.backtest_fullscreen_resize_job is not None:
             try:
@@ -6690,8 +8717,9 @@ class StrategyDesktopApp(tk.Tk):
         start_x: int | None,
         current_x: int,
         start_zoom: tuple[int, int] | None,
+        payload: dict[str, Any] | None = None,
     ) -> tuple[int, int] | None:
-        payload = self.backtest_chart_payload
+        payload = payload if payload is not None else self.backtest_chart_payload
         if not payload or start_x is None:
             return None
         points = payload.get("points", [])
@@ -6733,7 +8761,7 @@ class StrategyDesktopApp(tk.Tk):
 
     def _on_backtest_fullscreen_drag_start(self, event: tk.Event) -> None:
         canvas = self.backtest_fullscreen_canvas
-        if not self.backtest_chart_payload or canvas is None:
+        if not self.backtest_fullscreen_payload or canvas is None:
             return
         left, right, top, bottom = self._backtest_plot_bounds_for_canvas(canvas)
         x = max(left, min(right, int(event.x)))
@@ -6760,7 +8788,7 @@ class StrategyDesktopApp(tk.Tk):
         canvas.coords(self.backtest_fullscreen_drag_rect, self.backtest_fullscreen_drag_start_x, top, x, bottom)
 
     def _on_backtest_fullscreen_drag_release(self, event: tk.Event) -> None:
-        payload = self.backtest_chart_payload
+        payload = self.backtest_fullscreen_payload
         canvas = self.backtest_fullscreen_canvas
         start_x = self.backtest_fullscreen_drag_start_x
         if not payload or canvas is None or start_x is None:
@@ -6774,7 +8802,7 @@ class StrategyDesktopApp(tk.Tk):
 
         x1, x2 = sorted((start_x, end_x))
         if x2 - x1 < 12:
-            self._show_backtest_point_info(canvas, event.x, self.backtest_fullscreen_zoom)
+            self._show_backtest_point_info(canvas, event.x, self.backtest_fullscreen_zoom, payload)
             return
         points = payload.get("points", [])
         total = len(points)
@@ -6796,9 +8824,10 @@ class StrategyDesktopApp(tk.Tk):
 
     def _on_backtest_fullscreen_pan_start(self, event: tk.Event) -> None:
         canvas = self.backtest_fullscreen_canvas
-        if not self.backtest_chart_payload or canvas is None:
+        payload = self.backtest_fullscreen_payload
+        if not payload or canvas is None:
             return
-        total = len(self.backtest_chart_payload.get("points", []))
+        total = len(payload.get("points", []))
         self.backtest_fullscreen_pan_start_x = int(event.x)
         self.backtest_fullscreen_pan_start_zoom = self.backtest_fullscreen_zoom or (0, total)
         canvas.configure(cursor="fleur")
@@ -6807,7 +8836,13 @@ class StrategyDesktopApp(tk.Tk):
         canvas = self.backtest_fullscreen_canvas
         if canvas is None:
             return
-        zoom = self._pan_zoom_from_drag(canvas, self.backtest_fullscreen_pan_start_x, int(event.x), self.backtest_fullscreen_pan_start_zoom)
+        zoom = self._pan_zoom_from_drag(
+            canvas,
+            self.backtest_fullscreen_pan_start_x,
+            int(event.x),
+            self.backtest_fullscreen_pan_start_zoom,
+            self.backtest_fullscreen_payload,
+        )
         if zoom is None:
             return
         self.backtest_fullscreen_zoom = zoom
@@ -6819,8 +8854,8 @@ class StrategyDesktopApp(tk.Tk):
         self.backtest_fullscreen_pan_start_zoom = None
         if canvas is not None:
             canvas.configure(cursor="")
-        if self.backtest_fullscreen_zoom and self.backtest_chart_payload:
-            total = len(self.backtest_chart_payload.get("points", []))
+        if self.backtest_fullscreen_zoom and self.backtest_fullscreen_payload:
+            total = len(self.backtest_fullscreen_payload.get("points", []))
             self.status_var.set(f"全屏图已平移到：{self.backtest_fullscreen_zoom[0] + 1}-{self.backtest_fullscreen_zoom[1]}/{total}")
 
     def _on_monitor_select(self, _event: object | None = None) -> None:
@@ -7093,20 +9128,21 @@ class StrategyDesktopApp(tk.Tk):
             points = visible
         self._draw_backtest_canvas(points, buys, sells, title, indicator_points, indicator_type, canvas=canvas)
 
-    def _draw_backtest_chart(self, result: dict[str, Any], row: pd.Series | None = None) -> None:
+    def _draw_backtest_chart(self, result: dict[str, Any], row: pd.Series | None = None, target: str = "traditional") -> None:
         data: pd.DataFrame = result["data"]
         horizon = str(result.get("horizon", "short"))
         cash = float(result["cash"])
         fee = float(result["fee"])
-        selected = row if row is not None else result.get("best")
 
-        if isinstance(selected, pd.Series):
-            fast = int(selected["fast"])
-            slow = int(selected["slow"])
-            strategy_type = str(selected.get("strategy_type", "sma"))
+        if row is not None:
+            fast = int(row["fast"])
+            slow = int(row["slow"])
+            strategy_type = str(row.get("strategy_type", "sma"))
             fast_line, slow_line, entries, exits = engine.strategy_signals(data, fast, slow, horizon, strategy_type)
             trades: pd.DataFrame = engine.strategy_portfolio(data, entries, exits, cash, fee, horizon).trades.records_readable
         else:
+            # The worker already calculated the best row. Reusing it avoids running
+            # vectorbt/Numba on Tk's UI thread when a batch result first appears.
             fast_line = result["fast_line"]
             slow_line = result["slow_line"]
             trades = result["trades"]
@@ -7166,7 +9202,7 @@ class StrategyDesktopApp(tk.Tk):
                     sells.append({"time": exit_time.strftime("%Y-%m-%d"), "price": float(trade["Avg Exit Price"])})
 
         label = engine.STRATEGY_TYPES.get(strategy_type, strategy_type)
-        self.backtest_chart_payload = {
+        payload = {
             "points": points,
             "buys": buys,
             "sells": sells,
@@ -7174,6 +9210,13 @@ class StrategyDesktopApp(tk.Tk):
             "indicator_points": indicator_points,
             "indicator_type": indicator_type,
         }
+        if target == "ths":
+            self.ths_backtest_chart_payload = payload
+            self.ths_backtest_zoom = None
+            if hasattr(self, "ths_canvas"):
+                self._draw_backtest_payload_on_canvas(self.ths_canvas, self.ths_backtest_zoom, self.ths_backtest_chart_payload)
+            return
+        self.backtest_chart_payload = payload
         self.backtest_zoom = None
         self.backtest_fullscreen_zoom = None
         self._draw_backtest_payload()
@@ -7182,8 +9225,12 @@ class StrategyDesktopApp(tk.Tk):
     def _draw_backtest_payload(self) -> None:
         self._draw_backtest_payload_on_canvas(self.backtest_canvas, self.backtest_zoom)
 
-    def _backtest_visible_payload(self, zoom: tuple[int, int] | None = None) -> dict[str, Any] | None:
-        payload = self.backtest_chart_payload
+    def _backtest_visible_payload(
+        self,
+        zoom: tuple[int, int] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        payload = payload if payload is not None else self.backtest_chart_payload
         if not payload:
             return None
         points: list[dict[str, Any]] = list(payload.get("points", []))
@@ -7213,8 +9260,13 @@ class StrategyDesktopApp(tk.Tk):
             "total": total,
         }
 
-    def _draw_backtest_payload_on_canvas(self, canvas: tk.Canvas, zoom: tuple[int, int] | None = None) -> None:
-        visible_payload = self._backtest_visible_payload(zoom)
+    def _draw_backtest_payload_on_canvas(
+        self,
+        canvas: tk.Canvas,
+        zoom: tuple[int, int] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        visible_payload = self._backtest_visible_payload(zoom, payload)
         if not visible_payload:
             self._draw_backtest_canvas([], [], [], "暂无回测曲线", canvas=canvas)
             return
@@ -7496,8 +9548,14 @@ class StrategyDesktopApp(tk.Tk):
             canvas.create_line(x, axis_bottom, x, axis_bottom + 5, fill="#cbd5e1")
             canvas.create_text(x, height - 18, text=label, fill="#607086", anchor="center", font=("Microsoft YaHei", 8))
 
-    def _show_backtest_point_info(self, canvas: tk.Canvas, x: int, zoom: tuple[int, int] | None = None) -> None:
-        visible_payload = self._backtest_visible_payload(zoom)
+    def _show_backtest_point_info(
+        self,
+        canvas: tk.Canvas,
+        x: int,
+        zoom: tuple[int, int] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        visible_payload = self._backtest_visible_payload(zoom, payload)
         if not visible_payload:
             return
         points: list[dict[str, Any]] = list(visible_payload.get("points", []))

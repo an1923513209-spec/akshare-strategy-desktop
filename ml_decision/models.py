@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
+import json
 import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -21,6 +24,86 @@ except ImportError:  # pragma: no cover - compatibility with transitional sklear
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def configured_xgboost_device() -> str:
+    """Return the explicit CUDA device used by every production tree model."""
+    raw = str(os.environ.get("ML_XGBOOST_DEVICE", "cuda:0") or "cuda:0").strip().lower()
+    if raw == "cuda":
+        return "cuda:0"
+    if not raw.startswith("cuda:"):
+        raise RuntimeError(f"ML_XGBOOST_DEVICE 必须是 CUDA 设备，例如 cuda:0；当前为 {raw!r}")
+    return raw
+
+
+def configured_xgboost_cpu_threads() -> int:
+    """Keep host-side XGBoost work bounded so it cannot saturate the desktop."""
+    try:
+        value = int(os.environ.get("ML_XGBOOST_CPU_THREADS", "2") or "2")
+    except ValueError:
+        value = 2
+    return min(max(value, 1), 8)
+
+
+def xgboost_backend_label(runtime: dict[str, Any] | None = None) -> str:
+    status = runtime or require_xgboost_cuda()
+    cuda_version = status.get("cuda_version") or "unknown"
+    return (
+        f"XGBoost {status.get('xgboost_version', '?')} CUDA {cuda_version} "
+        f"({status.get('actual_device', '?')})"
+    )
+
+
+@lru_cache(maxsize=4)
+def require_xgboost_cuda(device: str | None = None) -> dict[str, Any]:
+    """Run a real fit and verify that XGBoost created a CUDA booster.
+
+    Checking ``build_info`` alone is insufficient: a CUDA-enabled wheel can
+    still start with an unavailable or incorrectly selected device.  The tiny
+    probe is cached once per process and prevents silent CPU-only training.
+    """
+    selected = device or configured_xgboost_device()
+    try:
+        import xgboost as xgb
+    except Exception as exc:
+        raise RuntimeError("未安装 xgboost，无法使用 GPU 训练") from exc
+    try:
+        info = xgb.build_info()
+    except Exception as exc:
+        raise RuntimeError("无法读取 xgboost 编译信息，不能确认 CUDA 可用") from exc
+    if not bool(info.get("USE_CUDA")):
+        raise RuntimeError("当前 xgboost 不是 CUDA 版本，已拒绝退回 CPU 训练")
+
+    probe_x = np.asarray(
+        [[0.0, 1.0], [1.0, 0.0], [0.2, 0.8], [0.8, 0.2]], dtype=np.float32
+    )
+    probe_y = np.asarray([0, 1, 0, 1], dtype=np.int32)
+    try:
+        probe = xgb.XGBClassifier(
+            n_estimators=1,
+            max_depth=1,
+            tree_method="hist",
+            device=selected,
+            n_jobs=1,
+            verbosity=0,
+        )
+        probe.fit(probe_x, probe_y)
+        booster_config = json.loads(probe.get_booster().save_config())
+        actual_device = str(booster_config["learner"]["generic_param"]["device"])
+    except Exception as exc:
+        raise RuntimeError(f"CUDA 训练自检失败（请求设备 {selected}）：{exc}") from exc
+    if not actual_device.startswith("cuda:"):
+        raise RuntimeError(
+            f"XGBoost 实际设备为 {actual_device}，已拒绝静默退回 CPU"
+        )
+    return {
+        "backend": "XGBoost CUDA",
+        "requested_device": selected,
+        "actual_device": actual_device,
+        "xgboost_version": str(xgb.__version__),
+        "cuda_version": ".".join(str(part) for part in info.get("CUDA_VERSION", [])),
+        "cpu_threads": configured_xgboost_cpu_threads(),
+    }
 
 
 @dataclass(slots=True)
@@ -92,10 +175,21 @@ class _LegacyNextSessionModel:
 
     MIN_USABLE_ROWS = 50
 
-    def __init__(self, calibration_method: str = "sigmoid", random_state: int = 42, use_shap: bool = True) -> None:
+    def __init__(
+        self,
+        calibration_method: str = "sigmoid",
+        random_state: int = 42,
+        use_shap: bool = True,
+        gpu_device: str | None = None,
+        host_cpu_threads: int | None = None,
+    ) -> None:
         self.calibration_method = calibration_method if calibration_method in {"sigmoid", "isotonic"} else "sigmoid"
         self.random_state = random_state
         self.use_shap = bool(use_shap)
+        self.gpu_device = gpu_device or configured_xgboost_device()
+        self.host_cpu_threads = min(
+            max(int(host_cpu_threads or configured_xgboost_cpu_threads()), 1), 8
+        )
         self.feature_columns: list[str] = []
         self.models: dict[str, Any] = {}
         self.metrics: dict[str, float] = {}
@@ -125,7 +219,7 @@ class _LegacyNextSessionModel:
         self.models["q90"] = self._fit_quantile(x_train, train["next_open_to_next_open_return"], 0.90)
 
         self.metrics = self._score_validation(valid, x_valid)
-        self.metrics["model_backend"] = "XGBoost CUDA"
+        self.metrics["model_backend"] = xgboost_backend_label()
         self.metrics["train_rows"] = float(len(train))
         self.metrics["valid_rows"] = float(len(valid))
         return self
@@ -295,20 +389,11 @@ class _LegacyNextSessionModel:
         names = [name for name, _value in pairs]
         return [], []
 
-    def _require_xgboost_cuda(self) -> None:
-        try:
-            import xgboost as xgb
-        except Exception as exc:
-            raise RuntimeError("未安装 xgboost，无法使用 GPU 训练") from exc
-        try:
-            info = xgb.build_info()
-        except Exception as exc:
-            raise RuntimeError("无法读取 xgboost 编译信息，不能确认 CUDA 可用") from exc
-        if not bool(info.get("USE_CUDA")):
-            raise RuntimeError("当前 xgboost 不是 CUDA 版本，无法使用 GPU 训练")
+    def _require_xgboost_cuda(self) -> dict[str, Any]:
+        return require_xgboost_cuda(self.gpu_device)
 
     def _xgb_regressor(self) -> Any:
-        self._require_xgboost_cuda()
+        runtime = self._require_xgboost_cuda()
         from xgboost import XGBRegressor
 
         return XGBRegressor(
@@ -320,13 +405,14 @@ class _LegacyNextSessionModel:
             subsample=0.9,
             colsample_bytree=0.9,
             tree_method="hist",
-            device="cuda",
+            device=runtime["actual_device"],
+            n_jobs=self.host_cpu_threads,
             random_state=self.random_state,
             verbosity=0,
         )
 
     def _xgb_quantile(self, alpha: float) -> Any:
-        self._require_xgboost_cuda()
+        runtime = self._require_xgboost_cuda()
         from xgboost import XGBRegressor
 
         return XGBRegressor(
@@ -339,13 +425,14 @@ class _LegacyNextSessionModel:
             subsample=0.9,
             colsample_bytree=0.9,
             tree_method="hist",
-            device="cuda",
+            device=runtime["actual_device"],
+            n_jobs=self.host_cpu_threads,
             random_state=self.random_state,
             verbosity=0,
         )
 
     def _xgb_classifier(self) -> Any:
-        self._require_xgboost_cuda()
+        runtime = self._require_xgboost_cuda()
         from xgboost import XGBClassifier
 
         return XGBClassifier(
@@ -358,7 +445,8 @@ class _LegacyNextSessionModel:
             subsample=0.9,
             colsample_bytree=0.9,
             tree_method="hist",
-            device="cuda",
+            device=runtime["actual_device"],
+            n_jobs=self.host_cpu_threads,
             random_state=self.random_state,
             verbosity=0,
         )
@@ -421,7 +509,7 @@ class NextSessionModel(_LegacyNextSessionModel):
         self.metrics.update(self._calibration_metrics)
         self.metrics.update(
             {
-                "model_backend": "XGBoost CUDA",
+                "model_backend": xgboost_backend_label(),
                 "train_rows": float(len(train)),
                 "calibration_rows": float(len(calibration)),
                 "valid_rows": float(len(validation)),
@@ -493,7 +581,7 @@ class NextSessionModel(_LegacyNextSessionModel):
                 "production_training_end": str(dates.max().date()),
                 "production_calibration_start": str(calibration_dates.min().date()),
                 "production_calibration_end": str(calibration_dates.max().date()),
-                "model_backend": "XGBoost CUDA",
+                "model_backend": xgboost_backend_label(),
             }
         )
         return self

@@ -146,6 +146,12 @@ def test_ml_policy_report_requires_the_complete_strict_oos_bundle(tmp_path: Path
 
 
 def test_monthly_training_progress_tracks_real_log_counters() -> None:
+    progress, stage = desktop._monthly_training_progress(
+        ["[gpu] verified XGBoost 3.2.0 CUDA 12.9 (cuda:0)"]
+    )
+    assert progress == 1.5
+    assert "CUDA 自检通过" in stage
+
     progress, stage = desktop._monthly_training_progress(["[market 5/10] 000001 A"])
     assert progress == 15.5
     assert "5/10" in stage

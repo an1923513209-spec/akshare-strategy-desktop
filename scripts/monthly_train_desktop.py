@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import app as engine
 from ml_decision.data_sources import fetch_external_factor_frame, merge_external_factors
+from ml_decision.models import require_xgboost_cuda, xgboost_backend_label
 from ml_decision.workflows import monthly_train
 
 
@@ -110,6 +111,13 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=int(os.environ.get("ML_MARKET_FETCH_WORKERS", "8") or "8"))
     parser.add_argument("--version")
     args = parser.parse_args()
+    runtime = require_xgboost_cuda()
+    print(
+        "[gpu] verified "
+        f"{xgboost_backend_label(runtime)}; host_threads={runtime['cpu_threads']}; "
+        "CPU remains responsible for data loading, factors and calibration",
+        flush=True,
+    )
     panel, errors = build_training_panel(args.start, args.adjust, max_workers=args.workers)
     data_path = Path(args.data)
     data_path.parent.mkdir(parents=True, exist_ok=True)

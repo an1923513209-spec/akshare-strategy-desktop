@@ -17,7 +17,7 @@ from .ensemble import apply_event_gates, combine_group_predictions, compute_dyna
 from .evaluation import evaluate_factors, evaluate_prediction_frame
 from .factor_registry import build_factor_groups, classify_factor, factor_group_counts, source_requirements
 from .features import TARGET_COLUMNS, add_labels, build_features, feature_columns
-from .models import NextSessionModel
+from .models import NextSessionModel, xgboost_backend_label
 from .policy import FactorPolicyParameters, calibrate_factor_policy
 from .schema import FEATURE_SCHEMA_VERSION, feature_schema_hash
 from .governance_training import (
@@ -234,6 +234,11 @@ def monthly_train(
             policy_oos_frames.append(all_factor_result.predictions.assign(window_id=window.window_id))
         if all_factor_result is not None and all_factor_result.feature_columns:
             try:
+                print(
+                    f"[cpu-baseline] window={window.window_id} "
+                    "running Ridge/Logistic comparison only",
+                    flush=True,
+                )
                 oos_rows.extend(
                     evaluate_stable_baselines(
                         dataset,
@@ -343,6 +348,8 @@ def monthly_train(
             calibration_method=model_settings.get("calibration_method", "sigmoid"),
             random_state=int(model_settings.get("random_state", 42)),
             use_shap=bool(model_settings.get("use_shap", True)),
+            gpu_device=str(model_settings.get("device", "cuda:0")),
+            host_cpu_threads=int(model_settings.get("host_cpu_threads", 2)),
         ).refit_production(
             dataset,
             result.feature_columns,
@@ -390,7 +397,7 @@ def monthly_train(
         "factor_diagnostics": factor_diagnostics,
         "random_seed": settings.get("model", {}).get("random_state", 42),
         "transaction_cost": settings["factor_evaluation"].get("transaction_cost", 0.0016),
-        "model_backend": "XGBoost CUDA",
+        "model_backend": xgboost_backend_label(),
         "calibration_status": latest_results["all_factor"].model.metrics.get("calibration_up_status", "unknown"),
         "calibration_metrics": {
             key: value

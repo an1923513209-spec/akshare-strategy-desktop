@@ -126,6 +126,9 @@
   "model": {
     "random_state": 42,
     "calibration_method": "sigmoid",
-    "use_shap": true
+    "use_shap": true,
+    "device": "cuda:0",
+    "host_cpu_threads": 2,
+    "require_cuda": true
   }
 }

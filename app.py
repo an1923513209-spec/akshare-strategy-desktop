@@ -30,6 +30,7 @@ STRATEGY_CACHE_PATH = CACHE_DIR / "strategy_cache.json"
 sys.path.insert(0, str(SCRIPTS))
 
 from data_utils import load_a_share_daily, normalize_symbol  # noqa: E402
+from ths_strategy_catalog import strategy_title_map  # noqa: E402
 
 
 app = Flask(__name__)
@@ -74,6 +75,13 @@ STRATEGY_GRIDS = {
 STRATEGY_TYPES = {
     "auto": "Auto",
     "auto_fast": "Auto Fast",
+    "ths_auto": "THS All",
+    "ths_hybrid": "THS Hybrid",
+    "ths_indicator": "THS Indicator",
+    "ths_oscillator": "THS Oscillator",
+    "ths_volume_price": "THS Volume Price",
+    "ths_capital": "THS Capital",
+    "ths_lhb": "THS LHB Institution",
     "sma": "SMA Trend",
     "breakout": "Breakout",
     "rsi": "RSI Pullback",
@@ -84,6 +92,7 @@ STRATEGY_TYPES = {
     "breakout_capital": "Breakout Capital",
     "ml": "ML Stacking",
     "hybrid": "Hybrid Vote",
+    **strategy_title_map(),
 }
 
 
@@ -771,6 +780,347 @@ def williams_r(data: pd.DataFrame, window: int = 14) -> pd.Series:
     high_max = data["High"].rolling(window).max()
     low_min = data["Low"].rolling(window).min()
     return -100 * (high_max - data["Close"]) / (high_max - low_min).replace(0, np.nan)
+
+
+def cci(data: pd.DataFrame, window: int = 14) -> pd.Series:
+    typical = (data["High"] + data["Low"] + data["Close"]) / 3
+    ma = typical.rolling(window).mean()
+    mad = (typical - ma).abs().rolling(window).mean()
+    return (typical - ma) / (0.015 * mad.replace(0, np.nan))
+
+
+def bias(close: pd.Series, window: int = 20) -> pd.Series:
+    ma = close.rolling(window).mean()
+    return (close / ma.replace(0, np.nan) - 1) * 100
+
+
+def _cross_up(left: pd.Series, right: pd.Series | float) -> pd.Series:
+    if not isinstance(right, pd.Series):
+        right = pd.Series(float(right), index=left.index)
+    return (left > right) & (left.shift(1) <= right.shift(1))
+
+
+def _cross_down(left: pd.Series, right: pd.Series | float) -> pd.Series:
+    if not isinstance(right, pd.Series):
+        right = pd.Series(float(right), index=left.index)
+    return (left < right) & (left.shift(1) >= right.shift(1))
+
+
+def _volume_ratio(data: pd.DataFrame, window: int = 20) -> pd.Series:
+    return data["Volume"] / data["Volume"].rolling(window).mean().replace(0, np.nan)
+
+
+def _amount_proxy(data: pd.DataFrame) -> pd.Series:
+    if "Amount" in data.columns:
+        return pd.to_numeric(data["Amount"], errors="coerce")
+    if "amount" in data.columns:
+        return pd.to_numeric(data["amount"], errors="coerce")
+    return data["Close"] * data["Volume"]
+
+
+def _first_numeric_column(data: pd.DataFrame, names: list[str]) -> pd.Series | None:
+    lower_map = {str(column).lower(): column for column in data.columns}
+    for name in names:
+        column = lower_map.get(name.lower())
+        if column is not None:
+            return pd.to_numeric(data[column], errors="coerce")
+    return None
+
+
+def _capital_proxy(data: pd.DataFrame) -> pd.Series:
+    direct = _first_numeric_column(
+        data,
+        [
+            "dde_net_amount",
+            "dde_net_volume",
+            "main_net_inflow",
+            "main_net_amount",
+            "super_large_net_amount",
+            "fund_main_net_inflow",
+            "主力净流入",
+            "大单净额",
+            "大单净量",
+            "超大单净额",
+        ],
+    )
+    if direct is not None:
+        return direct.fillna(0)
+    obv_line = obv(data)
+    return obv_line.diff().fillna(0)
+
+
+def _capital_strength(data: pd.DataFrame, window: int = 20) -> pd.Series:
+    capital = _capital_proxy(data)
+    scale = capital.abs().rolling(window).mean().replace(0, np.nan)
+    return capital / scale
+
+
+def _lhb_institution_strength(data: pd.DataFrame) -> pd.Series:
+    direct = _first_numeric_column(
+        data,
+        [
+            "lhb_inst_net_buy_ratio",
+            "institution_net_buy_ratio",
+            "lhb_net_buy_ratio",
+            "lhb_inst_net_buy",
+            "institution_net_buy",
+            "lhb_net_buy",
+        ],
+    )
+    if direct is not None:
+        scale = direct.abs().rolling(20).mean().replace(0, np.nan)
+        return (direct / scale).replace([np.inf, -np.inf], np.nan).fillna(0)
+    return pd.Series(0.0, index=data.index)
+
+
+def make_ths_macd_kdj_rsi_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    ema_fast = close.ewm(span=max(5, fast), adjust=False).mean()
+    ema_slow = close.ewm(span=max(20, slow), adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    k, d, _j = kdj(data, 9)
+    rsi_line = rsi(close, 14)
+    ma20 = close.rolling(20).mean()
+    volume_ok = _volume_ratio(data, 10).between(0.8, 3.5)
+    entries = _cross_up(macd_line, signal_line) & (k > d) & (rsi_line.between(45, 72)) & (close > ma20) & volume_ok
+    exits = _cross_down(macd_line, signal_line) | ((k < d) & (k > 75)) | (rsi_line > 80) | (close < ma20)
+    return ema_fast, ema_slow, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_oversold_reversal_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """Oversold reversal signal matching the exported Tonghuashun card."""
+    close = data["Close"]
+    rsi_fast = rsi(close, 6)
+    rsi_slow = rsi(close, 12)
+    k, d, j = kdj(data, 9)
+    dif = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+    ma20 = close.rolling(20).mean()
+    prior_dif_high = dif.shift(1).rolling(20).max()
+    near_price_high = close >= close.rolling(20).max() * 0.98
+    top_divergence = near_price_high & (dif < prior_dif_high)
+    winner_ratio = _first_numeric_column(data, ["winner_ratio", "profit_chip_ratio", "profit_ratio"])
+    profit_chip_exit = winner_ratio > 0.90 if winner_ratio is not None else pd.Series(False, index=data.index)
+    entries = _cross_up(rsi_fast, rsi_slow) | ((j < 10) & _cross_up(k, d))
+    exits = top_divergence | profit_chip_exit | (rsi_fast > 82) | _cross_down(close, ma20)
+    return rsi_fast, rsi_slow, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_boll_squeeze_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    mid = close.rolling(max(18, slow)).mean()
+    std = close.rolling(max(18, slow)).std()
+    upper = mid + 2 * std
+    lower = mid - 2 * std
+    bandwidth = (upper - lower) / mid.replace(0, np.nan)
+    squeeze = bandwidth < bandwidth.rolling(120, min_periods=40).quantile(0.35)
+    prior_high = data["High"].shift(1).rolling(max(8, fast)).max()
+    vol_ok = _volume_ratio(data, 20) > 1.15
+    entries = squeeze.shift(1).fillna(False) & (close > upper) & (close > prior_high) & vol_ok
+    exits = (close < mid) | (bandwidth > bandwidth.rolling(120, min_periods=40).quantile(0.85))
+    return close.rolling(max(5, fast)).mean(), mid, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_boll_rsi_break_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    mid = close.rolling(max(20, slow)).mean()
+    std = close.rolling(max(20, slow)).std()
+    upper = mid + 2 * std
+    lower = mid - 2 * std
+    rsi_line = rsi(close, 14)
+    entries = (close > upper) & (rsi_line.between(50, 76)) & (_volume_ratio(data, 20) > 1.05)
+    exits = (close < mid) | (rsi_line > 82) | (close < lower)
+    return close.rolling(max(6, fast)).mean(), mid, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_wr_rebound_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    wr_line = williams_r(data, max(10, fast))
+    ma = close.rolling(max(20, slow)).mean()
+    entries = _cross_up(wr_line, -80) & (close > ma * 0.96) & (_volume_ratio(data, 10) > 0.75)
+    exits = (wr_line > -18) | (close < ma * 0.96)
+    return close.rolling(max(5, fast)).mean(), ma, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_cci_breakout_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    cci_line = cci(data, max(10, fast))
+    ma = close.rolling(max(20, slow)).mean()
+    entries = _cross_up(cci_line, 100) & (close > ma) & (_volume_ratio(data, 20) > 1.0)
+    exits = _cross_down(cci_line, 0) | (close < ma)
+    return cci_line, ma, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_bias_revert_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    bias_line = bias(close, max(10, fast))
+    ma = close.rolling(max(20, slow)).mean()
+    entries = (bias_line > -6) & (bias_line.shift(1) <= -6) & (close > ma * 0.92)
+    exits = (bias_line > 8) | (close < ma * 0.94)
+    return bias_line, ma, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_mtm_accel_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    mtm = close - close.shift(max(6, fast))
+    mtm_ma = mtm.rolling(max(6, fast)).mean()
+    trend = close.rolling(max(20, slow)).mean()
+    entries = _cross_up(mtm, mtm_ma) & (mtm > 0) & (close > trend) & (_volume_ratio(data, 10) > 0.9)
+    exits = _cross_down(mtm, mtm_ma) | (close < trend)
+    return mtm, mtm_ma, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_kdj_oversold_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    k, d, j = kdj(data, 9)
+    ma = close.rolling(max(20, slow)).mean()
+    entries = _cross_up(k, d) & (j < 35) & (close > ma * 0.94)
+    exits = ((k < d) & (j > 80)) | (close < ma * 0.95)
+    return k, d, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_volume_breakout_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    ma_fast = close.rolling(max(5, fast)).mean()
+    ma_slow = close.rolling(max(20, slow)).mean()
+    prior_high = data["High"].shift(1).rolling(max(20, slow)).max()
+    recent_low = data["Low"].shift(1).rolling(max(5, fast)).min()
+    vol_ratio = _volume_ratio(data, 20)
+    entries = (close > prior_high) & (ma_fast > ma_slow) & vol_ratio.between(1.35, 5.0)
+    exits = (close < ma_fast) | (close < recent_low)
+    return ma_fast, ma_slow, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_shrink_pullback_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    ma_fast = close.rolling(max(5, fast)).mean()
+    ma_slow = close.rolling(max(20, slow)).mean()
+    vol_ratio = _volume_ratio(data, 20)
+    pullback = (close.shift(1) < ma_fast.shift(1)) & (close.shift(1) > ma_slow.shift(1) * 0.97) & (vol_ratio.shift(1) < 0.85)
+    entries = pullback & (close > ma_fast) & (ma_fast > ma_slow)
+    exits = (close < ma_slow) | (close < data["Low"].shift(1).rolling(max(5, fast)).min())
+    return ma_fast, ma_slow, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_amount_breakout_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    amount = _amount_proxy(data)
+    amount_ratio = amount / amount.rolling(20).mean().replace(0, np.nan)
+    prior_high = data["High"].shift(1).rolling(max(12, slow)).max()
+    ma = close.rolling(max(20, slow)).mean()
+    entries = (close > prior_high) & (close > ma) & amount_ratio.between(1.4, 6.0)
+    exits = (close < ma) | (amount_ratio < 0.55)
+    return amount_ratio, ma, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_platform_breakout_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    high = data["High"]
+    low = data["Low"]
+    box_window = max(20, slow)
+    box_high = high.shift(1).rolling(box_window).max()
+    box_low = low.shift(1).rolling(box_window).min()
+    box_width = (box_high - box_low) / close.replace(0, np.nan)
+    ma = close.rolling(max(10, fast)).mean()
+    entries = (box_width < 0.22) & (close > box_high) & (_volume_ratio(data, 20) > 1.15)
+    exits = (close < ma) | (close < box_low)
+    return ma, box_high, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_new_high_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    ma_fast = close.rolling(max(5, fast)).mean()
+    ma_slow = close.rolling(max(30, slow)).mean()
+    high_line = data["High"].shift(1).rolling(max(55, slow)).max()
+    entries = (close > high_line) & (ma_fast > ma_slow) & (_volume_ratio(data, 20) > 1.0)
+    exits = (close < ma_fast) | (ma_fast < ma_slow)
+    return ma_fast, high_line, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_trendline_break_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    fast_ma = close.ewm(span=max(8, fast), adjust=False).mean()
+    slow_ma = close.ewm(span=max(34, slow), adjust=False).mean()
+    trendline = fast_ma * 0.35 + slow_ma * 0.65
+    entries = _cross_up(close, trendline) & (trendline > trendline.shift(5)) & (_volume_ratio(data, 10) > 0.9)
+    exits = _cross_down(close, trendline) | (trendline < trendline.shift(5))
+    return fast_ma, trendline, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_obv_mfi_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    obv_line = obv(data)
+    obv_ma = obv_line.rolling(max(10, fast)).mean()
+    mfi_line = money_flow_index(data, 14)
+    ma = close.rolling(max(20, slow)).mean()
+    entries = _cross_up(obv_line, obv_ma) & (mfi_line > 50) & (close > ma)
+    exits = _cross_down(obv_line, obv_ma) | (mfi_line < 42) | (close < ma)
+    return obv_line, obv_ma, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_capital_breakout_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    ma = close.rolling(max(20, slow)).mean()
+    cap = _capital_strength(data, 20)
+    prior_high = data["High"].shift(1).rolling(max(10, slow)).max()
+    entries = (cap > 0.6) & (cap > cap.shift(2)) & (close > ma) & ((close > prior_high) | (_volume_ratio(data, 20) > 1.2))
+    exits = (cap < -0.4) | (close < ma)
+    return cap, ma, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_lhb_institution_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    ma = close.rolling(max(20, slow)).mean()
+    strength = _lhb_institution_strength(data)
+    cap = _capital_strength(data, 20)
+    entries = ((strength > 0.4) | (strength.rolling(5).sum() > 1.0)) & (close > ma) & (cap > -0.4)
+    exits = (strength < -0.5) | (close < ma)
+    return strength, ma, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_alloy_momentum_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    ma = close.rolling(max(20, slow)).mean()
+    rsi_line = rsi(close, 14)
+    macd_line = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    k, d, _j = kdj(data, 9)
+    cap = _capital_strength(data, 20)
+    volume_break = _volume_ratio(data, 20) > 1.15
+    score = (
+        (close > ma).astype(int)
+        + (macd_line > signal_line).astype(int)
+        + (k > d).astype(int)
+        + rsi_line.between(45, 72).astype(int)
+        + (cap > 0).astype(int)
+        + volume_break.astype(int)
+    )
+    entries = (score >= 5) & (score.shift(1) < 5)
+    exits = (score <= 2) | (close < ma)
+    return score.astype(float), ma, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_quality_pullback_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    ma20 = close.rolling(20).mean()
+    ma60 = close.rolling(max(40, slow)).mean()
+    rsi_line = rsi(close, 14)
+    wr_line = williams_r(data, 14)
+    cap = _capital_strength(data, 20)
+    entries = (ma20 > ma60) & _cross_up(close, ma20) & (rsi_line.between(38, 62)) & (wr_line > -80) & (cap > -0.3)
+    exits = (close < ma60) | (rsi_line > 78) | (cap < -0.8)
+    return ma20, ma60, entries.fillna(False), exits.fillna(False)
+
+
+def make_ths_risk_off_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    close = data["Close"]
+    ma = close.rolling(max(20, slow)).mean()
+    rsi_line = rsi(close, 14)
+    cap = _capital_strength(data, 20)
+    vol_ratio = _volume_ratio(data, 20)
+    entries = (close > ma) & (rsi_line.between(42, 68)) & (cap > 0.1) & vol_ratio.between(0.8, 2.3)
+    exits = (close < ma) | (cap < -0.7) | (vol_ratio > 4.0) | (rsi_line > 82)
+    return close.rolling(max(5, fast)).mean(), ma, entries.fillna(False), exits.fillna(False)
 
 
 def make_rsi_pullback_signals(data: pd.DataFrame, fast: int, slow: int) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
@@ -1605,6 +1955,48 @@ def strategy_signals(
     horizon: str,
     strategy_type: str,
 ) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    if strategy_type == "ths_oversold_reversal":
+        return make_ths_oversold_reversal_signals(data, fast, slow)
+    if strategy_type == "ths_macd_kdj_rsi":
+        return make_ths_macd_kdj_rsi_signals(data, fast, slow)
+    if strategy_type == "ths_boll_squeeze":
+        return make_ths_boll_squeeze_signals(data, fast, slow)
+    if strategy_type == "ths_boll_rsi_break":
+        return make_ths_boll_rsi_break_signals(data, fast, slow)
+    if strategy_type == "ths_wr_rebound":
+        return make_ths_wr_rebound_signals(data, fast, slow)
+    if strategy_type == "ths_cci_breakout":
+        return make_ths_cci_breakout_signals(data, fast, slow)
+    if strategy_type == "ths_bias_revert":
+        return make_ths_bias_revert_signals(data, fast, slow)
+    if strategy_type == "ths_mtm_accel":
+        return make_ths_mtm_accel_signals(data, fast, slow)
+    if strategy_type == "ths_kdj_oversold":
+        return make_ths_kdj_oversold_signals(data, fast, slow)
+    if strategy_type == "ths_volume_breakout":
+        return make_ths_volume_breakout_signals(data, fast, slow)
+    if strategy_type == "ths_shrink_pullback":
+        return make_ths_shrink_pullback_signals(data, fast, slow)
+    if strategy_type == "ths_amount_breakout":
+        return make_ths_amount_breakout_signals(data, fast, slow)
+    if strategy_type == "ths_platform_breakout":
+        return make_ths_platform_breakout_signals(data, fast, slow)
+    if strategy_type == "ths_new_high":
+        return make_ths_new_high_signals(data, fast, slow)
+    if strategy_type == "ths_trendline_break":
+        return make_ths_trendline_break_signals(data, fast, slow)
+    if strategy_type == "ths_obv_mfi":
+        return make_ths_obv_mfi_signals(data, fast, slow)
+    if strategy_type == "ths_capital_breakout":
+        return make_ths_capital_breakout_signals(data, fast, slow)
+    if strategy_type == "ths_lhb_institution":
+        return make_ths_lhb_institution_signals(data, fast, slow)
+    if strategy_type == "ths_alloy_momentum":
+        return make_ths_alloy_momentum_signals(data, fast, slow)
+    if strategy_type == "ths_quality_pullback":
+        return make_ths_quality_pullback_signals(data, fast, slow)
+    if strategy_type == "ths_risk_off":
+        return make_ths_risk_off_signals(data, fast, slow)
     if strategy_type == "breakout":
         return make_short_signals(data, fast, slow)
     if strategy_type == "rsi":
@@ -1629,7 +2021,22 @@ def strategy_signals(
 def strategy_in_trend(strategy_type: str, latest_fast: float, latest_slow: float, latest_close: float) -> bool:
     if strategy_type == "ml":
         return latest_close > latest_slow and latest_fast >= 0.45
+    if strategy_type.startswith("ths_"):
+        return latest_close > latest_slow
     return latest_fast > latest_slow
+
+
+THS_STRATEGY_GROUPS = {
+    "ths_indicator": ["ths_oversold_reversal", "ths_macd_kdj_rsi", "ths_mtm_accel", "ths_kdj_oversold"],
+    "ths_oscillator": ["ths_boll_squeeze", "ths_boll_rsi_break", "ths_wr_rebound", "ths_cci_breakout", "ths_bias_revert"],
+    "ths_volume_price": ["ths_volume_breakout", "ths_shrink_pullback", "ths_amount_breakout", "ths_platform_breakout", "ths_new_high", "ths_trendline_break"],
+    "ths_capital": ["ths_obv_mfi", "ths_capital_breakout"],
+    "ths_lhb": ["ths_lhb_institution"],
+    "ths_hybrid": ["ths_oversold_reversal", "ths_alloy_momentum", "ths_quality_pullback", "ths_risk_off", "ths_boll_rsi_break", "ths_capital_breakout"],
+}
+THS_ALL_STRATEGIES = list(dict.fromkeys(sum(THS_STRATEGY_GROUPS.values(), [])))
+THS_STRATEGY_TYPES = set(THS_ALL_STRATEGIES)
+THS_FILTERS = set(THS_STRATEGY_GROUPS) | {"ths_auto"}
 
 
 def strategy_portfolio(
@@ -1660,7 +2067,11 @@ def strategy_portfolio(
 
 def candidate_params(horizon: str, strategy_filter: str) -> list[tuple[str, int, int]]:
     grid = STRATEGY_GRIDS[horizon]
-    if strategy_filter == "auto":
+    if strategy_filter == "ths_auto":
+        strategy_types = THS_ALL_STRATEGIES
+    elif strategy_filter in THS_STRATEGY_GROUPS:
+        strategy_types = THS_STRATEGY_GROUPS[strategy_filter]
+    elif strategy_filter == "auto":
         if horizon == "short":
             strategy_types = ["hybrid", "rsi_capital", "macd_kdj", "boll_wr", "breakout_capital", "breakout", "rsi", "macd", "sma"]
         else:
@@ -1674,7 +2085,9 @@ def candidate_params(horizon: str, strategy_filter: str) -> list[tuple[str, int,
         strategy_types = [strategy_filter]
     candidates: list[tuple[str, int, int]] = []
     for strategy_type in strategy_types:
-        if strategy_type == "ml":
+        if strategy_type in THS_STRATEGY_TYPES:
+            pairs = [(5, 20), (8, 20), (8, 30), (10, 30), (13, 40)]
+        elif strategy_type == "ml":
             pairs = [(6, 20), (8, 21), (13, 40)]
         elif strategy_type == "rsi":
             pairs = [(6, 20), (6, 30), (9, 30), (9, 40)]
@@ -1721,6 +2134,10 @@ def scan_strategies(
                 score -= 500
             if strategy_type == "ml":
                 score -= 15
+            if str(strategy_type).startswith("ths_"):
+                score += 8
+                if strategy_type in {"ths_alloy_momentum", "ths_quality_pullback", "ths_risk_off"}:
+                    score += 8
         if trades < grid["min_trades"]:
             score -= 200
         rows.append(
@@ -2084,6 +2501,10 @@ def _daily_gate_matches_filter(
     exclude_strategy_type: str | None = None,
 ) -> bool:
     result_type = daily_gate_strategy_type(result)
+    # 同花顺风格策略由独立页面管理。未明确请求某个同花顺策略时，
+    # 不让旧缓存进入传统盘中监控或传统策略选择。
+    if strategy_type is None and result_type.startswith("ths_"):
+        return False
     if strategy_type is not None and result_type != strategy_type:
         return False
     if exclude_strategy_type is not None and result_type == exclude_strategy_type:
@@ -2140,7 +2561,12 @@ def load_latest_saved_daily_gate_for_symbol(
     return result
 
 
-def save_daily_gate(cache_key: tuple[str, str, str, str, str, str], result: dict[str, object]) -> None:
+def save_daily_gate(
+    cache_key: tuple[str, str, str, str, str, str],
+    result: dict[str, object],
+    *,
+    persist: bool = True,
+) -> None:
     cache = load_persistent_strategy_cache()
     symbol = cache_key[0]
     key_text = strategy_cache_key_text(cache_key)
@@ -2224,7 +2650,8 @@ def save_daily_gate(cache_key: tuple[str, str, str, str, str, str], result: dict
         "position": existing_position,
         "result": result,
     }
-    save_persistent_strategy_cache()
+    if persist:
+        save_persistent_strategy_cache()
 
 
 def compute_daily_gate(form: dict[str, str]) -> dict[str, object]:
@@ -2339,6 +2766,7 @@ def build_monitor_item(
     saved_strategy_key_text: str = "",
     strategy_type: str | None = None,
     exclude_strategy_type: str | None = "ml",
+    daily_override: dict[str, object] | None = None,
 ) -> dict[str, object]:
     code = resolve_stock_identifier(symbol)
     data = load_intraday_minutes(code, period)
@@ -2381,11 +2809,15 @@ def build_monitor_item(
     breakout = price > latest_prior_high and volume_ratio >= 1.2
     not_chasing = price <= latest_vwap * 1.035
 
-    daily = ensure_daily_strategy(
-        code,
-        saved_strategy_key_text,
-        strategy_type=strategy_type,
-        exclude_strategy_type=exclude_strategy_type,
+    daily = (
+        daily_override
+        if isinstance(daily_override, dict)
+        else ensure_daily_strategy(
+            code,
+            saved_strategy_key_text,
+            strategy_type=strategy_type,
+            exclude_strategy_type=exclude_strategy_type,
+        )
     )
     daily_signal = daily.get("daily_signal", {})
     daily_entry = bool(daily_signal.get("entry_today"))

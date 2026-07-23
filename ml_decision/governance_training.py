@@ -96,6 +96,8 @@ def train_fixed_window(
         calibration_method=model_settings.get("calibration_method", "sigmoid"),
         random_state=int(model_settings.get("random_state", 42)),
         use_shap=bool(model_settings.get("use_shap", True)),
+        gpu_device=str(model_settings.get("device", "cuda:0")),
+        host_cpu_threads=int(model_settings.get("host_cpu_threads", 2)),
     )
     model.fit(dataset, selected, splits=window.as_splits())
     predictions = model_prediction_frame(model, test)
@@ -126,7 +128,13 @@ def train_window_model_set(
     ):
         requests[group] = list(dict.fromkeys(list(groups.get(group, [])) + controls))
     results: dict[str, WindowModelResult] = {}
-    for group, features in requests.items():
+    request_items = list(requests.items())
+    for group_index, (group, features) in enumerate(request_items, start=1):
+        print(
+            f"[gpu-fit {group_index}/{len(request_items)}] "
+            f"window={window.window_id} group={group}",
+            flush=True,
+        )
         try:
             results[group] = train_fixed_window(
                 dataset, features, window, group=group, config=config, model_factory=model_factory
